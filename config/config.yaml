@@ -237,61 +237,29 @@ api:
     - critico
 metrics:
   classification_thresholds:
-    outbreak_threshold: 50  # casos/semana: >= threshold classifica a semana como surto (F2/PR-AUC/Precision/Recall)
+    outbreak_threshold: 50  # casos/semana: >= threshold classifica a semana como surto
   targets:
     h1:
-      f2_score: 0.90
-      pr_auc: 0.95
-      rmse: 90.0
       wmape: 0.26
-      rmsse: 0.35
-      rmsse_last: 0.35
+      mase: 0.35
     h2:
-      f2_score: 0.90
-      pr_auc: 0.94
-      rmse: 120.0
       wmape: 0.34
-      rmsse: 0.45
-      rmsse_last: 0.45
+      mase: 0.45
     h3:
-      f2_score: 0.90
-      pr_auc: 0.92
-      rmse: 130.0
       wmape: 0.39
-      rmsse: 0.50
-      rmsse_last: 0.50
+      mase: 0.50
     h4:
-      f2_score: 0.88
-      pr_auc: 0.91
-      rmse: 150.0
       wmape: 0.45
-      rmsse: 0.55
-      rmsse_last: 0.55
+      mase: 0.55
     h5:
-      f2_score: 0.87
-      pr_auc: 0.90
-      rmse: 165.0
       wmape: 0.47
-      rmsse: 0.60
-      rmsse_last: 0.60
+      mase: 0.60
     h6:
-      f2_score: 0.86
-      pr_auc: 0.89
-      rmse: 160.0
       wmape: 0.47
-      rmsse: 0.58
-      rmsse_last: 0.58
+      mase: 0.58
     h7:
-      f2_score: 0.87
-      pr_auc: 0.91
-      rmse: 160.0
       wmape: 0.45
-      rmsse: 0.58
-      rmsse_last: 0.58
+      mase: 0.58
     h8:
-      f2_score: 0.94
-      pr_auc: 0.91
-      rmse: 175.0
       wmape: 0.47
-      rmsse: 0.65
-      rmsse_last: 0.65
+      mase: 0.65

@@ -6,11 +6,7 @@ Implements walk-forward validation with strict leakage prevention.
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.metrics import (
-    mean_squared_error,
-    fbeta_score, average_precision_score,
-    r2_score, precision_score, recall_score
-)
+from sklearn.metrics import mean_squared_error
 from pathlib import Path
 import json
 import logging
@@ -270,15 +266,12 @@ class EpisenseTrainer:
     def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
                              y_true_raw: np.ndarray = None, y_train: pd.Series = None, 
                              train_se: np.ndarray = None, test_se: np.ndarray = None) -> Dict[str, float]:
-            """Calculate all required metrics."""
+            """Calculate required metrics: WMAPE and MASE only."""
             metrics = {}
 
             # Convert to cases scale
             y_true_cases = np.expm1(y_true)
             y_pred_cases = np.expm1(y_pred)
-
-            # Regression metrics in CASES scale (not log)
-            metrics['rmse'] = float(np.sqrt(mean_squared_error(y_true_cases, np.expm1(y_pred))))
 
             # WMAPE in cases scale
             if y_true_raw is not None and np.sum(y_true_raw) > 0:
@@ -286,148 +279,80 @@ class EpisenseTrainer:
             else:
                 metrics['wmape'] = float(np.sum(np.abs(y_true_cases - np.expm1(y_pred))) / (np.sum(y_true_cases) + 1e-10))
 
-            # RMSE in log scale (for backward compatibility / model selection)
-            metrics['rmse_log'] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-
-            # RMSSE (Root Mean Squared Scaled Error) - using naive forecast from TRAINING data
-            # Uses RMSE instead of MAE since MAE is removed
+            # MASE (Mean Absolute Scaled Error) - using naive forecast from TRAINING data
+            # MASE = MAE / MAE_naive where naive is seasonal (same week previous year) or last value
             if y_train is not None and len(y_train) > 0:
-                # Convert y_train to cases scale for naive baselines
                 y_train_cases = np.expm1(y_train)
-                # Handle both pandas Series and numpy array
                 if hasattr(y_train_cases, 'iloc'):
                     last_train_value_cases = y_train_cases.iloc[-1]
                 else:
                     last_train_value_cases = y_train_cases[-1]
 
-                # Naive forecast 1: last training value for all test points (in CASES scale)
+                # MAE of predictions
+                mae = float(np.mean(np.abs(y_true_cases - y_pred_cases)))
+
+                # Naive forecast 1: last training value
                 naive_pred_last_cases = np.full_like(y_true_cases, last_train_value_cases)
-                naive_rmse_last = float(np.sqrt(np.mean((y_true_cases - naive_pred_last_cases) ** 2)))
+                mae_last = float(np.mean(np.abs(y_true_cases - naive_pred_last_cases)))
 
                 # Naive forecast 2: seasonal naive (same week previous year from training data)
-                # NOTE: SEs must be normalized to the SAME string format on both sides
-                # (train keys and test lookups), otherwise the dict lookup never
-                # matches and the baseline silently falls back to 'last_value' on
-                # every fold, making RMSSE not comparable across folds/horizons.
-                naive_rmse_seasonal = None
+                naive_mae_seasonal = None
                 seasonal_fallback_count = 0
                 seasonal_matched_count = 0
                 if train_se is not None and test_se is not None and len(y_train) >= 52:
                     try:
-                        # Build a mapping from SE to y_train values (in CASES scale) for the training period
                         se_to_y_cases = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
-
-                        # For each test SE, find the same epidemiological week in the previous year
                         seasonal_naive_pred_cases = []
-                        fallback_dists = []
                         for se in test_se:
                             se_str = normalize_se(se)
                             ano = int(se_str[:4])
                             semana = int(se_str[4:])
                             prev_year_se = f"{ano-1}{semana:02d}"
-
                             if prev_year_se in se_to_y_cases:
                                 seasonal_naive_pred_cases.append(se_to_y_cases[prev_year_se])
                                 seasonal_matched_count += 1
                                 continue
-
-                            # Fallback: nearest available equivalent week (T-52±k).
-                            # Keeps the baseline seasonal (same period last year)
-                            # instead of a ~50-week-old constant, which inflated the
-                            # naive RMSE and contaminated RMSSE (review bug). Only
-                            # when nothing is found inside the search window do we
-                            # use the last training value.
+                            # Fallback: nearest available equivalent week (T-52±k)
                             found = False
                             for k in range(1, 5):
                                 for cand in (f"{ano-1}{semana-k:02d}", f"{ano-1}{semana+k:02d}"):
                                     if cand in se_to_y_cases:
                                         seasonal_naive_pred_cases.append(se_to_y_cases[cand])
-                                        fallback_dists.append(k)
                                         found = True
                                         break
                                 if found:
                                     break
                             if not found:
                                 seasonal_naive_pred_cases.append(last_train_value_cases)
-                                fallback_dists.append(5)  # fora da janela de busca
-                            seasonal_fallback_count += 1
-
+                                seasonal_fallback_count += 1
                         seasonal_naive_pred_cases = np.array(seasonal_naive_pred_cases)
-                        naive_rmse_seasonal = float(np.sqrt(np.mean((y_true_cases - seasonal_naive_pred_cases) ** 2)))
+                        naive_mae_seasonal = float(np.mean(np.abs(y_true_cases - seasonal_naive_pred_cases)))
                     except Exception as e:
                         logger.warning(f"Could not compute seasonal naive baseline: {e}")
-                        naive_rmse_seasonal = None
+                        naive_mae_seasonal = None
+
                 # Use seasonal naive if available, otherwise last value
-                # Both numerators and denominators now in CASES scale (RMSE)
-                if naive_rmse_seasonal is not None and naive_rmse_seasonal > 0:
-                    metrics['rmsse'] = float(metrics['rmse'] / (naive_rmse_seasonal + 1e-10))
-                    metrics['rmsse_last'] = float(metrics['rmse'] / (naive_rmse_last + 1e-10))
-                    metrics['rmsse_baseline'] = 'seasonal'
+                if naive_mae_seasonal is not None and naive_mae_seasonal > 0:
+                    metrics['mase'] = float(mae / (naive_mae_seasonal + 1e-10))
+                    metrics['mase_baseline'] = 'seasonal'
                     metrics['seasonal_fallback_count'] = seasonal_fallback_count
                     metrics['seasonal_matched_count'] = seasonal_matched_count
-                    metrics['seasonal_fallback_mean_dist'] = float(np.mean(fallback_dists)) if fallback_dists else 0.0
                 else:
-                    metrics['rmsse'] = float(metrics['rmse'] / (naive_rmse_last + 1e-10))
-                    metrics['rmsse_last'] = metrics['rmsse']
-                    metrics['rmsse_baseline'] = 'last_value'
+                    metrics['mase'] = float(mae / (mae_last + 1e-10))
+                    metrics['mase_baseline'] = 'last_value'
                     metrics['seasonal_fallback_count'] = len(test_se) if test_se is not None else 0
                     metrics['seasonal_matched_count'] = 0
-                    metrics['seasonal_fallback_mean_dist'] = 0.0
             else:
-                # Fallback: use naive forecast on test data (less correct, for backward compat)
-                # Convert to cases scale for consistency
-                naive_rmse = float(np.sqrt(np.mean(np.diff(y_true_cases) ** 2))) if len(y_true_cases) > 1 else 1.0
-                metrics['rmsse'] = float(metrics['rmse'] / (naive_rmse + 1e-10))
-                metrics['rmsse_last'] = metrics['rmsse']
-                metrics['rmsse_baseline'] = 'test_diff'
+                # Fallback: use naive forecast on test data
+                mae = float(np.mean(np.abs(y_true_cases - y_pred_cases)))
+                naive_mae = float(np.mean(np.abs(np.diff(y_true_cases)))) if len(y_true_cases) > 1 else 1.0
+                metrics['mase'] = float(mae / (naive_mae + 1e-10))
+                metrics['mase_baseline'] = 'test_diff'
                 metrics['seasonal_fallback_count'] = len(test_se) if test_se is not None else 0
                 metrics['seasonal_matched_count'] = 0
-                metrics['seasonal_fallback_mean_dist'] = 0.0
 
-            # Share of test weeks whose seasonal baseline had to fall back to
-            # 'last training value' (0.0 = pure seasonal, 1.0 = no seasonal match).
-            # Lets consumers filter folds/horizons by baseline strength, keeping
-            # RMSSE comparable across them.
             metrics['seasonal_fallback_ratio'] = metrics.get('seasonal_fallback_count', 0) / max(
                 1, metrics.get('seasonal_fallback_count', 0) + metrics.get('seasonal_matched_count', 0))
-        
-            # Classification metrics (using outbreak threshold on cases scale)
-            outbreak_threshold = self.config.get('metrics', {}).get('classification_thresholds', {}).get('outbreak_threshold')
-            if outbreak_threshold is None:
-                raise ValueError("metrics.classification_thresholds.outbreak_threshold must be set in config.yaml")
-            y_true_cases = np.expm1(y_true)
-            y_pred_cases = np.expm1(y_pred)
-            y_true_binary = (y_true_cases >= outbreak_threshold).astype(int)
-            y_pred_binary = (y_pred_cases >= outbreak_threshold).astype(int)
-
-            # Only calculate if both classes present in TRUE labels
-            # Return NaN instead of 0.0 when class is missing (will be excluded by nanmean)
-            if len(np.unique(y_true_binary)) > 1:
-                metrics['f2_score'] = float(fbeta_score(y_true_binary, y_pred_binary, beta=2, zero_division=0))
-                metrics['precision'] = float(precision_score(y_true_binary, y_pred_binary, zero_division=0))
-                metrics['recall'] = float(recall_score(y_true_binary, y_pred_binary, zero_division=0))
-
-                # PR-AUC (continuous scores in cases scale)
-                try:
-                    metrics['pr_auc'] = float(average_precision_score(y_true_binary, y_pred_cases))
-                except ValueError as e:
-                    logger.warning(f"PR-AUC could not be computed: {e}")
-                    metrics['pr_auc'] = np.nan
-            else:
-                # Missing class in true labels - return NaN (excluded from ensemble mean)
-                metrics['f2_score'] = np.nan
-                metrics['precision'] = np.nan
-                metrics['recall'] = np.nan
-                metrics['pr_auc'] = np.nan
-                # Distinguish 'all weeks are outbreaks' (single class, e.g. 2024)
-                # from 'no outbreak at all' - the fold summary labels them correctly.
-                n_pos = int(y_true_binary.sum())
-                metrics['classification_single_class'] = 'all_positive' if n_pos == len(y_true_binary) else 'all_negative'
-
-            # R² per fold/horizon (bug fix: métrica exigida pelo escopo estava ausente)
-            # r2 na escala de treino (log1p) e na escala de casos
-            metrics['r2'] = float(r2_score(y_true, y_pred))
-            metrics['r2_casos'] = float(r2_score(y_true_cases, y_pred_cases))
 
             return metrics
     
