@@ -67,13 +67,14 @@ TARGET_HORIZONS = config['targets']['horizons']
 
 def _fetch_infodengue() -> pd.DataFrame:
     """Fetch latest dengue data from InfoDengue API directly (no CSV storage)."""
-    url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=csv&ew_format=SE"
+    url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
     logger.info(f"Fetching InfoDengue data from {url}")
     
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     
-    df = pd.read_csv(StringIO(response.text))
+    data = response.json()
+    df = pd.DataFrame(data)
     logger.info(f"Downloaded {len(df)} rows from InfoDengue")
     
     # Keep only needed columns
