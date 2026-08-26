@@ -1,0 +1,297 @@
+project:
+  name: Episense
+  location: Campo Grande, MS
+  geocode: '5002704'
+  disease: dengue
+  target_variable: casos
+  se_format: YYYYWW
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  models: models
+  logs: logs
+  api: api
+data_sources:
+  infodengue:
+    base_url: https://info.dengue.mat.br/api/alertcity
+    geocode: '5002704'
+    disease: dengue
+    format: csv
+    ew_format: SE
+  openmeteo:
+    base_url: https://archive-api.open-meteo.com/v1/archive
+    latitude: -20.4697
+    longitude: -54.6201
+    timezone: America/Campo_Grande
+    daily_variables:
+    - temperature_2m_max
+    - temperature_2m_min
+    - temperature_2m_mean
+    - precipitation_sum
+    - relative_humidity_2m_mean
+    - wind_speed_10m_max
+features:
+  target_transform: log1p
+  legacy_convention:
+    log_lag1_shift: 0
+    log_lagn_shift: 1
+    temp_lag2_shift: 1
+    temp_lag4_shift: 3
+    p_rt1_rt_nivel_lag1_shift: 2  # Changed from 0 to 2: Rt/p_rt/nivel are nowcasted and revised; use proper lag
+  advanced_convention:
+    log_lag1_shift: 1
+    log_lagn_shift: 1
+  lags:
+    cases:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    temperature:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    precipitation:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    humidity:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+  rolling_windows:
+  - 3
+  - 4
+  - 8
+  - 12
+  seasonal_features: true
+  interaction_features: true
+  horizon_features: true
+  # Experimental feature expansions (from train_exp.py / LGBM_swl experiment)
+  expand_seasonal: true    # T-52/53 lag, YoY, YTD, YTD ratios (attacks h5-h8 degradation)
+  expand_weather_long: true  # Weather lags 7-12, precip accumulations 16-26 weeks (climate long memory)
+  expand_extra: false       # Deactivated (increases features but marginal gain) - seasonal+weather_long tested better
+targets:
+  horizons:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  target_cols:
+  - target_h1
+  - target_h2
+  - target_h3
+  - target_h4
+  target_transform: log1p
+model:
+  type: LightGBM
+  ensemble:
+    n_seeds: 5
+    seeds:
+    - 42
+    - 123
+    - 456
+    - 789
+    - 999
+    aggregation: mean
+  hyperparameters:
+    objective: tweedie
+    tweedie_variance_power: 1.5
+    metric: rmse
+    boosting_type: gbdt
+    num_leaves: 127
+    max_depth: 10
+    learning_rate: 0.03
+    n_estimators: 3000
+    subsample: 0.85
+    colsample_bytree: 0.85
+    reg_alpha: 0.05
+    reg_lambda: 0.05
+    min_child_samples: 15
+    random_state: 42
+    verbosity: -1
+    early_stopping_rounds: 150
+    feature_fraction: 0.85
+    bagging_fraction: 0.85
+    bagging_freq: 3
+    min_gain_to_split: 0.01
+training:
+  start_year: 2014  # VENCEDOR do experimento 2011 vs 2014 (6 folds, janelas identicas):
+                     # 2011-2013 (outlier 2013 = 45k casos) pioram WMAPE/RMSSE em todos os
+                     # horizontes e dobram RMSE em anos recentes de baixa (2020 h1, 2024 h8).
+                     # Features usam o histórico completo; só as LINHAS de treino < 2014 saem.
+  walk_forward:
+    n_splits: 5  # um fold por test_year (2021-2025; decisão final do usuário)
+    test_size_weeks: 52
+    gap_weeks: 8  # >= max horizon (assert em train.py); experimento h1-h8
+    expanding_window: true
+    min_train_weeks: 100  # fold 2021: ~358 semanas de treino (2014-2020, gap 8)
+    test_years: [2021, 2022, 2023, 2024, 2025]  # Explicit test years for each fold
+    # NOTA: 2017-2020 fora dos folds de teste (regime atual); 2019 permanece no
+    # TREINO (modelo aprende o surto gigante) e vira stress-test documentado.
+  validation:
+    gap_weeks: 4
+    expanding: true
+  feature_selection:
+    method: importance
+    threshold: 0.001
+    max_features: 300  # Increased from 258 to accommodate new seasonal+weather_long features
+    expand_extra: false  # LGBM_swl uses seasonal+weather_long, not full expand_extra
+  scaler:
+    type: DataFrameScaler
+    feature_range:
+    - 0
+    - 1
+inference:
+  horizon_specific_features: true
+  feature_alignment: strict
+  scaler_path: models/scaler.pkl
+  # Padrão real produzido pelo treino: um .pkl por seed (models/lgbm_h{horizon}_seed{seed}.pkl)
+  # A inferência carrega os 5 seeds de cada horizonte e agrega pela média das predições.
+  model_paths:
+    h1: models/lgbm_h1_seed{seed}.pkl
+    h2: models/lgbm_h2_seed{seed}.pkl
+    h3: models/lgbm_h3_seed{seed}.pkl
+    h4: models/lgbm_h4_seed{seed}.pkl
+  feature_list_path: models/feature_list.json
+  legacy_feature_aliases: true
+api:
+  host: 0.0.0.0
+  port: 8000
+  host_external: localhost
+  port_external: 8000
+  geocode: '5002704'
+  request_body:
+    required_fields:
+    - geocode
+    optional_fields: []
+  response:
+    format: json
+    fields:
+    - horizonte_semanas
+    - semana_epidemiologica
+    - casos_previstos
+    - alerta
+    alert_thresholds:
+      h1:
+      - 10
+      - 50
+      - 100
+      h2:
+      - 10
+      - 50
+      - 100
+      h3:
+      - 10
+      - 50
+      - 100
+      h4:
+      - 10
+      - 50
+      - 100
+      h5:
+      - 10
+      - 50
+      - 100
+      h6:
+      - 10
+      - 50
+      - 100
+      h7:
+      - 10
+      - 50
+      - 100
+      h8:
+      - 10
+      - 50
+      - 100
+    horizon_guidance: >-
+      h1-h4: previsoes principais de magnitude (confianca media-alta). h5-h8:
+      sinal de alerta precoce - mais confiaveis em anos de baixa incidencia;
+      em anos de surto atipico (ex.: 2019, 45k casos) subestimam a magnitude.
+      Nao tratar h5-h8 como verdade absoluta.
+    alert_labels:
+    - baixo
+    - medio
+    - alto
+    - critico
+metrics:
+  classification_thresholds:
+    outbreak_threshold: 50  # casos/semana: >= threshold classifica a semana como surto (F2/PR-AUC/Precision/Recall)
+  targets:
+    h1:
+      f2_score: 0.90
+      pr_auc: 0.95
+      rmse: 90.0
+      wmape: 0.26
+      rmsse: 0.35
+      rmsse_last: 0.35
+    h2:
+      f2_score: 0.90
+      pr_auc: 0.94
+      rmse: 120.0
+      wmape: 0.34
+      rmsse: 0.45
+      rmsse_last: 0.45
+    h3:
+      f2_score: 0.90
+      pr_auc: 0.92
+      rmse: 130.0
+      wmape: 0.39
+      rmsse: 0.50
+      rmsse_last: 0.50
+    h4:
+      f2_score: 0.88
+      pr_auc: 0.91
+      rmse: 150.0
+      wmape: 0.45
+      rmsse: 0.55
+      rmsse_last: 0.55
+    h5:
+      f2_score: 0.87
+      pr_auc: 0.90
+      rmse: 165.0
+      wmape: 0.47
+      rmsse: 0.60
+      rmsse_last: 0.60
+    h6:
+      f2_score: 0.86
+      pr_auc: 0.89
+      rmse: 160.0
+      wmape: 0.47
+      rmsse: 0.58
+      rmsse_last: 0.58
+    h7:
+      f2_score: 0.87
+      pr_auc: 0.91
+      rmse: 160.0
+      wmape: 0.45
+      rmsse: 0.58
+      rmsse_last: 0.58
+    h8:
+      f2_score: 0.94
+      pr_auc: 0.91
+      rmse: 175.0
+      wmape: 0.47
+      rmsse: 0.65
+      rmsse_last: 0.65
