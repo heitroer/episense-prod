@@ -22,3 +22,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+  episense-dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: episense-dashboard
+    ports:
+      - "8501:8000"
+    restart: always
+    mem_limit: 1g
+    cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

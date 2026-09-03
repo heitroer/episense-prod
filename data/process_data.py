@@ -144,9 +144,15 @@ class EpisenseDataProcessor:
         # Merge to find missing weeks
         merged = pd.merge(all_weeks_df, df, on='SE', how='left')
         
-        # Fill missing cases with 0
+        # Flag semanas imputadas (fabricadas) antes do fillna
         if 'casos' in merged.columns:
+            merged['is_imputed'] = merged['casos'].isna()
+            n_imputed = int(merged['is_imputed'].sum())
+            if n_imputed > 0:
+                logger.warning(f"Semanas imputadas (fabricadas): {n_imputed} semanas com casos ausente preenchidas com 0")
             merged['casos'] = merged['casos'].fillna(0).astype(int)
+        else:
+            merged['is_imputed'] = False
         
         # Forward fill weather variables (strict ffill - no future data used for imputation)
         weather_cols = [c for c in merged.columns if c not in ['SE', 'ano', 'semana', 'data_inicio_semana', 'casos']]
@@ -175,58 +181,49 @@ class EpisenseDataProcessor:
         """Create base features from merged data."""
         df = df.copy()
         
-        # NOWCAST SUBSTITUTION: Use the maximum of confirmados (casos) and nowcast (casos_est)
-        # for ALL weeks. This ensures the target variable always reflects the best available
-        # estimate at the time of data collection. No 4-week window - applies globally.
-        if 'casos_est' in df.columns:
-            # Ensure both are numeric
-            df['casos'] = pd.to_numeric(df['casos'], errors='coerce').fillna(0).astype(float)
-            df['casos_est'] = pd.to_numeric(df['casos_est'], errors='coerce').fillna(0).astype(float)
-            
-            # casos = max(casos, casos_est) for all rows
-            mask = df['casos_est'] > df['casos']
-            if mask.any():
-                df.loc[mask, 'casos'] = np.round(df.loc[mask, 'casos_est']).astype(int)
-                logger.info(f"Nowcast substitution: {mask.sum()} weeks updated (casos <- casos_est where casos_est > casos)")
-        
-        # Log cases (target variable)
+        # NOTA: treino usa casos PURO (confirmados) sem substituicao por nowcast.
+        # O nowcast (casos_est) so e usado na API nas ultimas 12 semanas (ver api/main.py).
+        # Log cases (target variable) - casos puro
         df['log_casos'] = np.log1p(df['casos'])
         
-        # Seasonal features
-        df['sin_semana'] = np.sin(2 * np.pi * df['semana'] / 52)
-        df['cos_semana'] = np.cos(2 * np.pi * df['semana'] / 52)
+        # Seasonal features - usa weeks_in_year(ano) para anos com 53 semanas
+        try:
+            weeks = df['ano'].apply(lambda y: weeks_in_year(int(y)))
+            df['sin_semana'] = np.sin(2 * np.pi * df['semana'] / weeks)
+            df['cos_semana'] = np.cos(2 * np.pi * df['semana'] / weeks)
+        except Exception:
+            df['sin_semana'] = np.sin(2 * np.pi * df['semana'] / 52)
+            df['cos_semana'] = np.cos(2 * np.pi * df['semana'] / 52)
         
-        # Lag features for cases (legacy convention: log_lag1 = log_casos shift 0, log_lagN = shift N-1 for N>=2)
-        # This is the LEGACY convention for 22-feature models
-        # NOTE: log_lag1 = shift(0) is the LEGACY convention but creates target leakage if used as target directly
-        # features.py::run_full_feature_engineering() will create proper targets target_h1..target_h4 via shift(-h)
-        df['log_lag1'] = df['log_casos'].shift(0)      # Legacy: shift 0
-        df['log_lag2'] = df['log_casos'].shift(1)      # Legacy: shift 1 (N-1 where N=2)
-        df['log_lag3'] = df['log_casos'].shift(2)      # Legacy: shift 2 (N-1 where N=3)
-        df['log_lag4'] = df['log_casos'].shift(3)
-        df['log_lag5'] = df['log_casos'].shift(4)
-        df['log_lag6'] = df['log_casos'].shift(5)
-        df['log_lag7'] = df['log_casos'].shift(6)
-        df['log_lag8'] = df['log_casos'].shift(7)
+        # Lag features for cases - FIXED: advanced convention shift N (no leakage)
+        # Previously legacy shift 0 for lag1 caused target leakage; now shift 1..8
+        df['log_lag1'] = df['log_casos'].shift(1)
+        df['log_lag2'] = df['log_casos'].shift(2)
+        df['log_lag3'] = df['log_casos'].shift(3)
+        df['log_lag4'] = df['log_casos'].shift(4)
+        df['log_lag5'] = df['log_casos'].shift(5)
+        df['log_lag6'] = df['log_casos'].shift(6)
+        df['log_lag7'] = df['log_casos'].shift(7)
+        df['log_lag8'] = df['log_casos'].shift(8)
         
-        # Weather lags (legacy convention: temp_lag2 = shift 1, temp_lag4 = shift 3)
+        # Weather lags - FIXED to true lag (shift N, not N-1)
         if 'temp_mean_mean' in df.columns:
-            df['temp_lag2'] = df['temp_mean_mean'].shift(1)
-            df['temp_lag4'] = df['temp_mean_mean'].shift(3)
+            df['temp_lag2'] = df['temp_mean_mean'].shift(2)
+            df['temp_lag4'] = df['temp_mean_mean'].shift(4)
         elif 'temp_mean' in df.columns:
-            df['temp_lag2'] = df['temp_mean'].shift(1)
-            df['temp_lag4'] = df['temp_mean'].shift(3)
+            df['temp_lag2'] = df['temp_mean'].shift(2)
+            df['temp_lag4'] = df['temp_mean'].shift(4)
         
         if 'precip_total' in df.columns:
-            df['precip_lag2'] = df['precip_total'].shift(1)
-            df['precip_lag4'] = df['precip_total'].shift(3)
+            df['precip_lag2'] = df['precip_total'].shift(2)
+            df['precip_lag4'] = df['precip_total'].shift(4)
         elif 'precip' in df.columns:
-            df['precip_lag2'] = df['precip'].shift(1)
-            df['precip_lag4'] = df['precip'].shift(3)
+            df['precip_lag2'] = df['precip'].shift(2)
+            df['precip_lag4'] = df['precip'].shift(4)
         
         if 'humidity_mean' in df.columns:
-            df['humidity_lag2'] = df['humidity_mean'].shift(1)
-            df['humidity_lag4'] = df['humidity_mean'].shift(3)
+            df['humidity_lag2'] = df['humidity_mean'].shift(2)
+            df['humidity_lag4'] = df['humidity_mean'].shift(4)
         
         # Rt / p_rt / nivel lags: REMOVED (Bug fix from code review).
         # Rt, p_rt and nivel from InfoDengue are nowcasts that are revised

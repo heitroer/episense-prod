@@ -75,8 +75,13 @@ def process_infodengue_data(df: pd.DataFrame) -> pd.DataFrame:
     rename_dict = {k: v for k, v in col_mapping.items() if k in df.columns}
     df = df.rename(columns=rename_dict)
     
-    # Ensure SE is string with YYYYWW format
-    df['SE'] = df['SE'].astype(str).str.zfill(6)
+    # Ensure SE is string with YYYYWW format - robust to float \"202628.0\" from CSV numeric coercion
+    def _norm_se(s):
+        se_str = str(s).strip()
+        if '.' in se_str:
+            se_str = se_str.split('.')[0]
+        return se_str.zfill(6)
+    df['SE'] = df['SE'].apply(_norm_se)
     
     # Extract year and week
     df['ano'] = df['SE'].str[:4].astype(int)
@@ -106,11 +111,16 @@ def update_full_history(df_new: pd.DataFrame, full_path: Path) -> pd.DataFrame:
     while refreshing the latest weeks with their most current values.
     """
     df_new = df_new.copy()
-    df_new['SE'] = df_new['SE'].astype(str).str.zfill(6)
+    def _norm_se2(s):
+        se_str = str(s).strip()
+        if '.' in se_str:
+            se_str = se_str.split('.')[0]
+        return se_str.zfill(6)
+    df_new['SE'] = df_new['SE'].apply(_norm_se2)
 
     if full_path.exists():
         df_full = pd.read_csv(full_path)
-        df_full['SE'] = df_full['SE'].astype(str).str.zfill(6)
+        df_full['SE'] = df_full['SE'].apply(_norm_se2)
         df_full = df_full[~df_full['SE'].isin(df_new['SE'])]
         df_merged = pd.concat([df_full, df_new], ignore_index=True)
     else:

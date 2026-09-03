@@ -1,7 +1,7 @@
 """
-Feature Engineering EXPERIMENTAL para Episense-Teste (melhoria de metricas).
+Feature Engineering EXPERIMENTAL para Episense-Prod (melhoria de metricas v2).
 
-Base: versao Aedex-Ultra (expand_extra) + NOVAS familias de features que atacam
+Base: versao Aedex-Ultra (expand_extra) + familias que atacam
 a degradacao h5-h8 e a sazonalidade anual da dengue:
 
   expand_seasonal (flag):
@@ -19,9 +19,22 @@ a degradacao h5-h8 e a sazonalidade anual da dengue:
     - acumulados de precip em janelas 16/20/26 semanas
     - interacao temp x umid com medias moveis (estresse termico prolongado)
 
+  NOVO v2 (expand_climatology):
+    - media climatologica 3 anos para casos e clima (lag52,104,156)
+    - anomalias vs climatologia (casos, precip, temp, umid)
+    - desvio padrao climatologico 3y e ratio
+
+  NOVO v2 (expand_trend):
+    - slopes lineares 4/8/12 semanas, momentum, CV, aceleracao
+    - growth rates 1/2/4 semanas
+
+  NOVO v2 (expand_outbreak):
+    - semanas acima de limiares 50/100/200 em janelas 4/8/12
+    - weeks_since_peak_52, intensidade surto, flags rising/falling
+
 Convencao avancada: log_lagN = log_casos.shift(N), NUNCA shift(0).
 Nenhuma feature usa informacao futura (todas shift >= 1 ou rolling com
-min_periods=1 sobre o passado).
+min_periods sobre o passado, incluindo current que e conhecido em t).
 """
 
 import pandas as pd
@@ -37,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class EpisenseFeatureEngineer:
-    """Advanced feature engineering for dengue prediction (experimental)."""
+    """Advanced feature engineering for dengue prediction (experimental v2)."""
 
     def __init__(self, config=None):
         self.config = config or {}
@@ -46,6 +59,11 @@ class EpisenseFeatureEngineer:
         self.expand_extra = bool(self.config.get('features', {}).get('expand_extra', False))
         self.expand_seasonal = bool(self.config.get('features', {}).get('expand_seasonal', False))
         self.expand_weather_long = bool(self.config.get('features', {}).get('expand_weather_long', False))
+        self.expand_climatology = bool(self.config.get('features', {}).get('expand_climatology', False))
+        self.expand_trend = bool(self.config.get('features', {}).get('expand_trend', False))
+        self.expand_outbreak = bool(self.config.get('features', {}).get('expand_outbreak', False))
+        self.outbreak_threshold = self.config.get('metrics', {}).get('classification_thresholds', {}).get('outbreak_threshold', 50)
+        self.outbreak_thresholds = [self.outbreak_threshold, self.outbreak_threshold * 2, self.outbreak_threshold * 4]
 
     def create_lag_features(self, df: pd.DataFrame, target_col: str = 'log_casos',
                             max_lag: int = 12, convention: str = 'advanced') -> pd.DataFrame:
@@ -54,16 +72,10 @@ class EpisenseFeatureEngineer:
         prefix = target_col
 
         if convention == 'legacy':
-            if target_col == 'log_casos':
-                df['log_lag1'] = df[target_col].shift(0)
-                for n in range(2, max_lag + 1):
-                    df[f'log_lag{n}'] = df[target_col].shift(n - 1)
-            else:
-                for n in range(1, max_lag + 1):
-                    df[f'{prefix}_lag{n}'] = df[target_col].shift(n)
-        else:
-            for n in range(1, max_lag + 1):
-                df[f'{prefix}_lag{n}'] = df[target_col].shift(n)
+            raise ValueError("convention='legacy' desabilitado: shift 0 causava vazamento de dados (mesma semana). Use convention='advanced' (shift N)")
+
+        for n in range(1, max_lag + 1):
+            df[f'{prefix}_lag{n}'] = df[target_col].shift(n)
 
         return df
 
@@ -104,20 +116,26 @@ class EpisenseFeatureEngineer:
     def create_seasonal_features(self, df: pd.DataFrame, semana_col: str = 'semana',
                                  ano_col: str = 'ano') -> pd.DataFrame:
         df = df.copy()
-        df['sin_semana'] = np.sin(2 * np.pi * df[semana_col] / 52)
-        df['cos_semana'] = np.cos(2 * np.pi * df[semana_col] / 52)
-        df['mes_aprox'] = (df[semana_col] * 12 / 52).astype(int).clip(1, 12)
+        # FIX: handle 53-week years (2014,2020,2025) - denominator per year, not fixed 52
+        try:
+            from data.epiweeks import weeks_in_year
+            weeks = df[ano_col].apply(lambda y: weeks_in_year(int(y)))
+        except Exception:
+            weeks = 52
+        df['sin_semana'] = np.sin(2 * np.pi * df[semana_col] / weeks)
+        df['cos_semana'] = np.cos(2 * np.pi * df[semana_col] / weeks)
+        df['mes_aprox'] = (df[semana_col] * 12 / weeks).astype(int).clip(1, 12)
         df['sin_mes'] = np.sin(2 * np.pi * df['mes_aprox'] / 12)
         df['cos_mes'] = np.cos(2 * np.pi * df['mes_aprox'] / 12)
         # ano_raw: normalizado POR FOLD (treino) em train.py - nunca global
         df['ano_raw'] = df[ano_col]
-        df['verao'] = df[semana_col].isin(list(range(1, 14)) + list(range(49, 53))).astype(int)
+        df['verao'] = df[semana_col].isin(list(range(1, 14)) + list(range(49, 54))).astype(int)
         df['outono'] = df[semana_col].between(14, 26).astype(int)
         df['inverno'] = df[semana_col].between(27, 39).astype(int)
         df['primavera'] = df[semana_col].between(40, 48).astype(int)
         for k in [1, 2, 3]:
-            df[f'sin_{k}_semana'] = np.sin(2 * np.pi * k * df[semana_col] / 52)
-            df[f'cos_{k}_semana'] = np.cos(2 * np.pi * k * df[semana_col] / 52)
+            df[f'sin_{k}_semana'] = np.sin(2 * np.pi * k * df[semana_col] / weeks)
+            df[f'cos_{k}_semana'] = np.cos(2 * np.pi * k * df[semana_col] / weeks)
         return df
 
     def create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -231,13 +249,15 @@ class EpisenseFeatureEngineer:
             df['log_casos_ytd'] = np.log1p(df['casos_ytd'])
             df['casos_ytd_rate'] = df['casos_ytd'] / df['semana'].clip(lower=1)
 
-        # YTD do ano passado (mesmo ponto do ciclo) + razao
-        if 'casos_ytd' in df.columns and 'ano' in df.columns:
-            df['casos_ytd_prev_year'] = df.groupby('ano')['casos_ytd'].shift(52)
+        # YTD do ano passado (mesmo ponto do ciclo) + razao - alinhado por semana (respeita 53 semanas)
+        if 'casos_ytd' in df.columns:
+            df['casos_ytd_prev_year'] = df.groupby('semana')['casos_ytd'].shift(1)
             df['ytd_share_prev_year'] = df['casos_ytd'] / (df['casos_ytd_prev_year'] + 1e-6)
             df['log_ytd_ratio'] = np.log1p(df['casos_ytd']) - np.log1p(df['casos_ytd_prev_year'].fillna(0))
+            # razao YTD suavizada
+            df['ytd_ratio_roll4'] = df['ytd_share_prev_year'].rolling(4, min_periods=1).mean()
 
-        logger.info("expand_seasonal: lags T-52/53, YoY, YTD e razoes anuais adicionados")
+        logger.info("expand_seasonal: lags T-52/53, YoY, YTD e razoes anuais adicionados (fix shift 52 global)")
         return df
 
     def create_weather_long_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -281,6 +301,249 @@ class EpisenseFeatureEngineer:
         return df
 
     # ------------------------------------------------------------------
+    # NOVO v2: Climatologia 3 anos
+    # ------------------------------------------------------------------
+    def create_climatology_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Climatologia empirica 3 anos: media de lag52/104/156 e anomalias.
+
+        Ataca diretamente o baseline sazonal usado no denominador do SPL/WIS:
+        se o modelo sabe a expectativa climatologica para a mesma semana,
+        pode calibrar melhor h5-h8 onde a autocorrelacao curta ja nao basta.
+        Todas features usam apenas passado (shift >=52), sem vazamento.
+        """
+        df = df.copy()
+        if 'log_casos' not in df.columns:
+            return df
+
+        # --- Casos: lags longos adicionais e climatologia 3y ---
+        if 'log_casos_lag104' not in df.columns:
+            df['log_casos_lag104'] = df['log_casos'].shift(104)
+        if 'log_casos_lag156' not in df.columns:
+            df['log_casos_lag156'] = df['log_casos'].shift(156)
+
+        # Casos climatologia 3 anos (media e desvio das mesmas semanas em 1,2,3 anos atrás)
+        clim_cols = [c for c in ['log_casos_lag52', 'log_casos_lag104', 'log_casos_lag156'] if c in df.columns]
+        if clim_cols:
+            df['log_casos_clim_mean_3y'] = df[clim_cols].mean(axis=1)
+            df['log_casos_clim_std_3y'] = df[clim_cols].std(axis=1)
+            df['log_casos_clim_median_3y'] = df[clim_cols].median(axis=1)
+            # Anomalia vs climatologia (quanto a semana atual está acima do esperado)
+            df['log_casos_anomaly_clim'] = df['log_casos'] - df['log_casos_clim_mean_3y']
+            df['log_casos_anomaly_clim_lag1'] = df['log_casos'].shift(1) - df['log_casos_clim_mean_3y'].shift(1)
+            # ratio casos vs clim (em escala log, mas ratio em casos)
+            # evita divisao por zero: clip clim mean
+            df['log_casos_clim_ratio'] = df['log_casos'] / df['log_casos_clim_mean_3y'].clip(lower=0.5)
+            # desvio normalizado (z-score)
+            df['log_casos_clim_zscore'] = (df['log_casos'] - df['log_casos_clim_mean_3y']) / (df['log_casos_clim_std_3y'] + 0.5)
+            # YoY suavizado 3y
+            df['log_casos_yoy_clim'] = df['log_casos'] - df['log_casos_clim_mean_3y']
+            df['log_casos_yoy_clim_roll4'] = df['log_casos_yoy_clim'].rolling(4, min_periods=1).mean()
+
+        # --- Clima climatologia 3y para precip/temp/humid (core) ---
+        core_climate = [c for c in ['precip_total', 'temp_mean_mean', 'humidity_mean'] if c in df.columns]
+        for col in core_climate:
+            # lags 52,104,156 para clima
+            for lag in [52, 104, 156]:
+                lag_col = f'{col}_lag{lag}_clim'
+                if lag_col not in df.columns:
+                    df[lag_col] = df[col].shift(lag)
+            lag_cols = [f'{col}_lag{lag}_clim' for lag in [52, 104, 156]]
+            # media climatologica
+            df[f'{col}_clim_mean_3y'] = df[lag_cols].mean(axis=1)
+            df[f'{col}_clim_std_3y'] = df[lag_cols].std(axis=1)
+            # anomalia atual vs clim
+            df[f'{col}_anomaly_clim'] = df[col] - df[f'{col}_clim_mean_3y']
+            # anomalia do lag1 vs clim daquela semana (feature sem vazamento para prever futuro)
+            if f'{col}_lag1' in df.columns:
+                # clim da semana correspondente ao lag1 (shift 1 da clim)
+                df[f'{col}_anomaly_clim_lag1'] = df[f'{col}_lag1'] - df[f'{col}_clim_mean_3y'].shift(1)
+            else:
+                tmp_lag1 = df[col].shift(1)
+                df[f'{col}_anomaly_clim_lag1'] = tmp_lag1 - df[f'{col}_clim_mean_3y'].shift(1)
+            # desvio relativo
+            df[f'{col}_clim_zscore'] = (df[col] - df[f'{col}_clim_mean_3y']) / (df[f'{col}_clim_std_3y'] + 1e-6)
+            # precipitação: acumulada anomalia 4 semanas
+            if 'precip' in col.lower():
+                # anomalia acumulada 4 semanas
+                df[f'{col}_anomaly_clim_acc4'] = df[f'{col}_anomaly_clim'].rolling(4, min_periods=1).sum()
+                df[f'{col}_anomaly_clim_acc8'] = df[f'{col}_anomaly_clim'].rolling(8, min_periods=1).sum()
+
+        # Temperatura/umid interação climatologica
+        if 'temp_mean_mean_anomaly_clim' in df.columns and 'humidity_mean_anomaly_clim' in df.columns:
+            df['temp_anom_x_hum_anom'] = df['temp_mean_mean_anomaly_clim'] * df['humidity_mean_anomaly_clim']
+            df['temp_anom_x_precip_anom'] = df['temp_mean_mean_anomaly_clim'] * df.get('precip_total_anomaly_clim', 0)
+
+        logger.info("expand_climatology: media 3y + anomalias vs climatologia (casos e clima) adicionados")
+        return df
+
+    # ------------------------------------------------------------------
+    # NOVO v2: Tendencia / volatilidade
+    # ------------------------------------------------------------------
+    def create_trend_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Tendencia, momentum, volatilidade e aceleracao.
+
+        Slopes lineares capturam a direcao da epidemia - crucial para h5-h8
+        onde o modelo precisa extrapolar a curva (subida/descida) em vez de
+        apenas copiar o ultimo valor. CV e aceleracao detectam inflexoes.
+        """
+        df = df.copy()
+        if 'log_casos' not in df.columns:
+            return df
+
+        # Helper para slope via polyfit rolling
+        def slope_for_window(series: pd.Series, window: int) -> pd.Series:
+            # rolling com window exige min_periods=window para slope estável
+            return series.rolling(window, min_periods=window).apply(
+                lambda x: np.polyfit(np.arange(window), x, 1)[0] if len(x) == window else np.nan,
+                raw=True
+            )
+
+        for window in [4, 8, 12]:
+            # slope linear
+            df[f'log_casos_slope_{window}'] = slope_for_window(df['log_casos'], window)
+            # slope tambem com lag1 (tendencia ate semana passada, sem usar current para prever h>=1?)
+            # mas log_casos atual é conhecido em t, então slope incluindo t é válido.
+            # adiciona slope suavizado lag1
+            df[f'log_casos_slope_{window}_lag1'] = df[f'log_casos_slope_{window}'].shift(1)
+
+            # momentum: diferenca window
+            df[f'log_casos_momentum_{window}'] = df['log_casos'] - df['log_casos'].shift(window)
+            # volatility: CV = std/mean
+            roll_mean = df['log_casos'].rolling(window, min_periods=1).mean()
+            roll_std = df['log_casos'].rolling(window, min_periods=1).std()
+            df[f'log_casos_cv_{window}'] = roll_std / (roll_mean.abs() + 0.5)
+            # rolling std puro (ja tem mas adiciona CV)
+            # burst: max - min
+            roll_max = df['log_casos'].rolling(window, min_periods=1).max()
+            roll_min = df['log_casos'].rolling(window, min_periods=1).min()
+            df[f'log_casos_range_{window}'] = roll_max - roll_min
+
+            # aceleracao: diferenca do momentum
+            df[f'log_casos_accel_{window}'] = df[f'log_casos_momentum_{window}'].diff(1)
+            # aceleracao do slope
+            df[f'log_casos_slope_accel_{window}'] = df[f'log_casos_slope_{window}'].diff(1)
+
+        # Aceleração curta (1-2 semanas) detecta inflexão rápida
+        df['log_casos_accel_1_2'] = df['log_casos'].diff(1) - df['log_casos'].diff(1).shift(1)
+        # growth rates em casos (nao log) para interpretabilidade 1/2/4 semanas
+        for lag in [1, 2, 4]:
+            # diff log já existe, mas adiciona crescimento relativo em casos
+            shifted = df['casos'].shift(lag) if 'casos' in df.columns else np.expm1(df['log_casos'].shift(lag))
+            current = df['casos'] if 'casos' in df.columns else np.expm1(df['log_casos'])
+            df[f'casos_growth_rate_{lag}'] = (current - shifted) / (shifted + 5)
+            # log growth ratio
+            df[f'log_casos_growth_ratio_{lag}'] = df['log_casos'] / (df['log_casos'].shift(lag).clip(lower=0.5))
+
+        # Tendencia relativa à climatologia (se disponivel)
+        if 'log_casos_clim_mean_3y' in df.columns:
+            df['trend_vs_clim_4'] = df['log_casos_momentum_4'] - (df['log_casos_clim_mean_3y'] - df['log_casos_clim_mean_3y'].shift(4))
+            df['trend_vs_clim_8'] = df['log_casos_momentum_8'] - (df['log_casos_clim_mean_3y'] - df['log_casos_clim_mean_3y'].shift(8))
+
+        # EWMA ratio: atual vs EWMA (desvio de tendencia suavizada)
+        for span in [4, 8]:
+            ewma_col = f'log_casos_ewma_{span}'
+            if ewma_col in df.columns:
+                df[f'log_casos_vs_ewma_{span}'] = df['log_casos'] - df[ewma_col]
+                df[f'log_casos_vs_ewma_{span}_lag1'] = df[f'log_casos_vs_ewma_{span}'].shift(1)
+
+        logger.info("expand_trend: slopes 4/8/12, momentum, CV, range, accel e growth rates adicionados")
+        return df
+
+    # ------------------------------------------------------------------
+    # NOVO v2: Surto / fase epidemica
+    # ------------------------------------------------------------------
+    def create_outbreak_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fase epidemica, contagem de semanas acima de limiar e tempo desde pico.
+
+        Surto em dengue é auto-reforçado: semanas consecutivas acima de
+        limiar + tempo desde ultimo pico informam se a epidemia está em
+        ascensao, pico ou declínio - sinal forte para h5-h8.
+        """
+        df = df.copy()
+        if 'casos' not in df.columns or 'log_casos' not in df.columns:
+            return df
+
+        # Contagem de semanas acima de limiares em janelas recentes (shift 1 para não usar current futuro)
+        for thresh in self.outbreak_thresholds:
+            indicator = (df['casos'] > thresh).astype(int)
+            shifted = indicator.shift(1)
+            for w in [4, 8, 12]:
+                df[f'weeks_above_{thresh}_last{w}'] = shifted.rolling(w, min_periods=1).sum()
+                df[f'weeks_above_{thresh}_last{w}_rate'] = df[f'weeks_above_{thresh}_last{w}'] / w
+            # streak consecutivo atual (quantas semanas seguidas acima do limiar até t-1)
+            # calculado via loop simples (n=816, trivial)
+            streak = np.zeros(len(df), dtype=float)
+            c = 0
+            for i, val in enumerate(shifted.fillna(0).astype(int).values):
+                if val == 1:
+                    c += 1
+                else:
+                    c = 0
+                streak[i] = c
+            df[f'streak_above_{thresh}'] = streak
+
+        # Tempo desde ultimo pico em 52 semanas (excluindo current)
+        logc = df['log_casos'].values
+        weeks_since_peak = np.full(len(df), np.nan)
+        peak_value_52 = np.full(len(df), np.nan)
+        for i in range(len(df)):
+            start = max(0, i - 52)
+            window = logc[start:i]  # exclui i
+            if len(window) == 0:
+                continue
+            max_idx = int(np.argmax(window))
+            peak_pos = start + max_idx
+            weeks_since_peak[i] = i - peak_pos - 1
+            peak_value_52[i] = window[max_idx]
+        df['weeks_since_peak_52'] = weeks_since_peak
+        df['weeks_since_peak_52_norm'] = weeks_since_peak / 52.0
+        df['peak_value_52'] = peak_value_52
+        df['dist_from_peak_52'] = df['log_casos'].shift(1) - df['peak_value_52']
+        # tempo desde pico suavizado: se pico recente (<8 semanas), epidemia em declínio
+        df['recent_peak_flag'] = (df['weeks_since_peak_52'] < 8).astype(int)
+        df['old_peak_flag'] = (df['weeks_since_peak_52'] > 20).astype(int)
+
+        # Intensidade de surto: soma ultimas 4 semanas vs baseline climatologico
+        casos_sum4 = df['casos'].shift(1).rolling(4, min_periods=1).sum()
+        # baseline: media 3y climatologica convertida para casos ou media rolling 52
+        if 'log_casos_clim_mean_3y' in df.columns:
+            clim_cases = np.expm1(df['log_casos_clim_mean_3y'].shift(1))
+            df['outbreak_intensity_4'] = casos_sum4 / (clim_cases + 20)
+            df['outbreak_intensity_8'] = df['casos'].shift(1).rolling(8, min_periods=1).sum() / (clim_cases.rolling(8, min_periods=1).sum() + 20)
+        else:
+            base = df['casos'].shift(1).rolling(52, min_periods=12).mean()
+            df['outbreak_intensity_4'] = casos_sum4 / (base + 20)
+
+        # Flags de fase epidemica simples
+        # rising se diff positiva 2 semanas seguidas, falling idem
+        diff1 = df['log_casos'].diff(1)
+        df['epi_rising_2w'] = ((diff1 > 0) & (diff1.shift(1) > 0)).astype(int)
+        df['epi_falling_2w'] = ((diff1 < 0) & (diff1.shift(1) < 0)).astype(int)
+        df['epi_rising_3w'] = ((diff1 > 0) & (diff1.shift(1) > 0) & (diff1.shift(2) > 0)).astype(int)
+        df['epi_falling_3w'] = ((diff1 < 0) & (diff1.shift(1) < 0) & (diff1.shift(2) < 0)).astype(int)
+
+        # Acelerando: diff atual > media dos ultimos 8 diffs + 0.5*std
+        if 'log_casos_diff_1' in df.columns:
+            roll_mean_diff = df['log_casos_diff_1'].shift(1).rolling(8, min_periods=3).mean()
+            roll_std_diff = df['log_casos_diff_1'].shift(1).rolling(8, min_periods=3).std()
+            df['epi_accelerating'] = (df['log_casos_diff_1'] > roll_mean_diff + 0.5 * roll_std_diff.fillna(0)).astype(int)
+            df['epi_decelerating'] = (df['log_casos_diff_1'] < roll_mean_diff - 0.5 * roll_std_diff.fillna(0)).astype(int)
+        else:
+            df['epi_accelerating'] = 0
+            df['epi_decelerating'] = 0
+
+        # Razao pico atual vs pico historico 52w (proximidade de recorde)
+        df['peak_ratio_52'] = np.expm1(df['log_casos'].shift(1)) / (np.expm1(df['peak_value_52']) + 10)
+
+        # Semanas acima de mediana climatologia
+        if 'log_casos_clim_median_3y' in df.columns:
+            above_clim = (df['log_casos'] > df['log_casos_clim_median_3y']).astype(int).shift(1)
+            df['weeks_above_clim_last8'] = above_clim.rolling(8, min_periods=1).sum()
+
+        logger.info("expand_outbreak: semanas acima limiar, weeks_since_peak, intensidade e flags de fase adicionados")
+        return df
+
+    # ------------------------------------------------------------------
     def select_features(self, df: pd.DataFrame, target_col: str = 'target',
                         exclude_cols: List[str] = None, all_horizons: List[int] = None) -> Tuple[pd.DataFrame, List[str]]:
         df = df.copy()
@@ -320,7 +583,7 @@ class EpisenseFeatureEngineer:
                                      target_horizons: List[int] = [1, 2, 3, 4],
                                      legacy_mode: bool = False) -> pd.DataFrame:
         """Run complete feature engineering pipeline (shared treino/inferencia)."""
-        logger.info("Starting advanced feature engineering (EXP)...")
+        logger.info("Starting advanced feature engineering (EXP v2)...")
         df = df.copy()
 
         se_col = df['SE'].copy() if 'SE' in df.columns else None
@@ -417,6 +680,24 @@ class EpisenseFeatureEngineer:
         if self.expand_weather_long:
             df = self.create_weather_long_features(df)
 
+        # ============================================================
+        # EXPANSAO 4 (expand_climatology - v2): media 3y e anomalias vs clim
+        # ============================================================
+        if self.expand_climatology:
+            df = self.create_climatology_features(df)
+
+        # ============================================================
+        # EXPANSAO 5 (expand_trend - v2): slopes, momentum, CV, accel
+        # ============================================================
+        if self.expand_trend:
+            df = self.create_trend_features(df)
+
+        # ============================================================
+        # EXPANSAO 6 (expand_outbreak - v2): fase epidemica e contagens
+        # ============================================================
+        if self.expand_outbreak:
+            df = self.create_outbreak_features(df)
+
         if legacy_mode or convention == 'legacy':
             logger.warning("legacy_mode nao suportado no modo EXP (use convention='advanced')")
 
@@ -428,9 +709,8 @@ class EpisenseFeatureEngineer:
         if se_col is not None and 'SE' not in df.columns:
             df['SE'] = se_col
 
-        logger.info(f"Feature engineering complete (EXP). Shape: {df.shape}, Features: {len(feature_cols)}")
+        logger.info(f"Feature engineering complete (EXP v2). Shape: {df.shape}, Features: {len(feature_cols)}")
         return df
-
 
 def create_target_variables(df: pd.DataFrame, horizons: List[int] = [1, 2, 3, 4],
                            target_col: str = 'log_casos') -> pd.DataFrame:
@@ -439,7 +719,6 @@ def create_target_variables(df: pd.DataFrame, horizons: List[int] = [1, 2, 3, 4]
         df[f'target_h{h}'] = df[target_col].shift(-h)
     df['target'] = df['target_h1']
     return df
-
 
 if __name__ == "__main__":
     import sys

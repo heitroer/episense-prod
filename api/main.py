@@ -95,9 +95,9 @@ def _fetch_infodengue() -> pd.DataFrame:
 
 def _fetch_openmeteo() -> pd.DataFrame:
     """Fetch latest weather data from OpenMeteo API directly (no CSV storage)."""
-    # Get last 2 years of daily data (enough for lags/rolling up to 26 weeks)
+    # Get last ~171 weeks (1200 days) of daily data — suficiente para 156 semanas (lags/rolling + cobertura minima)
     end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=730)
+    start_date = end_date - timedelta(days=1200)
     
     params = {
         'latitude': LAT,
@@ -205,34 +205,43 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
     merged['ano'] = merged['SE'].str[:4].astype(int)
     merged['semana'] = merged['SE'].str[4:].astype(int)
     
-    # NOWCAST SUBSTITUTION: Use max of confirmados and nowcast
+    # NOWCAST: treino usa casos puro, inferencia usa nowcast nas ultimas 12 semanas
+    # Aplica max(casos, casos_est) apenas nas ultimas 12 linhas (janela nowcast) ordenadas por SE
     if 'casos_est' in merged.columns:
+        merged = merged.sort_values('SE').reset_index(drop=True)
         merged['casos'] = pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
         merged['casos_est'] = pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-        mask = merged['casos_est'] > merged['casos']
+        n = len(merged)
+        mask = (merged['casos_est'] > merged['casos']) & (merged.index >= n - 12)
         if mask.any():
             merged.loc[mask, 'casos'] = np.round(merged.loc[mask, 'casos_est']).astype(int)
-            logger.info(f"Nowcast substitution: {mask.sum()} weeks updated")
+            logger.info(f"Nowcast substitution: {mask.sum()} weeks updated (janela 12 semanas)")
     
     # Base features for feature engineering compatibility
     merged['log_casos'] = np.log1p(merged['casos'])
-    merged['sin_semana'] = np.sin(2 * np.pi * merged['semana'] / 52)
-    merged['cos_semana'] = np.cos(2 * np.pi * merged['semana'] / 52)
+    # FIX: sazonalidade com weeks_in_year para anos 53 semanas
+    try:
+        from data.epiweeks import weeks_in_year
+        weeks = merged['ano'].apply(lambda y: weeks_in_year(int(y)))
+        merged['sin_semana'] = np.sin(2 * np.pi * merged['semana'] / weeks)
+        merged['cos_semana'] = np.cos(2 * np.pi * merged['semana'] / weeks)
+    except Exception:
+        merged['sin_semana'] = np.sin(2 * np.pi * merged['semana'] / 52)
+        merged['cos_semana'] = np.cos(2 * np.pi * merged['semana'] / 52)
     
-    # Legacy lags (for compatibility with trained models)
-    merged['log_lag1'] = merged['log_casos'].shift(0)
-    for lag in range(2, 9):
-        merged[f'log_lag{lag}'] = merged['log_casos'].shift(lag - 1)
+    # Lags corrigidos: shift N (sem vazamento), antes era shift 0 / N-1
+    for lag in range(1, 9):
+        merged[f'log_lag{lag}'] = merged['log_casos'].shift(lag)
     
-    # Weather lags (legacy)
+    # Weather lags corrigidos: shift 2 e 4 (antes 1 e 3)
     temp_col = None
     for c in ['temp_mean', 'temp_mean_mean', 'tempmed']:
         if c in merged.columns:
             temp_col = c
             break
     if temp_col:
-        merged['temp_lag2'] = merged[temp_col].shift(1)
-        merged['temp_lag4'] = merged[temp_col].shift(3)
+        merged['temp_lag2'] = merged[temp_col].shift(2)
+        merged['temp_lag4'] = merged[temp_col].shift(4)
     
     precip_col = None
     for c in ['precip_total', 'precip']:
@@ -240,8 +249,8 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
             precip_col = c
             break
     if precip_col:
-        merged['precip_lag2'] = merged[precip_col].shift(1)
-        merged['precip_lag4'] = merged[precip_col].shift(3)
+        merged['precip_lag2'] = merged[precip_col].shift(2)
+        merged['precip_lag4'] = merged[precip_col].shift(4)
     
     hum_col = None
     for c in ['humidity_mean', 'relative_humidity_2m_mean', 'umidmed']:
@@ -249,8 +258,8 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
             hum_col = c
             break
     if hum_col:
-        merged['humidity_lag2'] = merged[hum_col].shift(1)
-        merged['humidity_lag4'] = merged[hum_col].shift(3)
+        merged['humidity_lag2'] = merged[hum_col].shift(2)
+        merged['humidity_lag4'] = merged[hum_col].shift(4)
     
     return merged
 
@@ -272,13 +281,17 @@ def _get_latest_engineered_data() -> pd.DataFrame:
     
     if dengue_df.empty:
         raise HTTPException(status_code=503, detail="Failed to fetch dengue data")
+    if weather_df.empty:
+        raise HTTPException(status_code=503, detail="Failed to fetch weather data")
+    if len(weather_df) < 156:
+        logger.warning(f"Weather coverage below minimum: {len(weather_df)} weeks < 156 weeks required")
     
     # Merge and process in memory
     merged = _merge_and_prepare(dengue_df, weather_df)
     
-    # Full feature engineering
+    # Full feature engineering (usa config com expand_* v2)
     from data.features import EpisenseFeatureEngineer
-    fe = EpisenseFeatureEngineer()
+    fe = EpisenseFeatureEngineer(config)
     engineered = fe.run_full_feature_engineering(
         merged,
         convention='advanced',

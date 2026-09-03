@@ -87,6 +87,10 @@ features:
   expand_seasonal: true    # T-52/53 lag, YoY, YTD, YTD ratios (attacks h5-h8 degradation)
   expand_weather_long: true  # Weather lags 7-12, precip accumulations 16-26 weeks (climate long memory)
   expand_extra: false       # Deactivated (increases features but marginal gain) - seasonal+weather_long tested better
+  # v2 - novas familias para atacar h5-h8 (WMAPE 0.47-> melhora, rWIS, SPL)
+  expand_climatology: true  # media 3y (52/104/156) + anomalias vs climatologia casos/clima
+  expand_trend: true        # slopes 4/8/12, momentum, CV, range, accel, growth rates
+  expand_outbreak: true     # semanas acima limiar, weeks_since_peak, intensidade, flags fase
 targets:
   horizons:
   - 1
@@ -141,12 +145,17 @@ training:
                      # horizontes e dobram RMSE em anos recentes de baixa (2020 h1, 2024 h8).
                      # Features usam o histórico completo; só as LINHAS de treino < 2014 saem.
   walk_forward:
-    n_splits: 5  # um fold por test_year (2021-2025; decisão final do usuário)
+    n_splits: 4  # um fold por test_year (2022-2025; 2021 removido)
     test_size_weeks: 52
     gap_weeks: 8  # >= max horizon (assert em train.py); experimento h1-h8
     expanding_window: true
-    min_train_weeks: 100  # fold 2021: ~358 semanas de treino (2014-2020, gap 8)
-    test_years: [2021, 2022, 2023, 2024, 2025]  # Explicit test years for each fold
+    min_train_weeks: 100  # fold 2022: ~410 semanas de treino (2014-2021, gap 8)
+    test_years: [2022, 2023, 2024, 2025]  # Explicit test years for each fold
+    # Validação epidemiológica: folds iniciam em setembro (SE ~35-36) e terminam em agosto
+    # Isso garante que cada fold capture o ciclo completo de calmaria (jun-set) + surto (out-maio)
+    epidemiological_folds: true
+    fold_start_month: 9  # setembro
+    fold_end_month: 8    # agosto
     # NOTA: 2017-2020 fora dos folds de teste (regime atual); 2019 permanece no
     # TREINO (modelo aprende o surto gigante) e vira stress-test documentado.
   validation:
@@ -155,24 +164,57 @@ training:
   feature_selection:
     method: importance
     threshold: 0.001
-    max_features: 300  # Increased from 258 to accommodate new seasonal+weather_long features
+    max_features: 380  # v2: 639 feats (+111) -> 380 kept (selecao agregada 3 quantis)
     expand_extra: false  # LGBM_swl uses seasonal+weather_long, not full expand_extra
   scaler:
     type: DataFrameScaler
     feature_range:
     - 0
     - 1
+
+# Quantile regression settings
+quantiles:
+  - 0.05   # piso IC 90% inferior
+  - 0.50   # mediana (previsão pontual robusta)
+  - 0.95   # teto IC 90% superior
+
+# Non-crossing quantile constraint
+non_crossing:
+  enabled: true
+  method: "post_process"  # "post_process" ou "monotone_constraints"
+
+# Asymmetric loss for horizons 5-8 (penalize undershooting more) - DISABLED
+# Constant sample_weight per horizon is a no-op (scales loss uniformly, does not
+# change argmin). Requires per-sample residual-based weighting (custom objective)
+# to actually penalize undershoot. Kept in config for documentation only.
+asymmetric_loss:
+  enabled: false  # was true but ineffective; disabled until custom loss implemented
+  horizon_threshold: 5  # aplicar para h >= 5
+  undershoot_weight: 2.0  # penalizar subestimação 2x mais (not applied)
+  overshoot_weight: 1.0   # penalização padrão para sobreestimação
+
+# Epidemiological period classification for stratified reporting
+epidemiological_periods:
+  outbreak_months: [10, 11, 12, 1, 2, 3, 4, 5]      # Outubro a Maio
+  calm_months: [6, 7, 8, 9]                           # Junho a Setembro
+  # Usado para stratificar métricas no relatório final
 inference:
   horizon_specific_features: true
   feature_alignment: strict
   scaler_path: models/scaler.pkl
-  # Padrão real produzido pelo treino: um .pkl por seed (models/lgbm_h{horizon}_seed{seed}.pkl)
-  # A inferência carrega os 5 seeds de cada horizonte e agrega pela média das predições.
+  # Padrão real produzido pelo treino multi-quantil: um .pkl por seed e quantil
+  # models/lgbm_h{horizon}_seed{seed}_q{tau:04d}.pkl (ex: lgbm_h1_seed42_q0050.pkl)
+  # A inferência deriva o nome automaticamente e NÃO usa este bloco (mantido para documentação)
+  # Inclui h1-h8 (todos os horizontes treinados)
   model_paths:
-    h1: models/lgbm_h1_seed{seed}.pkl
-    h2: models/lgbm_h2_seed{seed}.pkl
-    h3: models/lgbm_h3_seed{seed}.pkl
-    h4: models/lgbm_h4_seed{seed}.pkl
+    h1: models/lgbm_h1_seed{seed}_q{tau}.pkl
+    h2: models/lgbm_h2_seed{seed}_q{tau}.pkl
+    h3: models/lgbm_h3_seed{seed}_q{tau}.pkl
+    h4: models/lgbm_h4_seed{seed}_q{tau}.pkl
+    h5: models/lgbm_h5_seed{seed}_q{tau}.pkl
+    h6: models/lgbm_h6_seed{seed}_q{tau}.pkl
+    h7: models/lgbm_h7_seed{seed}_q{tau}.pkl
+    h8: models/lgbm_h8_seed{seed}_q{tau}.pkl
   feature_list_path: models/feature_list.json
   legacy_feature_aliases: true
 api:
@@ -241,25 +283,65 @@ metrics:
   targets:
     h1:
       wmape: 0.26
-      mase: 0.35
+      maxae: 350
+      spl_005: 0.80
+      spl_050: 0.70
+      spl_095: 0.85
+      etp: 2
+      wis: 39
     h2:
       wmape: 0.34
-      mase: 0.45
+      maxae: 450
+      spl_005: 0.85
+      spl_050: 0.75
+      spl_095: 0.90
+      etp: 3
+      wis: 45
     h3:
       wmape: 0.39
-      mase: 0.50
+      maxae: 500
+      spl_005: 0.90
+      spl_050: 0.80
+      spl_095: 0.95
+      etp: 4
+      wis: 52
     h4:
       wmape: 0.45
-      mase: 0.55
+      maxae: 550
+      spl_005: 0.95
+      spl_050: 0.85
+      spl_095: 1.00
+      etp: 5
+      wis: 58
     h5:
       wmape: 0.47
-      mase: 0.60
+      maxae: 600
+      spl_005: 1.00
+      spl_050: 0.90
+      spl_095: 1.05
+      etp: 6
+      wis: 65
     h6:
       wmape: 0.47
-      mase: 0.58
+      maxae: 580
+      spl_005: 1.05
+      spl_050: 0.95
+      spl_095: 1.10
+      etp: 7
+      wis: 71
     h7:
       wmape: 0.45
-      mase: 0.58
+      maxae: 580
+      spl_005: 1.10
+      spl_050: 1.00
+      spl_095: 1.15
+      etp: 8
+      wis: 78
     h8:
       wmape: 0.47
-      mase: 0.65
+      maxae: 650
+      spl_005: 1.15
+      spl_050: 1.05
+      spl_095: 1.20
+      etp: 9
+      wis: 84

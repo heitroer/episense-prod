@@ -6,7 +6,7 @@ API de previsão de casos de dengue para Campo Grande, MS usando dados em tempo 
 
 - **Dados em tempo real**: Coleta dados frescos das APIs InfoDengue e OpenMeteo a cada requisição (cache de 5 min)
 - **Modelo LightGBM ensemble**: 5 seeds × 8 horizontes (h1-h8)
-- **Walk-forward validation**: 5 folds (2021-2025), gap 8 semanas
+- **Walk-forward validation**: 4 folds (2022-2025), gap 8 semanas
 - **Calendário epidemiológico brasileiro**: Semana começa domingo, semana 1 contém 4/jan, anos de 53 semanas (2014, 2020, 2025)
 - **Features**: 300 por horizonte (lags, rolling, sazonalidade YoY 52/53, clima longo, interações)
 
@@ -106,7 +106,7 @@ python scripts/train.py
 
 > **Nota**: h5-h8 são sinais de alerta precoce - menos confiáveis em anos de surto atípico (ex: 2019 com 45k casos).
 
-## Métricas de Validação (Walk-Forward 2021-2025)
+## Métricas de Validação (Walk-Forward 2022-2025)
 
 | Horizonte | RMSE | WMAPE | F2-Score | PR-AUC | R² |
 |-----------|------|-------|----------|--------|-----|

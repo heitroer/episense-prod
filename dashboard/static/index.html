@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Episense - Vigilancia de dengue</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#05070d;
+  --panel:#0b0f19;
+  --panel-2:#101622;
+  --panel-3:#151c2b;
+  --line:#243044;
+  --line-2:#334155;
+  --text:#f4f7fb;
+  --text-2:#cbd5e1;
+  --muted:#8a97aa;
+  --muted-2:#64748b;
+  --accent:#2dd4bf;
+  --accent-2:#67e8f9;
+  --forecast:#f59e0b;
+  --danger:#fb7185;
+  --ok:#34d399;
+  --warn:#fbbf24;
+  --radius:14px;
+  --shadow:0 20px 60px rgba(0,0,0,.36);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:var(--bg);scroll-behavior:smooth}
+body{min-height:100vh;background:radial-gradient(circle at 12% -8%,rgba(45,212,191,.14),transparent 34%),radial-gradient(circle at 95% 0,rgba(103,232,249,.08),transparent 28%),var(--bg);color:var(--text);font-family:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.45;-webkit-font-smoothing:antialiased}
+button,input{font:inherit}
+button{cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.page{width:min(1500px,100%);margin:0 auto;padding:18px 22px 28px}
+.top{height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);margin-bottom:18px}
+.brand{display:flex;align-items:baseline;gap:12px;min-width:0}.brand h1{font-size:24px;letter-spacing:-.04em;line-height:1;font-weight:700}.brand span{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);white-space:nowrap}.statusbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.status{border:1px solid var(--line);background:rgba(11,15,25,.8);color:var(--text-2);height:32px;border-radius:999px;padding:0 12px;display:inline-flex;align-items:center;gap:8px;font:500 12px "IBM Plex Mono",monospace}.status[data-state=ok]::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok)}.ghost{height:32px;border:1px solid var(--line);background:transparent;color:var(--text-2);border-radius:999px;padding:0 12px;font-size:12px;font-weight:600}.ghost:hover{border-color:var(--accent);color:var(--text)}
+.grid{display:grid;grid-template-columns:1fr 320px;gap:16px}.main{min-width:0;display:flex;flex-direction:column;gap:16px}.side{min-width:0;display:flex;flex-direction:column;gap:16px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}.hero-block{background:linear-gradient(180deg,rgba(16,22,34,.96),rgba(11,15,25,.96));padding:22px}.kicker{font:600 11px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}.hero h2{font-size:clamp(30px,4vw,56px);line-height:.96;letter-spacing:-.055em;max-width:780px}.hero p{margin-top:14px;color:var(--text-2);max-width:62ch;font-size:14px}.readout{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line)}.readout .cell{background:var(--panel);padding:18px}.cell label{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.cell strong{display:block;margin-top:8px;font:500 28px "IBM Plex Mono",monospace;letter-spacing:-.04em}.cell small{display:block;color:var(--muted);font-size:11px;margin-top:4px}.controls{display:grid;grid-template-columns:1fr 280px 270px;gap:12px;align-items:stretch}.control{background:rgba(11,15,25,.92);border:1px solid var(--line);border-radius:var(--radius);padding:14px}.control h3{font-size:12px;color:var(--text-2);font-weight:700;margin-bottom:10px}.horizon{display:grid;grid-template-columns:repeat(8,1fr);gap:6px}.pill{height:34px;border:1px solid var(--line);background:var(--panel-2);color:var(--text-2);border-radius:10px;font:600 12px "IBM Plex Mono",monospace;transition:transform .16s ease,border-color .16s ease,background .16s ease,color .16s ease}.pill:hover{border-color:var(--accent);transform:translateY(-1px)}.pill.active{background:var(--accent);border-color:var(--accent);color:#031412}.range-wrap{display:flex;align-items:center;gap:12px}.range-wrap input{width:100%;accent-color:var(--accent)}.range-value{min-width:54px;height:30px;border-radius:999px;background:var(--panel-3);display:grid;place-items:center;font:500 12px "IBM Plex Mono",monospace;color:var(--text)}.originbox{display:flex;flex-direction:column;gap:8px}.originline{font:500 12px "IBM Plex Mono",monospace;color:var(--text)}.hint{font-size:12px;color:var(--muted);line-height:1.45}.chart-panel{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}.chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px 18px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,43,.9),rgba(11,15,25,.9))}.chart-head h3{font-size:16px;letter-spacing:-.02em}.chart-head p{font-size:12px;color:var(--muted);margin-top:4px}.chart-meta{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.tag{height:28px;border:1px solid var(--line);background:var(--panel-2);border-radius:999px;padding:0 10px;display:inline-flex;align-items:center;font:500 11px "IBM Plex Mono",monospace;color:var(--text-2);white-space:nowrap}.plot-wrap{height:492px;padding:10px 10px 4px}.chart-shell{position:relative;height:100%;width:100%}.legend{display:flex;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding:10px 18px;background:rgba(5,7,13,.82)}.legend span{display:inline-flex;align-items:center;gap:7px;color:var(--text-2);font-size:12px}.sw{width:20px;height:3px;border-radius:99px;background:var(--accent)}.sw.real{background:#e8eef7}.sw.hist{background:#67e8f9;border-top:2px dashed #67e8f9;height:0}.sw.fc{background:var(--forecast)}.sw.band{height:10px;background:rgba(245,158,11,.18);border:1px solid rgba(245,158,11,.5)}.forecast{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden}.forecast h3{padding:14px 16px;border-bottom:1px solid var(--line);font-size:14px}.fc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line)}.fc{background:var(--panel);padding:12px}.fc label{display:flex;align-items:center;justify-content:space-between;font:600 11px "IBM Plex Mono",monospace;color:var(--muted)}.fc strong{display:block;font:500 28px "IBM Plex Mono",monospace;letter-spacing:-.04em;margin-top:6px}.fc small{color:var(--muted);font-size:11px}.fc.active{background:linear-gradient(180deg,rgba(45,212,191,.14),var(--panel))}.side-card{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);padding:16px}.side-card h3{font-size:14px;margin-bottom:10px}.side-card p{font-size:12px;color:var(--text-2);line-height:1.55}.note-list{display:flex;flex-direction:column;gap:10px}.note{border-left:2px solid var(--line-2);padding-left:10px}.note b{display:block;font-size:12px;color:var(--text)}.note span{display:block;font-size:12px;color:var(--muted);margin-top:2px}.skeleton{position:relative;overflow:hidden;background:var(--panel-2);border-radius:10px;min-height:90px}.skeleton:after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.08),transparent);animation:shimmer 1.1s infinite}@keyframes shimmer{to{transform:translateX(100%)}}.error{border:1px solid rgba(251,113,133,.45);background:rgba(251,113,133,.1);color:#fecdd3;border-radius:12px;padding:14px;font-size:13px}.fade-in{animation:fade .28s cubic-bezier(.16,1,.3,1)}@keyframes fade{from{opacity:.55;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:1100px){.grid{grid-template-columns:1fr}.side{grid-template-columns:1fr 1fr;display:grid}.controls{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.readout{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:760px){.page{padding:12px}.top{height:auto;align-items:flex-start;flex-direction:column;padding-bottom:12px}.brand{align-items:flex-start;flex-direction:column;gap:4px}.hero-block{padding:18px}.readout{grid-template-columns:repeat(2,1fr)}.horizon{grid-template-columns:repeat(4,1fr)}.side{display:flex}.plot-wrap{height:420px}.chart-head{flex-direction:column}.chart-meta{justify-content:flex-start}.fc-grid{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div class="brand"><h1>Episense</h1><span>Campo Grande MS - vigilancia semanal de dengue</span></div>
+    <div class="statusbar"><span class="status" data-state="ok" id="model-status">carregando</span><button class="ghost" id="health-btn" type="button">status</button></div>
+  </header>
+
+  <section class="hero">
+    <div class="hero-block">
+      <div class="kicker">Painel operacional</div>
+      <h2>Previsao semanal com origem fixa no grafico.</h2>
+      <p>Use os horizontes historicos para comparar desempenho. Clique em uma semana para manter a mesma origem de previsao durante as trocas.</p>
+    </div>
+    <div class="readout">
+      <div class="cell"><label>WMAPE h1</label><strong id="m-h1">--</strong><small>meta 26%</small></div>
+      <div class="cell"><label>WMAPE h4</label><strong id="m-h4">--</strong><small>meta 45%</small></div>
+      <div class="cell"><label>WMAPE h8</label><strong id="m-h8">--</strong><small>meta 47%</small></div>
+      <div class="cell"><label>Cobertura h1</label><strong id="m-cov">--</strong><small>intervalo historico</small></div>
+    </div>
+  </section>
+
+  <div class="grid" style="margin-top:16px">
+    <main class="main">
+      <section class="controls">
+        <div class="control">
+          <h3>Horizonte historico</h3>
+          <div class="horizon" id="horizon-control"></div>
+        </div>
+        <div class="control">
+          <h3>Janela</h3>
+          <div class="range-wrap"><input id="window-range" type="range" min="12" max="104" value="52" step="1"><span class="range-value" id="window-label">52</span></div>
+        </div>
+        <div class="control originbox">
+          <h3>Origem de previsao</h3>
+          <div class="originline" id="origin-line">selecione no grafico</div>
+          <button class="ghost" id="latest-btn" type="button">usar mais recente</button>
+        </div>
+      </section>
+
+      <section class="chart-panel">
+        <div class="chart-head">
+          <div><h3>Casos reais, historico previsto e previsao futura</h3><p id="chart-subtitle">Cada semana e um ponto clicavel. O eixo mostra poucos rotulos para nao poluir.</p></div>
+          <div class="chart-meta"><span class="tag" id="range-tag">--</span><span class="tag" id="scope-tag">4 folds 2022-2025</span><span class="tag" id="origin-tag">origem --</span></div>
+        </div>
+        <div class="plot-wrap"><div class="chart-shell"><canvas id="chart"></canvas></div></div>
+        <div class="legend">
+          <span><i class="sw real"></i>real</span>
+          <span><i class="sw hist"></i>historico h<span id="legend-h">1</span></span>
+          <span><i class="sw band"></i>intervalo futuro</span>
+          <span><i class="sw fc"></i>previsao futura</span>
+        </div>
+      </section>
+    </main>
+
+    <aside class="side">
+      <section class="forecast"><h3>Previsao a partir da origem</h3><div class="fc-grid" id="forecast-grid"><div class="fc skeleton"></div><div class="fc skeleton"></div></div></section>
+      <section class="side-card"><h3>Leitura rapida</h3><div class="note-list"><div class="note"><b>Origem preservada</b><span>Trocar h1 a h8 nao muda a origem clicada.</span></div><div class="note"><b>Eixo curto</b><span>Rotulos amostrados, pontos semanais completos no hover.</span></div><div class="note"><b>Historico correto</b><span>Fonte filtrada para walk-forward final 2022-2025.</span></div></div></section>
+    </aside>
+  </div>
+</div>
+
+<script>
+const css = getComputedStyle(document.documentElement);
+const C = name => css.getPropertyValue(name).trim();
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const state = {h:'1', win:52, originSE:null, originDate:null, history:[], forecast:null, chart:null, cache:new Map(), forecastCache:new Map(), loading:false};
+const el = {
+  horizon:document.getElementById('horizon-control'), win:document.getElementById('window-range'), winLabel:document.getElementById('window-label'), chart:document.getElementById('chart'),
+  range:document.getElementById('range-tag'), originTag:document.getElementById('origin-tag'), originLine:document.getElementById('origin-line'), subtitle:document.getElementById('chart-subtitle'),
+  forecast:document.getElementById('forecast-grid'), legendH:document.getElementById('legend-h'), modelStatus:document.getElementById('model-status'), latest:document.getElementById('latest-btn'), health:document.getElementById('health-btn')
+};
+function seFmt(se){const s=String(se);return s.slice(0,4)+'S'+s.slice(4).padStart(2,'0')}
+function seLabel(se){const s=String(se);return s.slice(2,4)+'/'+s.slice(4).padStart(2,'0')}
+async function json(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(String(r.status));return r.json()}
+function pct(v){return v==null||Number.isNaN(v)?'--':(v*100).toFixed(1)+'%'}
+function num(v){return v==null||Number.isNaN(v)?'--':Math.round(v).toLocaleString('pt-BR')}
+function level(v){if(v==null)return ['--',C('--muted')]; if(v<10)return ['baixo',C('--ok')]; if(v<50)return ['medio',C('--warn')]; if(v<100)return ['alto',C('--forecast')]; return ['critico',C('--danger')]}
+function hButtons(){el.horizon.innerHTML=''; for(let h=1;h<=8;h++){const b=document.createElement('button');b.type='button';b.className='pill'+(String(h)===state.h?' active':'');b.textContent='h'+h;b.onclick=()=>setH(String(h));el.horizon.appendChild(b)}}
+async function loadMetrics(){try{const m=await json('/api/metrics');document.getElementById('m-h1').textContent=pct(m['1']?.wmape);document.getElementById('m-h4').textContent=pct(m['4']?.wmape);document.getElementById('m-h8').textContent=pct(m['8']?.wmape);document.getElementById('m-cov').textContent=pct(m['1']?.coverage_90);const health=await json('/health');el.modelStatus.textContent=health.status+' '+health.models+' modelos'}catch(e){el.modelStatus.textContent='erro de API'}}
+async function loadHistory(){
+  if(state.loading)return; state.loading=true;
+  const key=state.h+':'+state.win;
+  try{
+    const data = state.cache.get(key) || await json('/api/history?horizon='+state.h+'&window='+state.win);
+    state.cache.set(key,data);
+    state.history=data.history||[];
+    if(!state.history.length){drawError('sem dados');return}
+    const first=state.history[0], last=state.history[state.history.length-1];
+    if(!state.originSE){state.originSE=String(last.SE);state.originDate=last.date||last.SE}
+    el.range.textContent=seFmt(first.SE)+' a '+seFmt(last.SE)+' - '+state.history.length+' semanas';
+    el.legendH.textContent=state.h;
+    syncOriginUI();
+    renderChart();
+    const currentOrigin = String(state.originSE);
+    const needsForecast = !state.forecast || String(state.forecast.origin_se)!==currentOrigin;
+    if(needsForecast){
+      el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
+      loadForecast(currentOrigin).then(()=>{
+        if(String(state.originSE)!==currentOrigin)return;
+        syncOriginUI();
+        renderForecast();
+        renderChart();
+      }).catch(()=>{ if(String(state.originSE)===currentOrigin)el.forecast.innerHTML='<div class="fc"><small>erro ao buscar previsao</small></div>'; });
+    }else{
+      renderForecast();
+    }
+  }catch(e){drawError('erro ao carregar historico: '+e.message)}
+  finally{state.loading=false}
+}
+async function loadForecast(se){
+  if(!se)return;
+  const key=String(se);
+  const data=state.forecastCache.get(key) || await json('/api/forecast?origin_se='+encodeURIComponent(key));
+  state.forecastCache.set(key,data);
+  if(!data.error){state.forecast=data;state.originSE=String(data.origin_se||se);state.originDate=data.origin_date||state.originDate}
+}
+function syncOriginUI(){const label=state.originSE?seFmt(state.originSE):'--';el.originTag.textContent='origem '+label;el.originLine.textContent=state.originSE?label+(state.originDate?' - '+state.originDate:''):'selecione no grafico';el.subtitle.textContent='Origem fixa em '+label+'. Trocar horizonte historico mantem a previsao futura.'}
+function renderForecast(){
+  const rows=(state.forecast?.forecast||[]).slice().sort((a,b)=>a.h-b.h); if(!rows.length){el.forecast.innerHTML='<div class="fc"><small>sem previsao para esta origem</small></div>';return}
+  el.forecast.innerHTML='';
+  rows.forEach(f=>{const [txt,col]=level(f.q50);const card=document.createElement('div');card.className='fc'+(f.h===Number(state.h)?' active':'');card.innerHTML='<label><span>h'+f.h+'</span><span>'+seFmt(f.target_se)+'</span></label><strong>'+num(f.q50)+'</strong><small>'+num(f.q05)+' a '+num(f.q95)+' casos</small><small style="display:block;color:'+col+';margin-top:6px;font-weight:700">'+txt+'</small>';el.forecast.appendChild(card)})
+}
+function series(){
+  const hist=state.history, labels=hist.map(p=>seFmt(p.SE)), byLabel=new Map(labels.map((l,i)=>[l,i]));
+  const full=[...labels]; const fc=state.forecast?.forecast||[]; fc.forEach(f=>{const l=seFmt(f.target_se); if(!byLabel.has(l)&&!full.includes(l))full.push(l)});
+  const base=()=>Array(full.length).fill(null);
+  const real=base(), pred=base(), low=base(), high=base();
+  hist.forEach((p,i)=>{real[i]=p.real;pred[i]=p.pred;low[i]=p.pred_low??null;high[i]=p.pred_high??null});
+  const fLow=base(), fHigh=base(), fMed=base();
+  fc.forEach(f=>{const i=full.indexOf(seFmt(f.target_se)); if(i>=0){fLow[i]=f.q05;fHigh[i]=f.q95;fMed[i]=f.q50}});
+  return {full,real,pred,low,high,fLow,fHigh,fMed,originIndex:full.indexOf(seFmt(state.originSE||''))};
+}
+const originPlugin={id:'originLine',afterDatasetsDraw(chart,args,opts){const idx=opts.index;if(idx<0)return;const x=chart.scales.x.getPixelForValue(idx), top=chart.chartArea.top, bottom=chart.chartArea.bottom, ctx=chart.ctx;ctx.save();ctx.strokeStyle=C('--danger');ctx.lineWidth=1.4;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=C('--danger');ctx.font='600 11px IBM Plex Mono';ctx.textAlign='center';ctx.fillText('origem',x,top+14);ctx.restore()}};
+Chart.register(originPlugin);
+function renderChart(){
+  const s=series(); const step=Math.max(1,Math.ceil(s.full.length/16));
+  const data={labels:s.full,datasets:[
+    {label:'real',data:s.real,borderColor:'#e8eef7',backgroundColor:'#e8eef7',borderWidth:2,pointRadius:2,pointHoverRadius:5,pointHitRadius:14,tension:.28,spanGaps:true},
+    {label:'historico inferior',data:s.low,borderColor:'transparent',backgroundColor:'rgba(103,232,249,.08)',pointRadius:0,tension:.28,spanGaps:true},
+    {label:'historico superior',data:s.high,borderColor:'transparent',backgroundColor:'rgba(103,232,249,.08)',fill:'-1',pointRadius:0,tension:.28,spanGaps:true},
+    {label:'historico mediana h'+state.h,data:s.pred,borderColor:C('--accent-2'),backgroundColor:C('--accent-2'),borderDash:[5,5],borderWidth:1.8,pointRadius:0,pointHoverRadius:4,pointHitRadius:14,tension:.28,spanGaps:true},
+    {label:'futuro inferior',data:s.fLow,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'futuro superior',data:s.fHigh,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'previsao futura',data:s.fMed,borderColor:C('--forecast'),backgroundColor:C('--forecast'),borderWidth:2.2,pointRadius:3,pointHoverRadius:5,pointHitRadius:14,tension:.25,spanGaps:false}
+  ]};
+  const opts={responsive:true,maintainAspectRatio:false,animation:reducedMotion?false:{duration:360,easing:'easeOutQuart'},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},originLine:{index:s.originIndex},tooltip:{backgroundColor:'#0b0f19',titleColor:C('--text'),bodyColor:C('--text-2'),borderColor:C('--line-2'),borderWidth:1,padding:10,callbacks:{title(items){return items[0]?.label||''},label(ctx){if(ctx.parsed.y==null)return null;return ctx.dataset.label+': '+num(ctx.parsed.y)}}}},scales:{x:{grid:{color:'rgba(51,65,85,.45)'},border:{color:C('--line-2')},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},maxRotation:0,minRotation:0,autoSkip:false,callback(value,index){const lab=this.getLabelForValue(value);if(index===0||index===s.full.length-1)return lab;if(index%step===0)return lab.slice(2);return ''}}},y:{beginAtZero:true,grid:{color:'rgba(51,65,85,.5)'},border:{display:false},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},callback:v=>Number(v).toLocaleString('pt-BR')}}},onClick(evt,elements,chart){let idx=elements[0]?.index;if(idx==null){const x=evt.x??evt.native?.offsetX;idx=Math.round(chart.scales.x.getValueForPixel(x))}const label=s.full[idx];const found=state.history.find(p=>seFmt(p.SE)===label);if(found)setOrigin(String(found.SE),found.date)}};
+  if(!state.chart){state.chart=new Chart(el.chart,{type:'line',data,options:opts})}else{state.chart.options=opts;state.chart.data=data;state.chart.update(reducedMotion?'none':'active')}
+}
+function drawError(msg){const box=document.querySelector('.chart-shell');box.innerHTML='<div class="error">'+msg+'</div>'}
+let originRequest = 0;
+async function setOrigin(se,date){
+  const requestId = ++originRequest;
+  state.originSE=String(se);
+  state.originDate=date||state.originDate;
+  syncOriginUI();
+  renderChart();
+  el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
+  try{
+    await loadForecast(state.originSE);
+    if(requestId!==originRequest)return;
+    syncOriginUI();
+    renderForecast();
+    renderChart();
+    el.forecast.classList.remove('fade-in');void el.forecast.offsetWidth;el.forecast.classList.add('fade-in');
+  }catch(e){
+    if(requestId===originRequest)el.forecast.innerHTML='<div class="fc"><small>erro ao buscar previsao</small></div>';
+  }
+}
+async function setH(h){if(state.h===h)return;state.h=h;hButtons();renderForecast();await loadHistory()}
+el.win.addEventListener('input',()=>{el.winLabel.textContent=el.win.value});
+let winTimer=null;el.win.addEventListener('input',()=>{clearTimeout(winTimer);winTimer=setTimeout(()=>{state.win=Number(el.win.value);loadHistory()},220)});
+el.latest.addEventListener('click',async()=>{const last=state.history[state.history.length-1];if(last)await setOrigin(String(last.SE),last.date)});
+el.health.addEventListener('click',()=>window.open('/health','_blank'));
+(async function init(){hButtons();el.winLabel.textContent=el.win.value;await loadMetrics();await loadHistory()})();
+</script>
+</body>
+</html>

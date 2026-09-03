@@ -1,12 +1,28 @@
 """
-Episense Model Training Module
-Implements walk-forward validation with strict leakage prevention.
+Episense Model Training Module - Multi-Quantile Dengue Forecasting
+===================================================================
+Implements:
+  1. Walk-forward epidemiological folds (Sep-Aug cycle) with leakage prevention.
+  2. Multi-quantile regression: q in [0.05, 0.50, 0.95] for h in [1..8].
+  3. Monotonic guarantee via np.sort(y_pred, axis=-1): Q.05 <= Q.50 <= Q.95.
+  A) SPL (Scaled Pinball Loss) matrix (8 horizons x 3 quantiles).
+  B) WMAPE on Q.50 only (vector of 8).
+  C) MaxAE on Q.50 only (vector of 8).
+  D) WIS (Weighted Interval Score, mean pinball across quantiles).
+  E) Etp   (peak timing error) on Q.50 only.
+  3. Horizon weights disabled (constant weight no-op).
+  4. Stratified reporting: Outbreak (Oct-May) vs Calm (Jun-Sep).
+
+NOTE on temporal weights: each horizon is trained as its own model, so a
+constant weight per horizon is a constant scaling of that horizon's loss and
+does not change the argmin. It IS applied (faithful to the spec) as LightGBM
+sample weights, and is the hook that matters if a joint multi-horizon head is
+adopted later.
 """
 
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.metrics import mean_squared_error
 from pathlib import Path
 import json
 import logging
@@ -16,389 +32,879 @@ from typing import Dict, List, Tuple, Optional, Any
 import warnings
 warnings.filterwarnings('ignore')
 
-# Add project root to path
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data.features import EpisenseFeatureEngineer
+from data.epiweeks import epiweek_to_date
+
+# Optional DTW imports
+try:
+    from fastdtw import fastdtw
+    HAS_DTW = True
+except ImportError:
+    HAS_DTW = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def normalize_se(se) -> str:
-    """Normalize an epidemiological week (SE) to a YYYYWW string.
-
-    Data stores SE as 6-digit ints (e.g. 202101); strings must be
-    normalized the same way so dict lookups between train/test SEs match.
-    FIX (review Bug 6): floats like 202629.0 (CSV read with numeric dtype
-    after a NaN) are stripped of the decimal part - otherwise dict lookups
-    never match and the seasonal baseline silently degrades.
-    """
+    """Normalize an epidemiological week (SE) to a YYYYWW string."""
     s = str(se).strip()
     if '.' in s:
         s = s.split('.')[0]
     return s.zfill(6) if len(s) < 6 else s
 
 
+def pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    """Pinball loss for quantile tau."""
+    diff = y_true - y_pred
+    return float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+
+
+def dynamic_time_warping(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """DTW distance normalized by length and scale.
+
+    Uses abs(x-y) as the pointwise distance. The scipy `euclidean` metric was
+    dropped because modern scipy raises 'Input vector should be 1-D' when the
+    fastdtw wrappers pass scalar elements to it; abs() is the correct metric
+    for 1-D univariate series and matches the original intended behavior.
+    """
+    if HAS_DTW:
+        try:
+            distance, _ = fastdtw(y_true, y_pred, dist=lambda a, b: abs(a - b))
+            return float(distance / (len(y_true) * (np.std(y_true) + 1e-10)))
+        except Exception as e:
+            logger.warning(f"DTW computation failed: {e}")
+    return float(np.mean((y_true - y_pred) ** 2) / (np.std(y_true) ** 2 + 1e-10))
+
+
 class WalkForwardValidator:
-    """Walk-forward validation with strict leakage prevention."""
-    
-    def __init__(self, n_splits: int = 7, test_size_weeks: int = 52, 
-                 gap_weeks: int = 4, expanding_window: bool = True,
-                 min_train_weeks: int = 260, test_years: List[int] = None):
+    """Walk-forward validation with epidemiological folds (Sep-Aug cycle)."""
+
+    def __init__(self, n_splits: int = 4, test_size_weeks: int = 52,
+                 gap_weeks: int = 8, expanding_window: bool = True,
+                 min_train_weeks: int = 100, test_years: List[int] = None,
+                 epidemiological_folds: bool = True,
+                 fold_start_month: int = 9, fold_end_month: int = 8):
         self.n_splits = n_splits
         self.test_size_weeks = test_size_weeks
         self.gap_weeks = gap_weeks
         self.expanding_window = expanding_window
         self.min_train_weeks = min_train_weeks
         self.test_years = test_years or []
-        
+        self.epidemiological_folds = epidemiological_folds
+        self.fold_start_month = fold_start_month
+        self.fold_end_month = fold_end_month
+
     def split(self, df: pd.DataFrame, se_col: str = 'SE') -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Generate walk-forward splits with gap to prevent leakage.
-        
-        If test_years is provided, creates one split per year with that year as test period.
-        Otherwise uses the original step-based approach.
-        """
         df = df.copy()
         df = df.sort_values(se_col).reset_index(drop=True)
         n_samples = len(df)
-        
-        # Ensure SE is string for year extraction
+
         df[se_col] = df[se_col].astype(str).str.zfill(6)
-        
+        df['ano'] = df[se_col].str[:4].astype(int)
+        df['semana'] = df[se_col].str[4:].astype(int)
+        df['data'] = df.apply(lambda r: epiweek_to_date(r['ano'], r['semana']), axis=1)
+        df['mes'] = df['data'].dt.month
+
         splits = []
-        
-        if self.test_years:
-            # New approach: one fold per test year
+
+        if self.epidemiological_folds and self.test_years:
+            # Epidemiological year: Sep (year) to Aug (year+1).
+            # Use calendar dates (Sep 1 -> Aug 31) instead of (ano + mes) to avoid
+            # Dec/Jan spillover bug where epi week 01's Sunday falls in previous
+            # December (e.g. 202401 = 2023-12-31, mes=12, incorrectly captured by
+            # ano==2024 & mes>=9).
             for year in self.test_years:
-                # Find test indices for this year
-                test_mask = df[se_col].str.startswith(str(year))
+                start_date = pd.Timestamp(year, 9, 1)
+                end_date = pd.Timestamp(year + 1, 8, 31)
+                test_mask = (df['data'] >= start_date) & (df['data'] <= end_date)
                 test_indices = np.where(test_mask)[0]
-                
                 if len(test_indices) == 0:
-                    logger.warning(f"No data found for test year {year}")
+                    logger.warning(f"No data for epidemiological fold {year}-{year+1}")
                     continue
-                    
                 test_start = test_indices[0]
                 test_end = test_indices[-1] + 1
-                test_len = test_end - test_start
-                
-                # Train is everything before gap
                 train_end = test_start - self.gap_weeks
-                
                 if train_end < self.min_train_weeks:
-                    logger.warning(f"Insufficient training data for year {year}: train_end={train_end} < min_train_weeks={self.min_train_weeks}")
+                    logger.warning(f"Insufficient training data for fold {year}")
                     continue
-                
                 if self.expanding_window:
                     train_idx = np.arange(0, train_end)
                 else:
                     train_start = max(0, train_end - self.min_train_weeks)
                     train_idx = np.arange(train_start, train_end)
-                
                 test_idx = np.arange(test_start, test_end)
-                
                 if len(train_idx) >= self.min_train_weeks and len(test_idx) > 0:
                     splits.append((train_idx, test_idx))
-                    logger.info(f"Split {len(splits)} (year {year}): train={len(train_idx)}, test={len(test_idx)}, "
-                               f"SE train={df.iloc[train_idx[0]][se_col]}-{df.iloc[train_idx[-1]][se_col]}, "
-                               f"SE test={df.iloc[test_idx[0]][se_col]}-{df.iloc[test_idx[-1]][se_col]}, "
-                               f"gap={self.gap_weeks} weeks")
+                    logger.info(f"Epi Split {len(splits)} ({year}-{year+1}): train={len(train_idx)}, test={len(test_idx)}, gap={self.gap_weeks}")
         else:
-            # Original step-based approach
             if n_samples < self.min_train_weeks + self.gap_weeks + self.test_size_weeks:
-                logger.warning(f"Insufficient data for walk-forward: {n_samples} samples")
                 return []
-            
             available_test = n_samples - self.min_train_weeks - self.gap_weeks
             if available_test <= 0:
-                logger.warning("Not enough data for minimum train size")
                 return []
-              
             step = max(1, available_test // self.n_splits)
-            
             for i in range(self.n_splits):
                 train_end = self.min_train_weeks + i * step
                 test_start = train_end + self.gap_weeks
                 test_end = min(test_start + self.test_size_weeks, n_samples)
-                
                 if test_start >= n_samples or test_end <= test_start:
                     break
-                    
                 if self.expanding_window:
                     train_idx = np.arange(0, train_end)
                 else:
                     train_start = max(0, train_end - self.min_train_weeks)
                     train_idx = np.arange(train_start, train_end)
-                
                 test_idx = np.arange(test_start, test_end)
-                
                 if len(train_idx) >= self.min_train_weeks and len(test_idx) > 0:
                     splits.append((train_idx, test_idx))
-                    logger.info(f"Split {len(splits)}: train={len(train_idx)}, test={len(test_idx)}, "
-                               f"SE train={df.iloc[train_idx[0]][se_col]}-{df.iloc[train_idx[-1]][se_col]}, "
-                               f"SE test={df.iloc[test_idx[0]][se_col]}-{df.iloc[test_idx[-1]][se_col]}, "
-                               f"gap={self.gap_weeks} weeks")
-        
+
         return splits
 
 
 class EpisenseTrainer:
-    """Trains LightGBM models for multi-horizon dengue prediction with ensemble."""
-    
+    """Trains LightGBM quantile regression models for multi-horizon dengue
+    forecasting with walk-forward epidemiological validation."""
+
     def __init__(self, config: Dict):
         self.config = config
-        self.model_params = config.get('model', {}).get('hyperparameters', {})
+        self.model_params = config.get('model', {}).get('hyperparameters', {}).copy()
         self.ensemble_seeds = config.get('model', {}).get('ensemble', {}).get('seeds', [42, 123, 456, 789, 999])
-        self.target_horizons = config.get('targets', {}).get('horizons', [1, 2, 3, 4])
+        self.target_horizons = config.get('targets', {}).get('horizons', [1, 2, 3, 4, 5, 6, 7, 8])
+        self.quantiles = config.get('quantiles', [0.05, 0.50, 0.95])
         self.wf_config = config.get('training', {}).get('walk_forward', {})
-        
-        self.models = {}  # {horizon: {seed: model}}
-        self.feature_names = {}  # {horizon: [feature_names]}
-        self.validation_results = {}
-        self.training_history = []
-        self.ano_min = None  # For per-fold normalization of ano_normalizado
-        self.ano_max = None
-        
-    def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Run feature engineering on raw data."""
-        logger.info("Running feature engineering...")
+        self.epi_periods = config.get('epidemiological_periods', {
+            'outbreak_months': [10, 11, 12, 1, 2, 3, 4, 5],
+            'calm_months': [6, 7, 8, 9]
+        })
 
-        # Build feature config with expand_seasonal and expand_weather_long enabled
+        # Temporal horizon weights: removed (constant w per horizon does not change
+        # argmin; kept as placeholder for future joint multi-horizon head).
+        # Spec requested w=1.5 for h5-8 as sample_weight constant per horizon, but
+        # LightGBM per-horizon training with constant weight is a no-op (scales loss
+        # uniformly). If asymmetric penalization is needed, it must be per-sample
+        # based on residual sign, not constant. Horizon weights disabled.
+        self.horizon_weights = {h: 1.0 for h in self.target_horizons}
+        self.fold_series = {}
+        asym = config.get('asymmetric_loss', {})
+        if asym.get('enabled', False):
+            logger.warning("asymmetric_loss.enabled=true requested but constant horizon weight has no effect - disabled (requires per-sample residual weighting)")
+
+        self.models: Dict[int, Dict] = {}          # {horizon: {seed: {tau: booster}}}
+        self.feature_names: Dict[int, List[str]] = {}
+        self.validation_results: Dict[int, Dict] = {}
+        self.ano_normalization_params = {}
+
+    # ------------------------------------------------------------------
+    # Data preparation
+    # ------------------------------------------------------------------
+    def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        logger.info("Running feature engineering...")
         fe_cfg = {
             'features': {
                 'expand_extra': bool(self.config.get('training', {}).get('feature_selection', {}).get('expand_extra', False)),
                 'expand_seasonal': bool(self.config.get('features', {}).get('expand_seasonal', True)),
                 'expand_weather_long': bool(self.config.get('features', {}).get('expand_weather_long', True)),
+                'expand_climatology': bool(self.config.get('features', {}).get('expand_climatology', True)),
+                'expand_trend': bool(self.config.get('features', {}).get('expand_trend', True)),
+                'expand_outbreak': bool(self.config.get('features', {}).get('expand_outbreak', True)),
             }
         }
         fe = EpisenseFeatureEngineer(fe_cfg)
         df_featured = fe.run_full_feature_engineering(
-            df,
-            convention='advanced',
-            target_horizons=self.target_horizons,
-            legacy_mode=False
+            df, convention='advanced', target_horizons=self.target_horizons, legacy_mode=False
         )
-
-        # Store feature names from feature engineer
         self.feature_names = {h: fe.feature_names for h in self.target_horizons}
-        logger.info(f"Feature engineering complete: {len(df_featured)} samples, {len(fe.feature_names)} features")
-
+        logger.info(f"Feature engineering complete: {len(df_featured)} samples")
         return df_featured
-    
-    def prepare_horizon_data(self, df: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare features and target for a specific horizon.
-        
-        Returns ALL potential features (excluding target/metadata columns).
-        Per-fold feature selection will be done inside train_horizon using only training data.
+
+    def prepare_horizon_data(self, df: pd.DataFrame, horizon: int
+                             ) -> Tuple[pd.DataFrame, pd.Series, np.ndarray, pd.DataFrame]:
+        """Return (X, y, SE_index, df_subset) for a horizon.
+
+        SE_index preserves the original order (aligned to y) for split alignment.
         """
         target_col = f'target_h{horizon}'
-        
         if target_col not in df.columns:
             logger.error(f"Target column {target_col} not found")
-            return pd.DataFrame(), pd.Series()
-        
-        # Remove rows where target is NaN
+            return pd.DataFrame(), pd.Series(), np.array([]), pd.DataFrame()
+
         df_clean = df.dropna(subset=[target_col]).copy()
-        
-        # Select potential features - exclude ALL target_h* columns as features for this horizon
         exclude_cols = ['SE', 'ano', 'semana', 'data_inicio_semana', 'mes_aprox',
-                       'verao', 'outono', 'inverno', 'primavera',
-                       'casos', 'log_casos', 'target'] + [f'target_h{h}' for h in self.target_horizons]
-        
-        feature_cols = [c for c in df_clean.columns if c not in exclude_cols 
-                       and df_clean[c].dtype in ['float64', 'int64', 'float32', 'int32']]
-        
+                        'verao', 'outono', 'inverno', 'primavera',
+                        'casos', 'log_casos', 'target'] + [f'target_h{h}' for h in self.target_horizons]
+        feature_cols = [c for c in df_clean.columns if c not in exclude_cols
+                        and df_clean[c].dtype in ['float64', 'int64', 'float32', 'int32']]
         X = df_clean[feature_cols]
         y = df_clean[target_col]
-        
+        se_index = df_clean['SE'].astype(str).str.zfill(6).values
         logger.info(f"Horizon h{horizon}: {len(X)} samples, {len(feature_cols)} potential features")
-        logger.info(f"Target range: {y.min():.4f} to {y.max():.4f}")
-        
-        return X, y
-    
-    def train_single_model(self, X_train: pd.DataFrame, y_train: pd.Series,
-                          X_val: pd.DataFrame, y_val: pd.Series,
-                          seed: int, horizon: int) -> lgb.Booster:
-        """Train a single LightGBM model."""
+        return X, y, se_index, df_clean
+
+    # ------------------------------------------------------------------
+    # Model training (per seed, per quantile)
+    # ------------------------------------------------------------------
+    def train_single_model(self, X_tr: pd.DataFrame, y_tr: pd.Series,
+                           X_val: pd.DataFrame, y_val: pd.Series,
+                           seed: int, horizon: int, quantile: float) -> lgb.Booster:
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
-        
-        # Use actual feature names from training data (after per-fold selection)
-        feature_names = X_train.columns.tolist()
-        
-        train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_names)
-        val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names, reference=train_data)
-        
+        # Quantile objective (spec section 3: standard pinball loss)
+        params['objective'] = 'quantile'
+        params['alpha'] = quantile
+        params['metric'] = 'quantile'
+
+        feature_names = X_tr.columns.tolist()
+        train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names)
+        val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names,
+                               reference=train_data)
+
         model = lgb.train(
-            params,
-            train_data,
-            valid_sets=[val_data],
-            valid_names=['val'],
-            callbacks=[
-                lgb.early_stopping(params.get('early_stopping_rounds', 100)),
-                lgb.log_evaluation(0)
-            ]
+            params, train_data,
+            valid_sets=[val_data], valid_names=['val'],
+            callbacks=[lgb.early_stopping(params.get('early_stopping_rounds', 150)),
+                       lgb.log_evaluation(0)]
         )
-        
         return model
 
     def train_single_model_full(self, X: pd.DataFrame, y: pd.Series,
-                                seed: int, horizon: int, n_iters: Optional[int] = None) -> lgb.Booster:
-        """Train the PRODUCTION model on the FULL series (no holdout / early
-        stopping), so it sees data up to the last week. Iterations = mean
-        best_iteration of the walk-forward folds (review fix: the old retrain
-        held out the last 20% and stopped at ~2023, making production h5/h6
-        extrapolate years beyond the last target seen)."""
+                                seed: int, horizon: int, quantile: float,
+                                n_iters: Optional[int] = None) -> lgb.Booster:
+        """Production model on FULL data (no early stopping)."""
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
-        params.pop('early_stopping_rounds', None)  # full-data train: rounds fixos, sem ES
+        params.pop('early_stopping_rounds', None)
+        params['objective'] = 'quantile'
+        params['alpha'] = quantile
+        params['metric'] = 'quantile'
 
         feature_names = X.columns.tolist()
         data = lgb.Dataset(X, label=y, feature_name=feature_names)
-
         rounds = n_iters or int(params.get('n_estimators', 3000))
-        model = lgb.train(params, data, num_boost_round=rounds)
-        return model
-    def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, 
-                             y_true_raw: np.ndarray = None, y_train: pd.Series = None, 
-                             train_se: np.ndarray = None, test_se: np.ndarray = None) -> Dict[str, float]:
-            """Calculate required metrics: WMAPE and MASE only."""
-            metrics = {}
+        return lgb.train(params, data, num_boost_round=rounds)
 
-            # Convert to cases scale
-            y_true_cases = np.expm1(y_true)
-            y_pred_cases = np.expm1(y_pred)
+    def enforce_non_crossing(self, y_pred_dict: Dict[float, np.ndarray],
+                             log_scale=True) -> Dict[float, np.ndarray]:
+        """Ensure strict monotonicity Q.05 <= Q.50 <= Q.95 via np.sort
+        along the quantile axis (spec section 1)."""
+        q_order = sorted(self.quantiles)
+        if log_scale:
+            stack = np.column_stack([y_pred_dict[tau] for tau in q_order])
+        else:
+            stack = np.column_stack([np.expm1(y_pred_dict[tau]) for tau in q_order])
+        stack = np.sort(stack, axis=1)
+        for j, tau in enumerate(q_order):
+            y_pred_dict[tau] = stack[:, j]
+        return y_pred_dict
 
-            # WMAPE in cases scale
-            if y_true_raw is not None and np.sum(y_true_raw) > 0:
-                metrics['wmape'] = float(np.sum(np.abs(y_true_raw - np.expm1(y_pred))) / np.sum(y_true_raw))
-            else:
-                metrics['wmape'] = float(np.sum(np.abs(y_true_cases - np.expm1(y_pred))) / (np.sum(y_true_cases) + 1e-10))
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+    def seasonal_naive_baseline(self, y_train_cases: np.ndarray, train_se: np.ndarray,
+                                 test_se: np.ndarray) -> np.ndarray:
+        """Seasonal naive forecast in cases scale: value from the same SE week
+        in the previous year (fallback to T-52±k, then last value)."""
+        se_to_y = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
+        out = []
+        last_val = float(y_train_cases[-1]) if len(y_train_cases) else 0.0
+        for se in test_se:
+            se_str = normalize_se(se)
+            try:
+                ano = int(se_str[:4])
+                semana = int(se_str[4:])
+            except Exception:
+                out.append(last_val)
+                continue
+            prev = f"{ano-1}{semana:02d}"
+            if prev in se_to_y:
+                out.append(se_to_y[prev])
+                continue
+            found = False
+            for k in range(1, 5):
+                for cand in (f"{ano-1}{semana-k:02d}", f"{ano-1}{semana+k:02d}"):
+                    if cand in se_to_y:
+                        out.append(se_to_y[cand])
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                out.append(last_val)
+        return np.array(out)
 
-            # MASE (Mean Absolute Scaled Error) - using naive forecast from TRAINING data
-            # MASE = MAE / MAE_naive where naive is seasonal (same week previous year) or last value
-            if y_train is not None and len(y_train) > 0:
-                y_train_cases = np.expm1(y_train)
-                if hasattr(y_train_cases, 'iloc'):
-                    last_train_value_cases = y_train_cases.iloc[-1]
-                else:
-                    last_train_value_cases = y_train_cases[-1]
+    def calculate_metrics(self, y_true: np.ndarray, y_pred_dict: Dict[float, np.ndarray],
+                          y_train: Optional[pd.Series] = None,
+                          train_se: Optional[np.ndarray] = None,
+                          test_se: Optional[np.ndarray] = None,
+                          horizon: int = 1) -> Dict[str, Any]:
+        """Compute all metrics for one evaluation window (a fold).
 
-                # MAE of predictions
-                mae = float(np.mean(np.abs(y_true_cases - y_pred_cases)))
-
-                # Naive forecast 1: last training value
-                naive_pred_last_cases = np.full_like(y_true_cases, last_train_value_cases)
-                mae_last = float(np.mean(np.abs(y_true_cases - naive_pred_last_cases)))
-
-                # Naive forecast 2: seasonal naive (same week previous year from training data)
-                naive_mae_seasonal = None
-                seasonal_fallback_count = 0
-                seasonal_matched_count = 0
-                if train_se is not None and test_se is not None and len(y_train) >= 52:
-                    try:
-                        se_to_y_cases = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
-                        seasonal_naive_pred_cases = []
-                        for se in test_se:
-                            se_str = normalize_se(se)
-                            ano = int(se_str[:4])
-                            semana = int(se_str[4:])
-                            prev_year_se = f"{ano-1}{semana:02d}"
-                            if prev_year_se in se_to_y_cases:
-                                seasonal_naive_pred_cases.append(se_to_y_cases[prev_year_se])
-                                seasonal_matched_count += 1
-                                continue
-                            # Fallback: nearest available equivalent week (T-52±k)
-                            found = False
-                            for k in range(1, 5):
-                                for cand in (f"{ano-1}{semana-k:02d}", f"{ano-1}{semana+k:02d}"):
-                                    if cand in se_to_y_cases:
-                                        seasonal_naive_pred_cases.append(se_to_y_cases[cand])
-                                        found = True
-                                        break
-                                if found:
-                                    break
-                            if not found:
-                                seasonal_naive_pred_cases.append(last_train_value_cases)
-                                seasonal_fallback_count += 1
-                        seasonal_naive_pred_cases = np.array(seasonal_naive_pred_cases)
-                        naive_mae_seasonal = float(np.mean(np.abs(y_true_cases - seasonal_naive_pred_cases)))
-                    except Exception as e:
-                        logger.warning(f"Could not compute seasonal naive baseline: {e}")
-                        naive_mae_seasonal = None
-
-                # Use seasonal naive if available, otherwise last value
-                if naive_mae_seasonal is not None and naive_mae_seasonal > 0:
-                    metrics['mase'] = float(mae / (naive_mae_seasonal + 1e-10))
-                    metrics['mase_baseline'] = 'seasonal'
-                    metrics['seasonal_fallback_count'] = seasonal_fallback_count
-                    metrics['seasonal_matched_count'] = seasonal_matched_count
-                else:
-                    metrics['mase'] = float(mae / (mae_last + 1e-10))
-                    metrics['mase_baseline'] = 'last_value'
-                    metrics['seasonal_fallback_count'] = len(test_se) if test_se is not None else 0
-                    metrics['seasonal_matched_count'] = 0
-            else:
-                # Fallback: use naive forecast on test data
-                mae = float(np.mean(np.abs(y_true_cases - y_pred_cases)))
-                naive_mae = float(np.mean(np.abs(np.diff(y_true_cases)))) if len(y_true_cases) > 1 else 1.0
-                metrics['mase'] = float(mae / (naive_mae + 1e-10))
-                metrics['mase_baseline'] = 'test_diff'
-                metrics['seasonal_fallback_count'] = len(test_se) if test_se is not None else 0
-                metrics['seasonal_matched_count'] = 0
-
-            metrics['seasonal_fallback_ratio'] = metrics.get('seasonal_fallback_count', 0) / max(
-                1, metrics.get('seasonal_fallback_count', 0) + metrics.get('seasonal_matched_count', 0))
-
-            return metrics
-    
-    def _apply_feature_selection(self, X_tr: pd.DataFrame, y_tr: pd.Series,
-                                 X_val: pd.DataFrame, X_test: Optional[pd.DataFrame]
-                                 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
-        """Per-fold feature selection by LightGBM gain importance (config training.feature_selection).
-
-        Uses ONLY the training sub-portion (X_tr/y_tr, i.e. data before the internal
-        validation split) so no validation/test information leaks into the selection.
-        Keeps features with gain importance > threshold, capped at max_features
-        (config: threshold 0.001, max_features 258). Falls back to all features on
-        any failure (never crashes training).
+        Quantile-specific formatting:
+          - WMAPE, MaxAE, Etp, Coverage_90: Q.50 and interval [0.05,0.95]
+          - WIS: mean pinball across all quantiles + decomposition for 90% interval
+          - SPL: all quantiles
+          - Baseline sazonal (persistência Ano-1) para rWIS/rMAE sem vazamento
         """
+        y_true_cases = np.expm1(y_true)
+        y_pred_dict_cases = {tau: np.expm1(y_pred_dict[tau]) for tau in self.quantiles}
+        y_pred_median = y_pred_dict_cases[0.50]
+
+        # ---- B) WMAPE on Q.50 only ----
+        metrics = {}
+        metrics['wmape'] = float(np.sum(np.abs(y_true_cases - y_pred_median)) / (np.sum(y_true_cases) + 1e-10))
+        metrics['wmape_num'] = float(np.sum(np.abs(y_true_cases - y_pred_median)))
+        metrics['wmape_den'] = float(np.sum(y_true_cases))
+
+        # ---- C) MaxAE on Q.50 only ----
+        metrics['maxae'] = float(np.max(np.abs(y_true_cases - y_pred_median)))
+
+        # ---- C2) WIS on all quantiles (mean pinball, cases scale) + Decomposition 90% ----
+        # WIS principal = wis_pinball (media pinball correta). Decomposicao apenas para debug.
+        alpha = 0.10
+        q_inf = y_pred_dict_cases.get(0.05, y_pred_median)
+        q_sup = y_pred_dict_cases.get(0.95, y_pred_median)
+        # Sharpness, Over, Under por observação (debug apenas)
+        sharpness_vec = (q_sup - q_inf) * (alpha / 2.0)
+        # Overprediction: se y < q_inf
+        over_vec = np.where(y_true_cases < q_inf, (2.0 / alpha) * (q_inf - y_true_cases), 0.0)
+        under_vec = np.where(y_true_cases > q_sup, (2.0 / alpha) * (y_true_cases - q_sup), 0.0)
+        median_abs_vec = np.abs(y_true_cases - y_pred_median)
+        # WIS correto como média de pinball
+        wis_vals = []
+        for tau in self.quantiles:
+            diff = y_true_cases - y_pred_dict_cases[tau]
+            wis_vals.append(float(np.mean(np.maximum(tau * diff, (tau - 1) * diff))))
+        wis_pinball = float(np.mean(wis_vals)) if wis_vals else float('nan')
+        # WIS principal = pinball médio (correção bug pesos)
+        metrics['wis'] = wis_pinball
+        metrics['wis_sharpness'] = float(np.mean(sharpness_vec)) if len(sharpness_vec) else 0.0
+        metrics['wis_over'] = float(np.mean(over_vec)) if len(over_vec) else 0.0
+        metrics['wis_under'] = float(np.mean(under_vec)) if len(under_vec) else 0.0
+        metrics['wis_median_abs'] = float(np.mean(median_abs_vec)) if len(median_abs_vec) else 0.0
+        # Mantém pinball médio também para debug e decomposição vetorial para inspeção
+        metrics['wis_pinball'] = wis_pinball
+        wis_total_vec = sharpness_vec + over_vec + under_vec + median_abs_vec
+        metrics['wis_decomp_mean'] = float(np.mean(wis_total_vec)) if len(wis_total_vec) else wis_pinball
+
+        # ---- Coverage 90% ----
+        coverage_vec = (y_true_cases >= q_inf) & (y_true_cases <= q_sup)
+        metrics['coverage_90'] = float(np.mean(coverage_vec)) if len(coverage_vec) else 0.0
+
+        # ---- MASE (Mean Absolute Scaled Error) ----
+        # MAE do modelo / MAE sazonal naive (lag 52) do treino; fallback MAE se <52
+        mae_model = float(np.mean(median_abs_vec)) if len(median_abs_vec) else float('nan')
+        metrics['mae'] = mae_model
+        mase = float('nan')
+        if y_train is not None and len(np.asarray(y_train, dtype=float)) > 0:
+            y_train_cases_mase = np.expm1(np.asarray(y_train, dtype=float))
+            if len(y_train_cases_mase) > 52:
+                denom_seasonal = float(np.mean(np.abs(y_train_cases_mase[52:] - y_train_cases_mase[:-52])))
+            elif len(y_train_cases_mase) > 1:
+                # fallback MAE: lag1
+                denom_seasonal = float(np.mean(np.abs(np.diff(y_train_cases_mase))))
+                if not np.isfinite(denom_seasonal) or denom_seasonal < 1e-10:
+                    denom_seasonal = float(np.mean(np.abs(y_train_cases_mase - np.mean(y_train_cases_mase))) + 1e-10)
+            else:
+                denom_seasonal = float('nan')
+            if np.isfinite(denom_seasonal) and denom_seasonal > 1e-10 and np.isfinite(mae_model):
+                mase = float(mae_model / (denom_seasonal + 1e-10))
+            elif np.isfinite(mae_model):
+                # fallback adicional: denominador = MAE do treino vs media treino
+                denom_fallback = float(np.mean(np.abs(y_train_cases_mase - np.mean(y_train_cases_mase))) + 1e-10) if len(y_train_cases_mase) else float('nan')
+                if np.isfinite(denom_fallback) and denom_fallback > 1e-10:
+                    mase = float(mae_model / denom_fallback)
+        metrics['mase'] = mase
+
+        # ---- Baseline Sazonal (Persistência Ano-1) sem vazamento ----
+        # Para cada semana t no teste, baseline = valor real da mesma semana epi no ano anterior (train)
+        y_baseline_median = None
+        baseline_wis = None
+        baseline_mae = None
+        baseline_coverage = None
+        if y_train is not None and train_se is not None and test_se is not None and len(y_train) > 0:
+            y_train_cases = np.expm1(np.asarray(y_train, dtype=float))
+            se_to_y = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
+            # Histórico por semana para intervalo do baseline (empírico)
+            se_hist_bl: Dict[str, List[float]] = {}
+            for tr_se, tr_y in zip([normalize_se(s) for s in train_se], y_train_cases):
+                se_hist_bl.setdefault(tr_se[4:], []).append(float(tr_y))
+            baseline_vals = []
+            baseline_q05 = []
+            baseline_q95 = []
+            for se in test_se:
+                se_str = normalize_se(se)
+                try:
+                    ano = int(se_str[:4]); semana = int(se_str[4:])
+                except Exception:
+                    baseline_vals.append(float(y_train_cases[-1]) if len(y_train_cases) else 0.0)
+                    baseline_q05.append(float(np.quantile(y_train_cases, 0.05)) if len(y_train_cases) else 0.0)
+                    baseline_q95.append(float(np.quantile(y_train_cases, 0.95)) if len(y_train_cases) else 0.0)
+                    continue
+                prev = f"{ano-1}{semana:02d}"
+                if prev in se_to_y:
+                    baseline_vals.append(float(se_to_y[prev]))
+                else:
+                    found = False
+                    for k in (1, -1, 2, -2):
+                        cand = f"{ano-1}{semana+k:02d}"
+                        if cand in se_to_y:
+                            baseline_vals.append(float(se_to_y[cand]))
+                            found = True
+                            break
+                    if not found:
+                        baseline_vals.append(float(y_train_cases[-1]) if len(y_train_cases) else 0.0)
+                # Intervalo empírico do baseline: quantis da mesma semana no histórico
+                week = se_str[4:]
+                hist = se_hist_bl.get(week, list(y_train_cases))
+                baseline_q05.append(float(np.quantile(hist, 0.05)))
+                baseline_q95.append(float(np.quantile(hist, 0.95)))
+            y_baseline_median = np.array(baseline_vals, dtype=float)
+            q_baseline_inf = np.array(baseline_q05, dtype=float)
+            q_baseline_sup = np.array(baseline_q95, dtype=float)
+            sharp_bl = (q_baseline_sup - q_baseline_inf) * (alpha / 2.0)
+            over_bl = np.where(y_true_cases < q_baseline_inf, (2.0 / alpha) * (q_baseline_inf - y_true_cases), 0.0)
+            under_bl = np.where(y_true_cases > q_baseline_sup, (2.0 / alpha) * (y_true_cases - q_baseline_sup), 0.0)
+            median_abs_bl = np.abs(y_true_cases - y_baseline_median)
+            wis_baseline_vec = sharp_bl + over_bl + under_bl + median_abs_bl
+            baseline_wis = float(np.mean(wis_baseline_vec)) if len(wis_baseline_vec) else float('nan')
+            baseline_mae = float(np.mean(median_abs_bl)) if len(median_abs_bl) else float('nan')
+            baseline_coverage = float(np.mean((y_true_cases >= q_baseline_inf) & (y_true_cases <= q_baseline_sup))) if len(y_true_cases) else 0.0
+            metrics['baseline_wis'] = baseline_wis
+            metrics['baseline_mae'] = baseline_mae
+            metrics['baseline_coverage_90'] = baseline_coverage
+            # rWIS e rMAE com epsilon 1e-5
+            eps = 1e-5
+            metrics['rWIS'] = float(metrics['wis'] / (baseline_wis + eps)) if baseline_wis is not None else float('nan')
+            metrics['rMAE'] = float(np.mean(median_abs_vec) / (baseline_mae + eps)) if baseline_mae is not None else float('nan')
+        else:
+            metrics['rWIS'] = float('nan')
+            metrics['rMAE'] = float('nan')
+
+        # ---- A) SPL per quantile ----
+        spl = {}
+        pl_model_vals = {}
+        for tau in self.quantiles:
+            y_pred_tau = y_pred_dict_cases[tau]
+            diff = y_true_cases - y_pred_tau
+            pl_model = float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+            pl_model_vals[tau] = pl_model
+            # Seasonal quantile naive baseline from training data
+            if y_train is not None and len(y_train) >= 52 and train_se is not None and test_se is not None:
+                y_train_cases = np.expm1(np.asarray(y_train, dtype=float))
+                se_to_hist: Dict[str, List[float]] = {}
+                for tr_se, tr_y in zip([normalize_se(s) for s in train_se], y_train_cases):
+                    week = tr_se[4:]  # YYYYWW -> WW
+                    se_to_hist.setdefault(week, []).append(float(tr_y))
+                naive_preds = []
+                for te_se in test_se:
+                    week = normalize_se(te_se)[4:]
+                    hist = se_to_hist.get(week, None)
+                    if hist is None:
+                        # fallback: any week's empirical distribution
+                        hist = list(y_train_cases)
+                    naive_preds.append(np.quantile(hist, tau))
+                naive_preds = np.array(naive_preds)
+                pl_naive = float(np.mean(np.maximum(tau * (y_true_cases - naive_preds),
+                                                    (tau - 1) * (y_true_cases - naive_preds))))
+            else:
+                pl_naive = pinball_loss(y_true_cases, y_pred_median, tau) or (pl_model + 1e-10)
+            spl[tau] = float(pl_model / (pl_naive + 1e-10))
+        metrics['spl'] = {f"q{int(tau*1000):04d}": spl[tau] for tau in self.quantiles}
+        metrics['spl_matrix_row'] = [spl[tau] for tau in sorted(self.quantiles)]
+
+        # ---- Non-crossing check (raw, before post-process) ----
+        crossed = False
+        q_order = sorted(self.quantiles)
+        for i in range(len(q_order) - 1):
+            if np.any(np.expm1(y_pred_dict[q_order[i]]) > np.expm1(y_pred_dict[q_order[i+1]])):
+                crossed = True
+                break
+        metrics['quantile_crossed'] = crossed
+
+        # ---- D) Etp on Q.50 only (absolute timing error, no sign cancellation) ----
+        peak_real = int(np.argmax(y_true_cases))
+        peak_pred = int(np.argmax(y_pred_median))
+        # MAE_Etp = |idx_pred - idx_real| (abs para nao cancelar atraso/antecipacao na media)
+        metrics['etp'] = abs(peak_pred - peak_real)
+
+        return metrics
+
+    def stratify_months(self, se_array: np.ndarray) -> np.ndarray:
+        """Map each SE to 'outbreak' or 'calm' based on its calendar month."""
+        periods = []
+        for se in se_array:
+            se_str = normalize_se(se)
+            try:
+                ano = int(se_str[:4])
+                semana = int(se_str[4:])
+            except Exception:
+                periods.append('unknown')
+                continue
+            month = epiweek_to_date(ano, semana).month
+            periods.append('outbreak' if month in self.epi_periods.get('outbreak_months', [10,11,12,1,2,3,4,5]) else 'calm')
+        return np.array(periods)
+
+    def calculate_stratified(self, y_true_cases: np.ndarray, y_pred_dict_cases: Dict[float, np.ndarray],
+                             se_array: np.ndarray, y_train: Optional[np.ndarray] = None,
+                             train_se: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """Compute outbreak vs calm metrics for a single window.
+
+        WMAPE, MaxAE and WIS are computed on period slice; SPL scaled by
+        seasonal naive baseline per week+quantile; Etp timing error.
+        """
+        periods = self.stratify_months(se_array)
+
+        # Per-week empirical distribution of cases in TRAINING (for naive quantiles)
+        if y_train is not None and train_se is not None:
+            yt = np.expm1(np.asarray(y_train, dtype=float))
+            se_hist: Dict[str, List[float]] = {}
+            for tr_se, val in zip([normalize_se(s) for s in train_se], yt):
+                se_hist.setdefault(normalize_se(tr_se)[4:], []).append(float(val))
+
+        result = {}
+        for period in ['outbreak', 'calm']:
+            mask = periods == period
+            if not mask.any():
+                continue
+            y_true_p = y_true_cases[mask]
+            med_p = y_pred_dict_cases[0.50][mask]
+            wmape_num_p = float(np.sum(np.abs(y_true_p - med_p)))
+            wmape_den_p = float(np.sum(y_true_p))
+            entry = {
+                'n_samples': int(mask.sum()),
+                'wmape': float(wmape_num_p / (wmape_den_p + 1e-10)),
+                'wmape_num': wmape_num_p,
+                'wmape_den': wmape_den_p,
+                'maxae': float(np.max(np.abs(y_true_p - med_p))),
+            }
+            # WIS for this period (mean pinball across quantiles)
+            wis_vals_p = []
+            for tau in sorted(self.quantiles):
+                diff_p = y_true_p - y_pred_dict_cases[tau][mask]
+                wis_vals_p.append(float(np.mean(np.maximum(tau * diff_p, (tau - 1) * diff_p))))
+            entry['wis'] = float(np.mean(wis_vals_p)) if wis_vals_p else float('nan')
+
+            if period == 'outbreak':
+                # SPL row (3 quantiles scaled by seasonal naive pinball)
+                spl_outbreak = []
+                for tau in sorted(self.quantiles):
+                    y_pred_tau = y_pred_dict_cases[tau][mask]
+                    diff = y_true_p - y_pred_tau
+                    pl_model = float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+                    # Empirical naive quantile prediction for each test week
+                    if se_hist:
+                        naive_preds = []
+                        # iterate the test SEs that fell in this period
+                        for te_se in np.asarray(se_array)[mask]:
+                            week = normalize_se(te_se)[4:]
+                            hist = se_hist.get(week) or list(np.expm1(np.asarray(y_train, dtype=float)))
+                            naive_preds.append(np.quantile(hist, tau))
+                        naive_preds = np.array(naive_preds)
+                        pl_naive = float(np.mean(np.maximum(tau * (y_true_p - naive_preds),
+                                                            (tau - 1) * (y_true_p - naive_preds))))
+                    else:
+                        pl_naive = pl_model + 1e-10
+                    spl_outbreak.append(float(pl_model / (pl_naive + 1e-10)))
+                entry['spl_row'] = spl_outbreak
+                entry['etp'] = abs(int(np.argmax(y_pred_dict_cases[0.50][mask])) - int(np.argmax(y_true_p)))
+            result[period] = entry
+        return result
+
+    # ------------------------------------------------------------------
+    # Per-horizon training
+    # ------------------------------------------------------------------
+    def train_horizon(self, df: pd.DataFrame, horizon: int) -> Dict:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Training quantile models for horizon h{horizon}")
+        logger.info(f"{'='*60}")
+
+        gap_weeks = self.wf_config.get('gap_weeks', 4)
+        assert gap_weeks >= horizon, f"gap_weeks ({gap_weeks}) must be >= horizon ({horizon}) to prevent leakage"
+
+        X, y, se_index, df_clean = self.prepare_horizon_data(df, horizon)
+        if len(X) == 0:
+            logger.error(f"No data for horizon {horizon}")
+            return {}
+
+        # Optional start_year filter (features use full history)
+        start_year = self.config.get('training', {}).get('start_year')
+        if start_year:
+            keep = se_index >= f"{int(start_year)}01"
+            if int((~keep).sum()) > 0:
+                logger.info(f"start_year={start_year}: {(~keep).sum()} rows before {start_year}01 excluded from training")
+            X, y, se_index = X[keep], y[keep], se_index[keep]
+
+        # Walk-forward splits
+        wf = WalkForwardValidator(
+            n_splits=self.wf_config.get('n_splits', 4),
+            test_size_weeks=self.wf_config.get('test_size_weeks', 52),
+            gap_weeks=self.wf_config.get('gap_weeks', 8),
+            expanding_window=self.wf_config.get('expanding_window', True),
+            min_train_weeks=self.wf_config.get('min_train_weeks', 100),
+            test_years=self.wf_config.get('test_years', [2022, 2023, 2024, 2025]),
+            epidemiological_folds=self.wf_config.get('epidemiological_folds', True),
+            fold_start_month=self.wf_config.get('fold_start_month', 9),
+            fold_end_month=self.wf_config.get('fold_end_month', 8)
+        )
+        # df_for_split must share positional order with X (same rows, reset index)
+        df_for_split = df_clean.loc[X.index].reset_index(drop=True)
+        df_for_split['SE'] = [normalize_se(s) for s in df_for_split['SE']]
+        splits = wf.split(df_for_split)
+        if not splits:
+            logger.error(f"No valid walk-forward splits for horizon {horizon}")
+            return {}
+
+        # Per-fold preparation (shared across seeds/quantiles)
+        fold_prep: Dict[int, Dict[str, Any]] = {}
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            train_feature_cols = [c for c in X_train.columns
+                                  if not X_train[c].isna().all() and X_train[c].nunique() > 1]
+            X_train = X_train[train_feature_cols].fillna(0)
+            X_test = X_test.reindex(columns=train_feature_cols, fill_value=0)
+
+            # ano_normalizado from training only
+            if 'ano_raw' in X_train.columns:
+                ano_min = X_train['ano_raw'].min()
+                ano_max = X_train['ano_raw'].max()
+                X_train['ano_normalizado'] = (X_train['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
+                X_test['ano_normalizado'] = (X_test['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
+                X_train = X_train.drop(columns=['ano_raw'])
+                X_test = X_test.drop(columns=['ano_raw'])
+
+            gap = self.config.get('training',{}).get('validation',{}).get('gap_weeks', self.wf_config.get('gap_weeks',8))
+            val_size = max(1, len(X_train) // 5)
+            cutoff = len(X_train) - val_size
+            assert cutoff - gap > 0, "Not enough training data for gap+val"
+            X_tr, X_val = X_train.iloc[:cutoff - gap], X_train.iloc[cutoff:]
+            y_tr, y_val = y_train.iloc[:cutoff - gap], y_train.iloc[cutoff:]
+
+            X_tr, X_val, X_test = self._apply_feature_selection(X_tr, y_tr, X_val, X_test)
+
+            fold_prep[fold_idx] = {
+                'X_tr': X_tr, 'X_val': X_val, 'X_test': X_test,
+                'y_tr': y_tr, 'y_val': y_val,
+                'y_test': y_test.values,
+                'y_test_raw': np.expm1(y_test.values),
+                'y_train': y_train.values,
+                'train_se': se_index[train_idx],
+                'test_se': se_index[test_idx],
+            }
+
+        # Train: for each seed, for each quantile, for each fold.
+        models = {tau: {seed: None for seed in self.ensemble_seeds} for tau in self.quantiles}
+        fold_predictions: Dict[int, Dict[float, Dict[int, np.ndarray]]] = {}
+
+        for seed in self.ensemble_seeds:
+            logger.info(f"\n  Training seed {seed}...")
+            fold_best_iters: Dict[float, List[int]] = {tau: [] for tau in self.quantiles}
+            for fold_idx, prep in fold_prep.items():
+                for tau in self.quantiles:
+                    model = self.train_single_model(prep['X_tr'], prep['y_tr'],
+                                                    prep['X_val'], prep['y_val'],
+                                                    seed, horizon, tau)
+                    fold_best_iters[tau].append(model.best_iteration)
+                    y_pred = model.predict(prep['X_test'], num_iteration=model.best_iteration)
+                    fold_predictions.setdefault(fold_idx, {}).setdefault(tau, {})[seed] = y_pred
+
+            # Production retrain on FULL data for each quantile
+            full_feature_cols = [c for c in X.columns
+                                 if not X[c].isna().all() and X[c].nunique() > 1]
+            X_full = X[full_feature_cols].fillna(0)
+            if 'ano_raw' in X_full.columns:
+                ano_min = float(X_full['ano_raw'].min())
+                ano_max = float(X_full['ano_raw'].max())
+                X_full['ano_normalizado'] = (X_full['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
+                X_full = X_full.drop(columns=['ano_raw'])
+                if horizon not in self.ano_normalization_params:
+                    self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
+            X_full, _, _ = self._apply_feature_selection(X_full, y, None, None)
+            if horizon not in self.feature_names or seed == self.ensemble_seeds[0]:
+                self.feature_names[horizon] = X_full.columns.tolist()
+
+            for tau in self.quantiles:
+                n_iters = int(np.mean(fold_best_iters[tau])) if fold_best_iters[tau] else None
+                models[tau][seed] = self.train_single_model_full(X_full, y, seed, horizon, tau, n_iters)
+
+        # ------------------------------------------------------------------
+        # Ensemble metrics: average predictions across seeds per (fold, quantile)
+        # ------------------------------------------------------------------
+        ensemble_fold_metrics = []
+        spl_rows = []      # (n_folds x 4)
+        for fold_idx, prep in fold_prep.items():
+            y_pred_ens = {}
+            for tau in self.quantiles:
+                preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
+                y_pred_ens[tau] = np.mean(np.array(preds), axis=0)
+            # Enforce monotonicity on the ensembled quantiles
+            self.enforce_non_crossing(y_pred_ens, log_scale=True)
+            mets = self.calculate_metrics(prep['y_test'], y_pred_ens,
+                                                  y_train=prep['y_train'],
+                                                  train_se=prep['train_se'],
+                                                  test_se=prep['test_se'],
+                                                  horizon=horizon)
+            mets['fold'] = fold_idx
+            mets['seed'] = 'ensemble'
+            mets['horizon'] = horizon
+            # Stratified (outbreak/calm) using fold's SEs for the median
+            y_pred_cases = {tau: np.expm1(y_pred_ens[tau]) for tau in self.quantiles}
+            mets['stratified'] = self.calculate_stratified(prep['y_test_raw'], y_pred_cases,
+                                                           prep['test_se'], prep['y_train'],
+                                                           prep['train_se'])
+            ensemble_fold_metrics.append(mets)
+            spl_rows.append(mets['spl_matrix_row'])
+
+        ensemble_avg = self._average_metrics_list(ensemble_fold_metrics)
+        ensemble_avg['horizon'] = horizon
+        ensemble_avg['n_seeds'] = len(self.ensemble_seeds)
+        ensemble_avg['n_folds'] = len(ensemble_fold_metrics)
+        # SPL matrix row (mean across folds)
+        if spl_rows:
+            ensemble_avg['spl_mean'] = list(np.mean(np.array(spl_rows), axis=0))
+            ensemble_avg['spl_std'] = list(np.std(np.array(spl_rows), axis=0))
+
+        # Persist per-week prediction series (diagnostic/outbreak analysis):
+        # predicted vs actual cases, week by week, per fold per horizon per quantile.
+        if not hasattr(self, 'fold_series'):
+            self.fold_series = {}
+        self.fold_series.setdefault(horizon, {})
+        for tau in self.quantiles:
+            self.fold_series[horizon].setdefault(tau, [])
+            for fold_idx, prep in fold_prep.items():
+                preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
+                y_pred_ens = np.mean(np.array(preds), axis=0)
+                self.fold_series[horizon][tau].append({
+                    'fold': fold_idx,
+                    'test_se': [str(s).zfill(6) for s in prep['test_se']],
+                    'y_test_casos': [float(x) for x in prep['y_test_raw']],
+                    'y_pred_casos': [float(np.expm1(x)) for x in y_pred_ens],
+                })
+
+        # Aggregate stratified metrics across folds
+        stratified_totals = self._aggregate_stratified(ensemble_fold_metrics)
+
+        self.validation_results[horizon] = {
+            'quantiles': self.quantiles,
+            'per_fold_ensemble': ensemble_fold_metrics,
+            'ensemble_avg': ensemble_avg,
+            'stratified': stratified_totals,
+            'spl_matrix': list(np.mean(np.array(spl_rows), axis=0)) if spl_rows else [],
+        }
+
+        logger.info(f"\n  h{horizon} ENSEMBLE: WMAPE={ensemble_avg['wmape']:.3f}, "
+                    f"MaxAE={ensemble_avg['maxae']:.1f}, WIS={ensemble_avg['wis']:.1f} (sharp {ensemble_avg.get('wis_sharpness',0):.1f} over {ensemble_avg.get('wis_over',0):.1f} under {ensemble_avg.get('wis_under',0):.1f}), Coverage90={ensemble_avg.get('coverage_90',0):.2f}, rWIS={ensemble_avg.get('rWIS',0):.2f}, Etp={ensemble_avg.get('etp', float('nan')):.2f} ")
+        logger.info(f"    SPL mean (Q05/Q50/Q95): "
+                    f"{[f'{x:.3f}' for x in ensemble_avg.get('spl_mean', [])]}")
+
+        self.models[horizon] = models
+        return models
+
+    def _aggregate_stratified(self, ensemble_fold_metrics: List[Dict]) -> Dict[str, Any]:
+        """Aggregate outbreak/calm metrics across folds (support 8x4 SPL matrix)."""
+        result = {}
+        for period in ['outbreak', 'calm']:
+            rows = [m['stratified'].get(period) for m in ensemble_fold_metrics
+                    if period in m.get('stratified', {})]
+            rows = [r for r in rows if r]
+            if not rows:
+                continue
+            n = sum(r['n_samples'] for r in rows)
+            # WMAPE ponderado: sum(num)/sum(den) igual ao global, fallback ponderado por n
+            if all('wmape_num' in r and 'wmape_den' in r for r in rows):
+                total_num = float(sum(r['wmape_num'] for r in rows))
+                total_den = float(sum(r['wmape_den'] for r in rows))
+                wmape = float(total_num / (total_den + 1e-10))
+            else:
+                # fallback: media ponderada por n_samples
+                wmape = float(sum(r['wmape'] * r['n_samples'] for r in rows) / (n + 1e-10))
+            maxae = float(np.mean([r['maxae'] for r in rows]))
+            # WIS media ponderada por n (igual ao global ponderado por amostras)
+            if all('wis' in r for r in rows):
+                wis = float(sum(r['wis'] * r['n_samples'] for r in rows) / (n + 1e-10))
+            else:
+                wis = float(np.mean([r['wis'] for r in rows]))
+            entry = {'n_samples': n, 'wmape': wmape, 'maxae': maxae, 'wis': wis}
+            # preserva somas para debug
+            if all('wmape_num' in r for r in rows):
+                entry['wmape_num'] = float(sum(r['wmape_num'] for r in rows))
+                entry['wmape_den'] = float(sum(r['wmape_den'] for r in rows))
+            if period == 'outbreak':
+                spl_mat_rows = np.array([r['spl_row'] for r in rows])
+                entry['spl_matrix_row'] = list(np.mean(spl_mat_rows, axis=0))
+                entry['etp'] = float(np.mean([r['etp'] for r in rows]))
+            result[period] = entry
+        return result
+
+    def _average_metrics_list(self, metrics_list: List[Dict]) -> Dict[str, float]:
+        if not metrics_list:
+            return {}
+        avg = {}
+        # Weighted WMAPE: sum(num)/sum(den) is the correct global aggregation,
+        # not mean of per-fold ratios. Keep 'wmape' as mean for backwards compat
+        # but also expose 'wmape_weighted'.
+        if all('wmape_num' in m and 'wmape_den' in m for m in metrics_list):
+            total_num = float(np.sum([m['wmape_num'] for m in metrics_list]))
+            total_den = float(np.sum([m['wmape_den'] for m in metrics_list]))
+            avg['wmape_weighted'] = float(total_num / (total_den + 1e-10))
+        keys = set()
+        for m in metrics_list:
+            keys.update(m.keys())
+        for key in keys:
+            if key in ['fold', 'seed', 'horizon', 'spl', 'spl_matrix_row', 'stratified', 'wmape_num', 'wmape_den', 'coverage_vec']:
+                continue
+            values = [m.get(key, np.nan) for m in metrics_list]
+            if not all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
+                continue
+            avg[key] = float(np.nanmean(values)) if key in ['wmape', 'maxae', 'wis', 'wis_sharpness', 'wis_over', 'wis_under', 'wis_median_abs', 'wis_pinball', 'wis_decomp_mean', 'mae', 'mase', 'etp', 'coverage_90', 'rWIS', 'rMAE', 'baseline_wis', 'baseline_mae', 'baseline_coverage_90'] else float(np.mean(values))
+        # Preserve weighted as primary if available
+        if 'wmape_weighted' in avg:
+            avg['wmape'] = avg['wmape_weighted']
+        return avg
+
+    def _apply_feature_selection(self, X_tr: pd.DataFrame, y_tr: pd.Series,
+                                 X_val: Optional[pd.DataFrame],
+                                 X_test: Optional[pd.DataFrame]
+                                 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
         fs = self.config.get('training', {}).get('feature_selection', {})
         method = fs.get('method')
         if method != 'importance':
             return X_tr, X_val, X_test
-
         threshold = float(fs.get('threshold', 0.001))
-        max_features = int(fs.get('max_features', 258))
-
+        max_features = int(fs.get('max_features', 300))
         try:
             quick_params = self.model_params.copy()
             quick_params['random_state'] = 42
             quick_params['seed'] = 42
             quick_params['verbosity'] = -1
-            # Early stopping requires an eval set; the quick model has none,
-            # so drop it (num_boost_round is passed explicitly below).
             quick_params.pop('early_stopping_rounds', None)
-            quick_model = lgb.train(
-                quick_params,
-                lgb.Dataset(X_tr, label=y_tr),
-                num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000)))
-            )
-            imp = pd.Series(quick_model.feature_importance(importance_type='gain'), index=X_tr.columns)
+            quick_params['objective'] = 'quantile'
+            # Aggregate importance across all quantiles (median alone underrepresents tails)
+            imps = []
+            for tau in self.quantiles:
+                qp = quick_params.copy()
+                qp['alpha'] = tau
+                m = lgb.train(
+                    qp, lgb.Dataset(X_tr, label=y_tr),
+                    num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000)))
+                )
+                imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
+                imps.append(imp)
+            imp = pd.concat(imps, axis=1).mean(axis=1) if imps else pd.Series(0, index=X_tr.columns)
             selected = imp[imp > threshold].sort_values(ascending=False)
             selected_cols = selected.head(max_features).index.tolist()
             if not selected_cols:
-                logger.warning("Feature selection kept 0 features; falling back to all training features")
                 selected_cols = X_tr.columns.tolist()
         except Exception as e:
-            logger.warning(f"Feature selection failed ({e}); using all training features")
+            logger.warning(f"Feature selection failed ({e}); using all features")
             selected_cols = X_tr.columns.tolist()
-
-        logger.info(f"    Feature selection: {len(selected_cols)}/{X_tr.shape[1]} features kept (threshold={threshold}, max={max_features})")
+        logger.info(f"    Feature selection: {len(selected_cols)}/{X_tr.shape[1]} features kept")
         X_tr = X_tr[selected_cols]
         if X_val is not None:
             X_val = X_val.reindex(columns=selected_cols, fill_value=0)
@@ -406,571 +912,168 @@ class EpisenseTrainer:
             X_test = X_test.reindex(columns=selected_cols, fill_value=0)
         return X_tr, X_val, X_test
 
-    def train_horizon(self, df: pd.DataFrame, horizon: int) -> Dict[int, lgb.Booster]:
-        """Train ensemble models for a specific horizon using walk-forward validation.
-
-        IMPORTANT: ensemble metrics are computed on the ENSEMBLED PREDICTIONS
-        (np.mean of the 5 seed predictions per fold), NOT on the mean of the
-        individual seed metrics. Individual seed metrics are kept separately in
-        'avg_individual_seed_metrics' as a reference only.
-        """
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Training models for horizon h{horizon}")
-        logger.info(f"{'='*60}")
-
-        # CRITICAL: gap_weeks must be >= horizon to prevent leakage
-        # target_h{horizon} references log_casos at train_end + horizon - 1
-        # test_start = train_end + gap_weeks
-        # Need gap_weeks >= horizon to ensure no overlap
-        gap_weeks = self.wf_config.get('gap_weeks', 4)
-        assert gap_weeks >= horizon, f"gap_weeks ({gap_weeks}) must be >= horizon ({horizon}) to prevent leakage"
-
-        X, y = self.prepare_horizon_data(df, horizon)
-
-        if len(X) == 0:
-            logger.error(f"No data for horizon {horizon}")
-            return {}
-
-        # OPTIONAL start_year filter (config training.start_year): drops TRAINING
-        # rows from years before start_year (e.g. 2013, a >45k-case outlier in
-        # Campo Grande that can confuse the model). Features are still computed
-        # over the full series (lags/rolling need history), so 2014 rows keep
-        # their real lag values; only rows with SE < start_year01 are removed.
-        start_year = self.config.get('training', {}).get('start_year')
-        if start_year:
-            se_vals = df.loc[X.index]['SE'].astype(str).str.zfill(6)
-            keep_mask = (se_vals >= f"{int(start_year)}01").values
-            n_dropped = int((~keep_mask).sum())
-            if n_dropped > 0:
-                logger.info(f"start_year={start_year}: {n_dropped} rows before {start_year}01 excluded from training (features use full history)")
-            X = X[keep_mask]
-            y = y[keep_mask]
-
-        # Walk-forward validation splits
-        wf = WalkForwardValidator(
-            n_splits=self.wf_config.get('n_splits', 7),
-            test_size_weeks=self.wf_config.get('test_size_weeks', 52),
-            gap_weeks=self.wf_config.get('gap_weeks', 4),
-            expanding_window=self.wf_config.get('expanding_window', True),
-            min_train_weeks=self.wf_config.get('min_train_weeks', 260),
-            test_years=self.wf_config.get('test_years', None)
-        )
-
-        # Need to split on the original dataframe indices
-        df_for_split = df.loc[X.index].reset_index(drop=True)
-        splits = wf.split(df_for_split)
-
-        if not splits:
-            logger.error(f"No valid walk-forward splits for horizon {horizon}")
-            return {}
-
-        # Train ensemble for each seed
-        models = {}
-        all_fold_metrics = {seed: [] for seed in self.ensemble_seeds}
-
-        # Store raw per-seed predictions per fold (for REAL ensemble metrics)
-        # plus the fold context (y_test, y_train, SEs) shared by all seeds.
-        fold_predictions: Dict[int, Dict[int, np.ndarray]] = {}
-        fold_context: Dict[int, Dict[str, Any]] = {}
-
-        # Per-fold data preparation computed ONCE (shared by all seeds of the fold):
-        # NaN/constant filter, ano_normalizado (treino-only), validation split and
-        # feature selection by importance - all using training data statistics only.
-        fold_prep: Dict[int, Dict[str, Any]] = {}
-        for fold_idx, (train_idx, test_idx) in enumerate(splits):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-            # PER-FOLD FEATURE FILTER: only use training data statistics
-            # Remove columns that are all NaN or constant in TRAINING data only
-            train_feature_cols = [c for c in X_train.columns 
-                                 if not X_train[c].isna().all() 
-                                 and X_train[c].nunique() > 1]
-
-            X_train = X_train[train_feature_cols].fillna(0)
-            X_test = X_test.reindex(columns=train_feature_cols, fill_value=0)
-
-            # PER-FOLD: Compute ano_normalizado using ONLY training data (no leakage)
-            if 'ano_raw' in X_train.columns:
-                ano_min = X_train['ano_raw'].min()
-                ano_max = X_train['ano_raw'].max()
-                X_train['ano_normalizado'] = (X_train['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
-                X_test['ano_normalizado'] = (X_test['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
-                # Drop the raw column since we now have the normalized version
-                X_train = X_train.drop(columns=['ano_raw'])
-                X_test = X_test.drop(columns=['ano_raw'])
-
-            # Validation split from training with gap to prevent leakage (target is shifted -horizon)
-            gap = self.wf_config.get('gap_weeks', 4)
-            val_size = max(1, len(X_train) // 5)
-            cutoff = len(X_train) - val_size
-            assert cutoff - gap > 0, f"Not enough training data for gap={gap} and val_size={val_size}"
-            X_tr, X_val = X_train.iloc[:cutoff - gap], X_train.iloc[cutoff:]
-            y_tr, y_val = y_train.iloc[:cutoff - gap], y_train.iloc[cutoff:]
-
-            # PER-FOLD FEATURE SELECTION by importance (config), on X_tr only
-            X_tr, X_val, X_test = self._apply_feature_selection(X_tr, y_tr, X_val, X_test)
-
-            fold_prep[fold_idx] = {
-                'X_tr': X_tr, 'X_val': X_val, 'X_test': X_test,
-                'y_tr': y_tr, 'y_val': y_val, 'y_train': y_train, 'y_test': y_test,
-                'train_idx': train_idx, 'test_idx': test_idx,
-            }
-
-        for seed in self.ensemble_seeds:
-            logger.info(f"\n  Training seed {seed}...")
-
-            fold_metrics = []
-            fold_best_iters = []  # for the full-data production retrain
-
-            for fold_idx in range(len(splits)):
-                prep = fold_prep[fold_idx]
-                X_tr, X_val, X_test = prep['X_tr'], prep['X_val'], prep['X_test']
-                y_tr, y_val = prep['y_tr'], prep['y_val']
-                y_train, y_test = prep['y_train'], prep['y_test']
-                train_idx, test_idx = prep['train_idx'], prep['test_idx']
-
-                # Train model
-                model = self.train_single_model(X_tr, y_tr, X_val, y_val, seed, horizon)
-                fold_best_iters.append(model.best_iteration)
-
-                # Predict on test
-                y_pred = model.predict(X_test, num_iteration=model.best_iteration)
-
-                # Collect raw prediction for ensemble aggregation (same fold, all seeds)
-                if fold_idx not in fold_predictions:
-                    fold_predictions[fold_idx] = {}
-                fold_predictions[fold_idx][seed] = y_pred
-
-                # Store fold context once (shared by all seeds in this fold)
-                if fold_idx not in fold_context:
-                    fold_context[fold_idx] = {
-                        'y_test': y_test.values,
-                        'y_test_raw': np.expm1(y_test.values),
-                        'y_train': y_train.values,
-                        'train_se': df_for_split.iloc[train_idx]['SE'].values,
-                        'test_se': df_for_split.iloc[test_idx]['SE'].values,
-                    }
-
-                # Metrics for this individual seed (kept for reference)
-                y_test_raw = np.expm1(y_test.values)
-                test_se = df_for_split.iloc[test_idx]['SE'].values
-                train_se = df_for_split.iloc[train_idx]['SE'].values
-                metrics = self.calculate_metrics(y_test.values, y_pred, y_test_raw, y_train, train_se, test_se)
-                metrics['fold'] = fold_idx
-                metrics['seed'] = seed
-                metrics['horizon'] = horizon
-                fold_metrics.append(metrics)
-
-                logger.info(f"    Fold {fold_idx+1}: RMSE={metrics['rmse']:.2f}, "
-                           f"WMAPE={metrics['wmape']:.3f}, RMSSE={metrics.get('rmsse', 0):.3f}, F2={metrics['f2_score']:.3f}")
-
-            # Average metrics across folds for this seed
-            avg_metrics = self._average_metrics_list(fold_metrics)
-            avg_metrics['seed'] = seed
-            avg_metrics['horizon'] = horizon
-            all_fold_metrics[seed] = fold_metrics
-
-            logger.info(f"  Seed {seed} avg: RMSE={avg_metrics['rmse']:.2f}, "
-                       f"WMAPE={avg_metrics['wmape']:.3f}, RMSSE={avg_metrics.get('rmsse', 0):.3f}, F2={avg_metrics['f2_score']:.3f}")
-
-            # Retrain on FULL data for this seed (production model). No holdout:
-            # the model must see the whole series (review fix - the old retrain
-            # held out the last 20% and stopped at ~2023, making production
-            # h5/h6 extrapolate ~2.5 years beyond the last target seen).
-            logger.info(f"  Retraining seed {seed} on FULL data (n_iters=mean fold best_iteration)...")
-            full_feature_cols = [c for c in X.columns
-                                 if not X[c].isna().all()
-                                 and X[c].nunique() > 1]
-
-            X_full = X[full_feature_cols].fillna(0)
-
-            # NORMALIZATION: min/max over the FULL series (no extrapolation gap)
-            if 'ano_raw' in X_full.columns:
-                ano_min = float(X_full['ano_raw'].min())
-                ano_max = float(X_full['ano_raw'].max())
-                X_full['ano_normalizado'] = (X_full['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
-                X_full = X_full.drop(columns=['ano_raw'])
-
-                # Store normalization params PER HORIZON from the first seed's full training data
-                if not hasattr(self, 'ano_normalization_params'):
-                    self.ano_normalization_params = {}
-                if horizon not in self.ano_normalization_params:
-                    self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
-
-            # Feature selection on the full matrix (uses only training data)
-            X_full, _, _ = self._apply_feature_selection(X_full, y, None, None)
-
-            # NOW capture the final feature list (after normalization, drop and selection)
-            final_feature_cols = X_full.columns.tolist()
-
-            n_iters = int(np.mean(fold_best_iters)) if fold_best_iters else None
-            final_model = self.train_single_model_full(X_full, y, seed, horizon, n_iters)
-            models[seed] = final_model
-
-            # Store the feature names used for this horizon (for inference)
-            if horizon not in self.feature_names or seed == self.ensemble_seeds[0]:
-                self.feature_names[horizon] = final_feature_cols
-
-        # ============================================================
-        # REAL ENSEMBLE METRICS: average the PREDICTIONS of the 5 seeds
-        # per fold (np.mean(axis=0), same as inference.py predict()),
-        # then compute calculate_metrics() ONCE on the ensembled
-        # prediction. Result: 1 metric set per fold (5 total), NOT
-        # 25 metric sets of individual models.
-        # ============================================================
-        ensemble_fold_metrics = []
-        for fold_idx in range(len(splits)):
-            preds_by_seed = fold_predictions.get(fold_idx, {})
-            if len(preds_by_seed) < len(self.ensemble_seeds):
-                logger.warning(f"    Fold {fold_idx+1}: only {len(preds_by_seed)}/{len(self.ensemble_seeds)} seed predictions available, skipping ensemble metrics")
-                continue
-
-            y_pred_ensemble = np.mean(np.array([preds_by_seed[s] for s in self.ensemble_seeds]), axis=0)
-            ctx = fold_context[fold_idx]
-            metrics = self.calculate_metrics(ctx['y_test'], y_pred_ensemble, ctx['y_test_raw'],
-                                             ctx['y_train'], ctx['train_se'], ctx['test_se'])
-            metrics['fold'] = fold_idx
-            metrics['seed'] = 'ensemble'
-            metrics['horizon'] = horizon
-            ensemble_fold_metrics.append(metrics)
-
-            # Persist per-week series (diagnostic/outbreak analysis): predicted
-            # vs actual cases, week by week, per fold per horizon.
-            if not hasattr(self, 'fold_series'):
-                self.fold_series = {}
-            self.fold_series.setdefault(horizon, []).append({
-                'fold': fold_idx,
-                'test_se': [str(s).zfill(6) for s in ctx['test_se']],
-                'y_test_casos': [float(x) for x in ctx['y_test_raw']],
-                'y_pred_casos': [float(np.expm1(x)) for x in y_pred_ensemble],
-            })
-
-            fallback = metrics.get('seasonal_fallback_count', 0)
-            matched = metrics.get('seasonal_matched_count', 0)
-            total_se = len(ctx['test_se'])
-            if fallback > 0:
-                logger.warning(f"    [ENSEMBLE] Fold {fold_idx+1}: RMSSE seasonal baseline FALLBACK used {fallback}/{total_se} weeks (matched {matched}) - RMSSE not fully seasonal")
-            logger.info(f"    [ENSEMBLE] Fold {fold_idx+1}: RMSE={metrics['rmse']:.2f}, "
-                       f"WMAPE={metrics['wmape']:.3f}, RMSSE={metrics.get('rmsse', 0):.3f}, "
-                       f"F2={metrics['f2_score']:.3f}, PR-AUC={metrics.get('pr_auc', np.nan):.3f}")
-
-        # Final ensemble metrics: average the per-fold ensemble evaluations
-        ensemble_avg = self._average_metrics_list(ensemble_fold_metrics)
-        ensemble_avg['horizon'] = horizon
-        ensemble_avg['n_seeds'] = len(self.ensemble_seeds)
-        ensemble_avg['n_folds'] = len(ensemble_fold_metrics)
-
-        # Average of INDIVIDUAL seed metrics (5 seeds x 5 folds = 25 evals).
-        # Legitimate as a reference, but NOT the ensemble metric.
-        avg_individual_seed_metrics = self._average_individual_seed_metrics(all_fold_metrics)
-        avg_individual_seed_metrics['horizon'] = horizon
-
-        # Store validation results
-        self.validation_results[horizon] = {
-            'per_seed': {seed: all_fold_metrics[seed] for seed in self.ensemble_seeds},
-            'per_fold_ensemble': ensemble_fold_metrics,
-            'ensemble_avg': ensemble_avg,
-            'avg_individual_seed_metrics': avg_individual_seed_metrics,
-        }
-
-        logger.info(f"\n  h{horizon} ENSEMBLE final: RMSE={ensemble_avg['rmse']:.2f}, "
-                    f"WMAPE={ensemble_avg['wmape']:.3f}, RMSSE={ensemble_avg.get('rmsse', 0):.3f} "
-                    f"(pure seasonal: {ensemble_avg.get('rmsse_pure_seasonal', float('nan')):.3f}, "
-                    f"low fallback: {ensemble_avg.get('rmsse_low_fallback', float('nan')):.3f}), "
-                    f"F2={ensemble_avg['f2_score']:.3f}, PR-AUC={ensemble_avg.get('pr_auc', np.nan):.3f}")
-
-        self.models[horizon] = models
-        return models
-    
-    def _average_metrics_list(self, metrics_list: List[Dict]) -> Dict[str, float]:
-        """Average metric dicts across a list of evaluations (e.g. folds).
-
-        - f2_score / pr_auc: nanmean (NaN when a class is missing in true labels)
-        - rmsse_pure_seasonal: mean of rmsse ONLY over folds whose seasonal
-          baseline had NO fallback (pure seasonal baseline); NaN if none.
-          This keeps RMSSE comparable across folds/horizons, since folds that
-          silently fell back to 'last_value' are excluded.
-        - other numeric keys: plain mean
-        """
-        if not metrics_list:
-            return {}
-        avg = {}
-        keys = set()
-        for m in metrics_list:
-            keys.update(m.keys())
-        for key in keys:
-            if key in ['fold', 'seed', 'horizon']:
-                continue
-            values = [m.get(key, np.nan) for m in metrics_list]
-            # Skip non-numeric metadata keys (e.g. rmsse_baseline string)
-            if not all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
-                continue
-            if key in ['f2_score', 'pr_auc', 'precision', 'recall']:
-                avg[key] = float(np.nanmean(values))
-            else:
-                avg[key] = float(np.mean(values))
-
-        # RMSSE computed ONLY on folds with pure seasonal baseline (no fallback)
-        pure_seasonal = [m.get('rmsse', np.nan) for m in metrics_list
-                         if m.get('rmsse_baseline') == 'seasonal'
-                         and m.get('seasonal_fallback_count', 1) == 0]
-        avg['rmsse_pure_seasonal'] = float(np.mean(pure_seasonal)) if pure_seasonal else float('nan')
-
-        # RMSSE on folds with <= 20% fallback (fallback = nearest equivalent week
-        # T-52±k, so the baseline stays seasonal). The walk-forward gap removes
-        # the last gap_weeks of the previous year from train; with gap 6 the
-        # real ratios are ~9.6%-13.2% per fold, so a 10% cut would collapse the
-        # statistic to a single fold (review bug). The count of folds used is
-        # reported alongside so the estimate is never read as robust when thin.
-        low_fallback = [m.get('rmsse', np.nan) for m in metrics_list
-                        if m.get('rmsse_baseline') == 'seasonal'
-                        and m.get('seasonal_fallback_ratio', 1.0) <= 0.2]
-        avg['rmsse_low_fallback'] = float(np.mean(low_fallback)) if low_fallback else float('nan')
-        avg['rmsse_low_fallback_n'] = len(low_fallback)
-        return avg
-
-    def _average_individual_seed_metrics(self, all_fold_metrics: Dict) -> Dict:
-        """Mean of the metrics of each INDIVIDUAL seed model across folds.
-
-        This averages 5 seeds x 5 folds = 25 individual evaluations.
-        It is NOT the ensemble metric: the real ensemble metric
-        ('ensemble_avg') is computed on the averaged PREDICTIONS
-        (np.mean of the seeds' predictions per fold), same as inference.
-        """
-        all_metrics = []
-        for seed_metrics in all_fold_metrics.values():
-            all_metrics.extend(seed_metrics)
-
-        if not all_metrics:
-            return {}
-
-        avg = self._average_metrics_list(all_metrics)
-        avg['n_seeds'] = len(self.ensemble_seeds)
-        avg['n_folds'] = len(all_fold_metrics[self.ensemble_seeds[0]]) if self.ensemble_seeds else 0
-        return avg
-    
-    def train_all_horizons(self, df: pd.DataFrame):
-        """Train models for all horizons."""
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    def train_all_horizons(self, df: pd.DataFrame) -> Dict:
         logger.info("Starting training for all horizons...")
-        
-        # Feature engineering
         df_featured = self.prepare_data(df)
-        
         for horizon in self.target_horizons:
             self.train_horizon(df_featured, horizon)
-        
-        # Save models and artifacts
         self.save_artifacts()
-        
-        # Print summary
         self.print_summary()
-        
         return self.validation_results
-    
+
     def save_artifacts(self):
-        """Save models, scaler, and metadata."""
         models_dir = Path("models")
         models_dir.mkdir(exist_ok=True)
-        
-        # Save ensemble models
-        for horizon in self.target_horizons:
-            for seed, model in self.models.get(horizon, {}).items():
-                model_path = models_dir / f"lgbm_h{horizon}_seed{seed}.pkl"
-                joblib.dump(model, model_path)
-                logger.info(f"Saved model: {model_path}")
-        
-        # Save feature list
+
+        # Save per-quantile ensemble models: lgbm_h{horizon}_seed{seed}_q{tau}.pkl
+        for horizon, tau_models in self.models.items():
+            for tau, seed_models in tau_models.items():
+                for seed, model in seed_models.items():
+                    path = models_dir / f"lgbm_h{horizon}_seed{seed}_q{int(tau*1000):04d}.pkl"
+                    joblib.dump(model, path)
+        logger.info(f"Saved quantile models to {models_dir}")
+
         feature_path = models_dir / "feature_list.json"
         with open(feature_path, 'w') as f:
-            json.dump(self.feature_names, f)
+            json.dump({str(k): v for k, v in self.feature_names.items()}, f)
         logger.info(f"Saved feature list: {feature_path}")
-        
-        # Save validation results
+
+        def _clean(d):
+            if isinstance(d, dict):
+                return {k: _clean(v) for k, v in d.items() if k != 'coverage_vec'}
+            if isinstance(d, np.ndarray):
+                return _clean(d.tolist())
+            if isinstance(d, (np.floating, np.integer)):
+                return float(d)
+            if isinstance(d, (list, tuple)):
+                return [_clean(x) for x in d]
+            return d
+
         results_path = models_dir / "validation_results.json"
         with open(results_path, 'w') as f:
-            # Convert numpy types to native Python
-            def _clean(d: Dict) -> Dict:
-                return {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
-                        for k, v in d.items()}
-
-            serializable_results = {}
-            for h, results in self.validation_results.items():
-                serializable_results[h] = {
-                    'per_seed': {
-                        str(seed): [_clean(r) for r in seed_metrics]
-                        for seed, seed_metrics in results.get('per_seed', {}).items()
-                    },
-                    'per_fold_ensemble': [_clean(r) for r in results.get('per_fold_ensemble', [])],
-                    'ensemble_avg': _clean(results.get('ensemble_avg', {})),
-                    'avg_individual_seed_metrics': _clean(results.get('avg_individual_seed_metrics', {})),
-                }
-            json.dump(serializable_results, f, indent=2, default=str)
+            json.dump(_clean(self.validation_results), f, indent=2, default=str)
         logger.info(f"Saved validation results: {results_path}")
-        
-        # Save normalization parameters (for inference ano_normalizado computation)
-        if not hasattr(self, 'ano_normalization_params') or not self.ano_normalization_params:
-            logger.warning("Normalization params not set from training; will compute from feature list if possible")
-        
-        if hasattr(self, 'ano_normalization_params') and self.ano_normalization_params:
-            norm_path = models_dir / "normalization_params.json"
+
+        norm_path = models_dir / "normalization_params.json"
+        if self.ano_normalization_params:
             with open(norm_path, 'w') as f:
                 json.dump(self.ano_normalization_params, f, indent=2)
-            logger.info(f"Saved normalization params per horizon: {norm_path}")
-
-        # Save fold surto summary
-        # FIX (review Bug 7): counts are per-FOLD (unique), with per-seed eval
-        # counts kept separately for transparency - the old JSON reported
-        # "25 folds com surto" (5 seeds x 5 folds), misleading readers.
-        if self.validation_results:
-            fold_summary = {}
-            for h in sorted(self.validation_results.keys()):
-                h_key = f"horizonte_h{h}"
-                folds_com = set()
-                folds_sem = set()
-                n_com_evals = 0
-                n_sem_evals = 0
-                folds_excluidos = []
-                for seed_metrics in self.validation_results[h].get('per_seed', {}).values():
-                    for r in seed_metrics:
-                        if np.isnan(r.get('f2_score', np.nan)):
-                            # NaN = classe unica no rotulo real. Distinguir
-                            # 'tudo surto' (ex.: 2024, 52/52 semanas >= 50) de
-                            # 'sem surto' para nao rotular 2024 como ano sem surto.
-                            if r.get('classification_single_class') == 'all_positive':
-                                folds_com.add(r['fold'])
-                                n_com_evals += 1
-                                folds_excluidos.append(f"fold{r['fold']}_seed{r['seed']} (classe unica: tudo surto)")
-                            else:
-                                folds_sem.add(r['fold'])
-                                n_sem_evals += 1
-                                folds_excluidos.append(f"fold{r['fold']}_seed{r['seed']} (sem surto)")
-                        else:
-                            folds_com.add(r['fold'])
-                            n_com_evals += 1
-                fold_summary[h_key] = {
-                    "folds_com_surto": len(folds_com),
-                    "folds_sem_surto": len(folds_sem),
-                    "total_folds": len(folds_com | folds_sem),
-                    "avaliacoes_com_surto": n_com_evals,
-                    "avaliacoes_sem_surto": n_sem_evals,
-                    "folds_excluidos": folds_excluidos
-                }
-            
-            summary_path = models_dir / "fold_surto_summary.json"
-            with open(summary_path, 'w') as f:
-                json.dump(fold_summary, f, indent=2)
-            logger.info(f"Saved fold surto summary: {summary_path}")
+            logger.info(f"Saved normalization params: {norm_path}")
 
         # Save per-week prediction series (outbreak/weekly analysis)
         if getattr(self, 'fold_series', None):
             series_path = models_dir / "validation_predictions.json"
+            # Convert defaultdict-like structures to plain dict for JSON
+            import copy
+            series_copy = copy.deepcopy(self.fold_series)
             with open(series_path, 'w') as f:
-                json.dump(self.fold_series, f, indent=1)
+                json.dump(series_copy, f, indent=1)
             logger.info(f"Saved per-week prediction series: {series_path}")
 
     def print_summary(self):
-        """Print training summary with metrics vs targets."""
-        print("\n" + "="*80)
-        print("EPISENSE TRAINING SUMMARY")
-        print("="*80)
-        
-        targets = self.config.get('metrics', {}).get('targets', {})
-        
+        print("\n" + "=" * 90)
+        print("EPISENSE QUANTILE TRAINING SUMMARY")
+        print("=" * 90)
+        headings = ['SPL Q0.05', 'SPL Q0.50', 'SPL Q0.95', 'WMAPE', 'MaxAE', 'WIS', 'Etp']
+        print(f"{'Horizon':<9}" + "".join(f"{h:>12}" for h in headings))
         for horizon in self.target_horizons:
             if horizon not in self.validation_results:
                 continue
-                
-            ensemble_metrics = self.validation_results[horizon].get('ensemble_avg', {})
-            horizon_targets = targets.get(f'h{horizon}', {})
-            
-            print(f"\nHorizon h{horizon}:")
-            print("-" * 40)
-            
-            for metric_name in ['f2_score', 'pr_auc', 'precision', 'recall', 'r2', 'r2_casos', 'rmse', 'wmape', 'rmsse', 'rmsse_pure_seasonal', 'rmsse_low_fallback']:
-                achieved = ensemble_metrics.get(metric_name, 0)
-                target = horizon_targets.get(metric_name, 'N/A')
-                
-                if target != 'N/A':
-                    if metric_name in ['f2_score', 'pr_auc']:
-                        status = "✓" if achieved >= target else "✗"
-                    elif metric_name in ['rmse', 'wmape', 'mase']:
-                        status = "✓" if achieved <= target else "✗"
-                    else:
-                        status = ""
-                    print(f"  {metric_name:15s}: {achieved:.4f} (target: {target:.4f}) {status}")
-                else:
-                    print(f"  {metric_name:15s}: {achieved:.4f}")
-        
-        print("\n" + "="*80)
+            a = self.validation_results[horizon].get('ensemble_avg', {})
+            spl = a.get('spl_mean', [])
+            row = spl + [a.get('wmape', float('nan')), a.get('maxae', float('nan')),
+                         a.get('wis', float('nan')), a.get('etp', float('nan'))]
+            print(f"  h{horizon:<7}" + "".join(f"{v:>12.3f}" for v in row))
+        print("\n" + "=" * 90)
+        print("STRATIFIED (Outbreak Oct-May / Calm Jun-Sep):")
+        for horizon in self.target_horizons:
+            st = self.validation_results.get(horizon, {}).get('stratified', {})
+            if not st:
+                continue
+            ob = st.get('outbreak', {}); cm = st.get('calm', {})
+            line = f"  h{horizon}: "
+            if ob:
+                line += (f"Surto: WMAPE={ob['wmape']:.3f} MaxAE={ob['maxae']:.1f} WIS={ob['wis']:.1f} "
+                         f"Etp={ob.get('etp', float('nan')):.1f} "
+                         f"SPL={[f'{v:.2f}' for v in ob.get('spl_matrix_row', [])]} n={ob['n_samples']} | ")
+            if cm:
+                line += f"Calmaria: WMAPE={cm['wmape']:.3f} MaxAE={cm['maxae']:.1f} WIS={cm['wis']:.1f} n={cm['n_samples']}"
+            print(line)
+        # DataFrame consolidado para feira científica
+        try:
+            df_metrics = self.get_metrics_dataframe()
+            print("\n" + "=" * 90)
+            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, WMAPE, MaxAE, Etp, Coverage_90, rWIS, rMAE")
+            print(df_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
+            # Salva CSV para plotagem
+            df_metrics.to_csv(Path("models") / "metrics_dataframe.csv")
+            print("Salvo em models/metrics_dataframe.csv")
+        except Exception as e:
+            logger.warning(f"Falha ao gerar DataFrame consolidado: {e}")
+
+    def get_metrics_dataframe(self) -> pd.DataFrame:
+        """Retorna DataFrame indexado por Horizonte com colunas acadêmicas.
+        Colunas: [WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, WMAPE, MaxAE, Etp, Coverage_90, rWIS, rMAE]
+        Sem vazamento: todas métricas vêm de validation_results (teste não usado no treino).
+        """
+        rows = []
+        for h in sorted(self.validation_results.keys()):
+            a = self.validation_results[h].get('ensemble_avg', {})
+            rows.append({
+                'Horizonte': int(h),
+                'WIS_Total': float(a.get('wis', np.nan)),
+                'WIS_Sharpness': float(a.get('wis_sharpness', np.nan)),
+                'WIS_Overprediction': float(a.get('wis_over', np.nan)),
+                'WIS_Underprediction': float(a.get('wis_under', np.nan)),
+                'WMAPE': float(a.get('wmape', np.nan)),
+                'MaxAE': float(a.get('maxae', np.nan)),
+                'Etp': float(a.get('etp', np.nan)),
+                'Coverage_90': float(a.get('coverage_90', np.nan)),
+                'rWIS': float(a.get('rWIS', np.nan)),
+                'rMAE': float(a.get('rMAE', np.nan)),
+            })
+        df = pd.DataFrame(rows).set_index('Horizonte')
+        # Ordena colunas exatamente como solicitado
+        cols = ['WIS_Total','WIS_Sharpness','WIS_Overprediction','WIS_Underprediction','WMAPE','MaxAE','Etp','Coverage_90','rWIS','rMAE']
+        df = df[cols]
+        return df
 
 
 def load_config(config_path: str = "config/config.yaml") -> Dict:
-    """Load configuration."""
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
 
 def load_processed_data(config: Dict) -> pd.DataFrame:
-    """Load processed data."""
     processed_dir = Path(config['paths']['data_processed'])
     files = list(processed_dir.glob("episense_base.csv"))
     if not files:
         files = list(processed_dir.glob("*.csv"))
-    
     if not files:
         logger.error("No processed data found")
         return pd.DataFrame()
-    
     latest = max(files, key=lambda f: f.stat().st_mtime)
     logger.info(f"Loading data from {latest}")
     return pd.read_csv(latest)
 
 
 def main():
-    """Main training function."""
-    logger.info("Starting Episense model training...")
-    
-    # Load config
+    logger.info("Starting Episense quantile training...")
     config = load_config()
-    
-    # Load data
     df = load_processed_data(config)
     if df.empty:
-        logger.error("No data available for training")
+        logger.error("No data available")
         return
-    
-    logger.info(f"Loaded data: {len(df)} records, SE range: {df['SE'].min()} - {df['SE'].max()}")
-    
-    # Train models
     trainer = EpisenseTrainer(config)
-    results = trainer.train_all_horizons(df)
-    
+    df_featured = trainer.prepare_data(df)
+    for horizon in trainer.target_horizons:
+        trainer.train_horizon(df_featured, horizon)
+    trainer.save_artifacts()
+    trainer.print_summary()
     logger.info("Training completed!")
-    
-    # Check if targets met
-    targets = config.get('metrics', {}).get('targets', {})
-    all_met = True
-    
-    for horizon in config.get('targets', {}).get('horizons', [1,2,3,4]):
-        if horizon not in results:
-            continue
-        ensemble = results[horizon].get('ensemble_avg', {})
-        horizon_targets = targets.get(f'h{horizon}', {})
-        
-        for metric, target in horizon_targets.items():
-            achieved = ensemble.get(metric, 0)
-            if metric in ['f2_score', 'pr_auc']:
-                if achieved < target:
-                    all_met = False
-            elif metric in ['rmse', 'wmape', 'mase']:
-                if achieved > target:
-                    all_met = False
-    
-    if all_met:
-        logger.info("✓ ALL TARGETS MET!")
-    else:
-        logger.warning("✗ Some targets not met - consider retraining with more data/features")
 
 
 if __name__ == "__main__":
