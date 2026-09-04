@@ -136,11 +136,11 @@ def api_metrics():
     # Fold periods (epi weeks) derived from validation_predictions (final 4 folds 2022-2025)
     # Keep in sync with dashboard fold labels
     fold_info = {
-        "avg": {"label": "Média geral", "period": "2022 a 2025", "se": "202236 a 202632"},
+        "avg": {"label": "Média geral", "period": "2022 a 2025", "se": "202236 a 202632", "note": "4 folds; Fold 2025 parcial 49 sem (até 202632)"},
         "0": {"label": "Fold 2022", "period": "04/09/2022 a 27/08/2023", "se": "202236 a 202335"},
         "1": {"label": "Fold 2023", "period": "03/09/2023 a 25/08/2024", "se": "202336 a 202435"},
         "2": {"label": "Fold 2024", "period": "01/09/2024 a 31/08/2025", "se": "202436 a 202536"},
-        "3": {"label": "Fold 2025", "period": "07/09/2025 a 09/08/2026", "se": "202537 a 202632"},
+        "3": {"label": "Fold 2025 (parcial)", "period": "07/09/2025 a 09/08/2026", "se": "202537 a 202632", "note": "49 semanas observadas; 202633+ ainda sem dados"},
     }
     out = {"folds": fold_info}
     for h in [str(i) for i in range(1,9)]:
@@ -231,38 +231,8 @@ def api_history(horizon: str = "1", window: int = 52):
             "date": se_map.get(se, se),
         }
         all_points.append(pt)
-    # Fix previsao historica encolhendo: preenche trailing faltante ate ultima semana para manter linha estavel (H8 etc)
-    # usa apenas cache de forecast quando disponivel (instantaneo), senao forward-fill do ultimo valido para evitar 8s de live inference por request
-    try:
-        last_valid_idx = -1
-        for i in range(len(all_points)-1, -1, -1):
-            if all_points[i].get("pred") is not None:
-                last_valid_idx = i
-                break
-        if last_valid_idx != -1 and last_valid_idx < len(all_points)-1:
-            for idx in range(last_valid_idx+1, len(all_points)):
-                target_se = all_points[idx]["SE"]
-                origin_for_target = add_epiweeks(target_se, -int(h))
-                filled = False
-                with _forecast_cache_lock:
-                    cached = _forecast_cache.get(str(origin_for_target))
-                if cached:
-                    for fc in cached.get("forecast", []):
-                        if fc.get("h") == int(h) and str(fc.get("target_se")) == str(target_se) and fc.get("q50") is not None:
-                            all_points[idx]["pred"]=float(fc["q50"])
-                            if fc.get("q05") is not None: all_points[idx]["pred_low"]=float(fc["q05"])
-                            if fc.get("q95") is not None: all_points[idx]["pred_high"]=float(fc["q95"])
-                            filled=True
-                            break
-                if not filled:
-                    # forward-fill rapido (0.01s) mantem linha estavel sem custo de live
-                    all_points[idx]["pred"]=all_points[last_valid_idx].get("pred")
-                    if all_points[idx].get("pred_low") is None and all_points[last_valid_idx].get("pred_low") is not None:
-                        all_points[idx]["pred_low"]=all_points[last_valid_idx].get("pred_low")
-                    if all_points[idx].get("pred_high") is None and all_points[last_valid_idx].get("pred_high") is not None:
-                        all_points[idx]["pred_high"]=all_points[last_valid_idx].get("pred_high")
-    except Exception:
-        pass
+    # Gap honesto: ultimas h semanas sem validacao permanecem null (spanGaps false no chart).
+    # Nao faz forward-fill: evita linha falsa e preserva erro real de cobertura para horizontes longos.
     return {
         "horizon": h,
         "history": all_points,

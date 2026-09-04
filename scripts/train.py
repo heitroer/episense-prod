@@ -886,6 +886,8 @@ class EpisenseTrainer:
             quick_params.pop('early_stopping_rounds', None)
             quick_params['objective'] = 'quantile'
             # Aggregate importance across all quantiles (median alone underrepresents tails)
+            # per_quantile=true: uniao dos tops por quantil preserva caudas (q05 colapsado h4/h8 var<1 quando agregado dilui sinal)
+            per_quantile = bool(fs.get('per_quantile', False))
             imps = []
             for tau in self.quantiles:
                 qp = quick_params.copy()
@@ -896,9 +898,27 @@ class EpisenseTrainer:
                 )
                 imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
                 imps.append(imp)
-            imp = pd.concat(imps, axis=1).mean(axis=1) if imps else pd.Series(0, index=X_tr.columns)
-            selected = imp[imp > threshold].sort_values(ascending=False)
-            selected_cols = selected.head(max_features).index.tolist()
+            if per_quantile:
+                # Uniao dos tops por quantil (max_features dividido, sem leakage: so X_tr)
+                per_q = max(1, max_features // len(self.quantiles))
+                cols_set = set()
+                for imp in imps:
+                    top = imp[imp > threshold].sort_values(ascending=False).head(per_q).index.tolist()
+                    cols_set.update(top)
+                # completa com media se faltar
+                if len(cols_set) < max_features:
+                    mean_imp = pd.concat(imps, axis=1).mean(axis=1)
+                    extra = mean_imp[~mean_imp.index.isin(cols_set)].sort_values(ascending=False).head(max_features - len(cols_set)).index.tolist()
+                    cols_set.update(extra)
+                selected_cols = list(cols_set)[:max_features]
+                # ordena por importancia media para estabilidade
+                mean_imp = pd.concat(imps, axis=1).mean(axis=1)
+                selected_cols = sorted(selected_cols, key=lambda c: mean_imp.get(c, 0), reverse=True)
+                logger.info(f"    Feature selection per_quantile=true: {len(selected_cols)} union of tops per tau (q05/q50/q95)")
+            else:
+                imp = pd.concat(imps, axis=1).mean(axis=1) if imps else pd.Series(0, index=X_tr.columns)
+                selected = imp[imp > threshold].sort_values(ascending=False)
+                selected_cols = selected.head(max_features).index.tolist()
             if not selected_cols:
                 selected_cols = X_tr.columns.tolist()
         except Exception as e:

@@ -200,8 +200,8 @@ function renderMetrics(){
 function buildMetricsTabs(){
   const tabs=document.getElementById('metrics-tabs'); if(!tabs||!metricsData) return;
   const folds=metricsData.folds||{'avg':{label:'Média geral',period:'2022 a 2025'}};
-  // Impeccable Operate: segmented control with only year, period stays in tooltip
-  const labels={'avg':'Média','0':'2022','1':'2023','2':'2024','3':'2025'};
+  // Impeccable Operate: segmented control with only year, period stays in tooltip; fold parcial sinalizado
+  const labels={'avg':'Média','0':'2022','1':'2023','2':'2024','3':'2025*'};
   tabs.innerHTML='';
   const order=['avg','0','1','2','3'];
   order.forEach(k=>{
@@ -210,7 +210,7 @@ function buildMetricsTabs(){
     const b=document.createElement('button');
     b.type='button'; b.className='tab'+(metricsFold===k?' active':'');
     b.textContent=labels[k]||info.label;
-    b.title=info.label+' — '+info.period+' ('+info.se+')';
+    b.title=info.label+' — '+info.period+' ('+info.se+')'+(info.note?' — '+info.note:'');
     b.setAttribute('aria-pressed', metricsFold===k?'true':'false');
     b.onclick=()=>{metricsFold=k; buildMetricsTabs(); renderMetrics();};
     tabs.appendChild(b);
@@ -402,9 +402,9 @@ function renderChart(animate){
   const s=series(); const step=Math.max(1,Math.ceil(s.full.length/16));
   const data={labels:s.full,datasets:[
     {label:'Real',data:s.real,borderColor:'#e8eef7',backgroundColor:'#e8eef7',borderWidth:2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:true},
-    {label:'Histórico inferior',data:s.low,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',pointRadius:0,tension:.28,spanGaps:true},
-    {label:'Histórico superior',data:s.high,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',fill:'-1',pointRadius:0,tension:.28,spanGaps:true},
-    {label:'Histórico mediana H'+state.h,data:s.pred,borderColor:C('--accent-2'),backgroundColor:C('--accent-2'),borderDash:[6,4],borderWidth:1.8,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:true},
+    {label:'Histórico inferior',data:s.low,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',pointRadius:0,tension:.28,spanGaps:false},
+    {label:'Histórico superior',data:s.high,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',fill:'-1',pointRadius:0,tension:.28,spanGaps:false},
+    {label:'Histórico mediana H'+state.h,data:s.pred,borderColor:C('--accent-2'),backgroundColor:C('--accent-2'),borderDash:[6,4],borderWidth:1.8,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:false},
     {label:'Futuro inferior',data:s.fLow,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',pointRadius:0,tension:.25,spanGaps:false},
     {label:'Futuro superior',data:s.fHigh,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
     {label:'Previsão futura',data:s.fMed,borderColor:C('--forecast'),backgroundColor:C('--forecast'),borderWidth:2.2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.25,spanGaps:false}

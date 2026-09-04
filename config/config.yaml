@@ -147,10 +147,10 @@ training:
   walk_forward:
     n_splits: 4  # um fold por test_year (2022-2025; 2021 removido)
     test_size_weeks: 52
-    gap_weeks: 8  # >= max horizon (assert em train.py); experimento h1-h8
+    gap_weeks: 8  # == max horizon (h8). Seguro: train_end = test_start - gap, ultimo alvo treino = train_end-1+h = test_start-1 < test_start (sem leakage). gap==h maximiza dados sem vazar.
     expanding_window: true
     min_train_weeks: 100  # fold 2022: ~410 semanas de treino (2014-2021, gap 8)
-    test_years: [2022, 2023, 2024, 2025]  # Explicit test years for each fold
+    test_years: [2022, 2023, 2024, 2025]  # Explicit test years for each fold; fold 2025 é parcial (49 sem até 202632, dados atuais) - média 4 folds inclui parcial, ver dashboard nota
     # Validação epidemiológica: folds iniciam em setembro (SE ~35-36) e terminam em agosto
     # Isso garante que cada fold capture o ciclo completo de calmaria (jun-set) + surto (out-maio)
     epidemiological_folds: true
@@ -165,6 +165,7 @@ training:
     method: importance
     threshold: 0.001
     max_features: 380  # v2: 639 feats (+111) -> 380 kept (selecao agregada 3 quantis)
+    per_quantile: false  # false=agregada (atual, 380); true=selecao separada por quantil (corrige q05 colapsado h4/h8 var~0.3, requer retreino sem leakage: usa so X_tr)
     expand_extra: false  # LGBM_swl uses seasonal+weather_long, not full expand_extra
   scaler:
     type: DataFrameScaler
