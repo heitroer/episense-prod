@@ -772,6 +772,7 @@ class EpisenseTrainer:
 
         # Persist per-week prediction series (diagnostic/outbreak analysis):
         # predicted vs actual cases, week by week, per fold per horizon per quantile.
+        # IMPORTANTE: aplicar non_crossing antes de salvar, senao mediana>q95 em picos (bug fold 0 h1 8 semanas)
         if not hasattr(self, 'fold_series'):
             self.fold_series = {}
         self.fold_series.setdefault(horizon, {})
@@ -780,12 +781,21 @@ class EpisenseTrainer:
             for fold_idx, prep in fold_prep.items():
                 preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
                 y_pred_ens = np.mean(np.array(preds), axis=0)
+                # enforce será aplicado em conjunto abaixo; por enquanto guarda raw temporário
                 self.fold_series[horizon][tau].append({
                     'fold': fold_idx,
                     'test_se': [str(s).zfill(6) for s in prep['test_se']],
                     'y_test_casos': [float(x) for x in prep['y_test_raw']],
                     'y_pred_casos': [float(np.expm1(x)) for x in y_pred_ens],
                 })
+        # Corrige crossing no fold_series salvo: ordena Q05<=Q50<=Q95 por semana (mesmo que _average_metrics usou)
+        for fold_idx in fold_prep.keys():
+            n_weeks = len(self.fold_series[horizon][self.quantiles[0]][fold_idx]['y_pred_casos'])
+            for w in range(n_weeks):
+                vals = [self.fold_series[horizon][tau][fold_idx]['y_pred_casos'][w] for tau in sorted(self.quantiles)]
+                vals_sorted = sorted(vals)
+                for j, tau in enumerate(sorted(self.quantiles)):
+                    self.fold_series[horizon][tau][fold_idx]['y_pred_casos'][w] = float(vals_sorted[j])
 
         # Aggregate stratified metrics across folds
         stratified_totals = self._aggregate_stratified(ensemble_fold_metrics)

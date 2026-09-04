@@ -221,11 +221,22 @@ def api_history(horizon: str = "1", window: int = 52):
         se = str(row["SE"])
         # validation pred may be missing for long horizons at the very end (expected gap)
         pv = points.get(se, {})
+        # Correcao non-crossing: validation_predictions.json foi salvo sem sort (bug train.py 781-788), mediana ficava > q95 em 8 semanas do pico 2022-2023.
+        # Garante Q05 <= Q50 <= Q95 aqui sem leakage (apenas ordena os 3 valores ja previstos para a mesma SE).
+        p_low = pv.get("pred_low")
+        p_med = pv.get("pred")
+        p_high = pv.get("pred_high")
+        if p_low is not None and p_med is not None and p_high is not None:
+            try:
+                vals = sorted([float(p_low), float(p_med), float(p_high)])
+                p_low, p_med, p_high = vals[0], vals[1], vals[2]
+            except Exception:
+                pass
         pt = {
             "SE": se,
-            "pred": pv.get("pred"),
-            "pred_low": pv.get("pred_low"),
-            "pred_high": pv.get("pred_high"),
+            "pred": p_med,
+            "pred_low": p_low,
+            "pred_high": p_high,
             "true": float(pv.get("true", row["casos"])) if "true" in pv else float(row["casos"]),
             "real": float(row["casos"]),
             "date": se_map.get(se, se),
