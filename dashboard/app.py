@@ -12,11 +12,14 @@ import sys
 from functools import lru_cache
 import time
 from threading import Lock
+import logging
+from datetime import datetime, timedelta
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 app = FastAPI(title="Episense Dashboard", version="1.0")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -49,6 +52,23 @@ _df_full_mtime = None
 _feat_cache = None
 _feat_cache_mtime = None
 _feat_cache_lock = Lock()
+FORECAST_ARCHIVE = ROOT / "data/processed/forecast_archive.json"
+_last_refresh_check = 0
+_refresh_lock = Lock()
+_refresh_cooldown = 60  # seconds between checks
+_last_fetch = 0
+_fetch_cooldown = 900  # 15 min between external API fetches (infodengue+openmeteo)
+_fetch_lock = Lock()
+_df_base_lock = Lock()
+# Live in-memory cache (same as API 8001) for dashboard forecast
+_live_cache = {'df': None, 'timestamp': 0, 'ttl': 300}
+GEOCODE = config['project']['geocode']
+INFODENGUE_URL = config['data_sources']['infodengue']['base_url']
+OPENMETEO_URL = config['data_sources']['openmeteo']['base_url']
+LAT = config['data_sources']['openmeteo']['latitude']
+LON = config['data_sources']['openmeteo']['longitude']
+TIMEZONE = config['data_sources']['openmeteo']['timezone']
+TARGET_HORIZONS = config['targets']['horizons']
 
 def _get_df_full():
     global _df_full_cache, _df_full_mtime
@@ -82,6 +102,419 @@ def _get_feat_full():
             print(f"feat cache failed: {e}")
             import traceback; traceback.print_exc()
             return None
+
+def _get_raw_max_se() -> str:
+    """Max SE in raw infodengue full (or latest timestamped)."""
+    try:
+        raw_full = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+        if raw_full.exists():
+            df = pd.read_csv(raw_full, usecols=["SE"], dtype={"SE": str})
+            return str(df["SE"].astype(str).str.zfill(6).max())
+        # fallback latest timestamped
+        import glob
+        files = list((ROOT / "data/raw/infodengue").glob("infodengue_cg_*.csv"))
+        if files:
+            latest = max(files, key=lambda p: p.stat().st_mtime)
+            df = pd.read_csv(latest, usecols=["SE"], dtype={"SE": str})
+            return str(df["SE"].astype(str).str.zfill(6).max())
+    except Exception as e:
+        logger.warning(f"_get_raw_max_se failed: {e}")
+    return "0"
+
+def _get_base_max_se() -> str:
+    try:
+        with _df_base_lock:
+            if len(df_base):
+                return str(df_base["SE"].max()).zfill(6)
+    except Exception:
+        pass
+    return "0"
+
+def _reload_df_base():
+    """Reload global df_base from BASE_CSV."""
+    global df_base
+    try:
+        df = pd.read_csv(BASE_CSV, usecols=["SE","casos","data_inicio_semana"], dtype={"SE": str})
+        df["SE"] = df["SE"].astype(str).str.replace(".0","", regex=False).str.zfill(6)
+        df = df.sort_values("SE")
+        with _df_base_lock:
+            df_base = df
+        logger.info(f"df_base reloaded: {len(df_base)} rows, last {df_base['SE'].iloc[-1] if len(df_base) else 'empty'}")
+    except Exception as e:
+        logger.error(f"_reload_df_base failed: {e}")
+
+def _archive_forecast(origin_se: str):
+    """Persist live forecast for origin_se to forecast_archive.json if not already stored."""
+    try:
+        origin_se = str(origin_se).zfill(6)
+        archive = FORECAST_ARCHIVE
+        # load existing
+        data = []
+        if archive.exists():
+            try:
+                data = json.loads(archive.read_text(encoding="utf-8"))
+                if not isinstance(data, list):
+                    data = []
+            except Exception:
+                data = []
+        if any(str(x.get("origin_se")).zfill(6) == origin_se for x in data):
+            return  # already archived
+        inf = get_inference()
+        if inf is None:
+            return
+        # need feat for origin
+        feat_full = _get_feat_full()
+        # generate forecast via inference (reuse logic from api_forecast live path)
+        # Use _get_df_full sliced to origin
+        df_full = _get_df_full()
+        df_full = df_full[df_full["SE"].astype(str).str.zfill(6) <= origin_se].copy().sort_values("SE")
+        if len(df_full) == 0:
+            return
+        # prepare features sliced
+        if feat_full is not None and "SE" in feat_full.columns:
+            mask = feat_full["SE"].astype(str).str.zfill(6) <= origin_se
+            df_feat = feat_full[mask].copy()
+        else:
+            df_feat = inf.prepare_inference_features(df_full)
+        preds = inf.predict(df_feat)
+        forecast = []
+        for hh in range(1,9):
+            if hh not in preds:
+                continue
+            fut_se = add_epiweeks(origin_se, hh)
+            q05=q50=q95=None
+            for tau, arr in preds[hh].items():
+                if len(arr)==0:
+                    continue
+                val = float(arr[-1])
+                casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
+                if abs(tau-0.05)<0.01: q05=casos
+                elif abs(tau-0.50)<0.01: q50=casos
+                elif abs(tau-0.95)<0.01: q95=casos
+            forecast.append({"h": hh, "target_se": str(fut_se), "q05": q05, "q50": q50, "q95": q95})
+        entry = {"origin_se": origin_se, "origin_date": se_to_date(origin_se), "generated_at": datetime.now().isoformat(), "forecast": forecast, "base_max_at_gen": _get_base_max_se()}
+        data.append(entry)
+        # keep sorted and limit to last 200
+        data = sorted(data, key=lambda x: str(x.get("origin_se")))
+        if len(data) > 200:
+            data = data[-200:]
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info(f"Archived forecast for origin {origin_se} -> {forecast[0] if forecast else 'empty'}")
+    except Exception as e:
+        logger.warning(f"_archive_forecast {origin_se} failed: {e}")
+        import traceback; traceback.print_exc()
+
+def _fetch_fresh_raw():
+    """Fetch latest InfoDengue + OpenMeteo directly from external APIs and update raw CSVs.
+    Called from _ensure_fresh_data when fetch cooldown expired. Never throws.
+    """
+    global _last_fetch
+    now = time.time()
+    if now - _last_fetch < _fetch_cooldown:
+        return False
+    # try double-checked locking
+    if not _fetch_lock.acquire(blocking=False):
+        return False
+    try:
+        if time.time() - _last_fetch < _fetch_cooldown:
+            return False
+        _last_fetch = time.time()
+        fetched = False
+        # --- InfoDengue ---
+        try:
+            from data.collect_infodengue import collect_infodengue_data, process_infodengue_data, update_full_history, save_infodengue_data
+            logger.info("Fetching fresh InfoDengue from external API (on-demand)...")
+            df_raw = collect_infodengue_data()
+            if df_raw is not None and not df_raw.empty:
+                df_proc = process_infodengue_data(df_raw)
+                if not df_proc.empty:
+                    full_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+                    df_full = update_full_history(df_proc, full_path)
+                    df_full.to_csv(full_path, index=False)
+                    try:
+                        save_infodengue_data(df_proc)
+                    except Exception:
+                        pass
+                    logger.info(f"InfoDengue fresh fetched: {len(df_proc)} rows range {df_proc['SE'].min()}-{df_proc['SE'].max()} full {len(df_full)}")
+                    fetched = True
+                else:
+                    logger.warning("InfoDengue fetch returned empty after processing")
+            else:
+                logger.warning("InfoDengue fetch empty or failed")
+        except Exception as e:
+            logger.warning(f"InfoDengue on-demand fetch failed: {e}")
+            import traceback; traceback.print_exc()
+        # --- OpenMeteo ---
+        try:
+            from data.collect_openmeteo import collect_openmeteo_data, aggregate_to_weekly, save_openmeteo_data
+            logger.info("Fetching fresh OpenMeteo from external API (on-demand)...")
+            # collect with auto end_date = yesterday
+            df_daily = collect_openmeteo_data()
+            if df_daily is not None and not df_daily.empty:
+                df_weekly = aggregate_to_weekly(df_daily)
+                if not df_weekly.empty:
+                    # save with dated filenames
+                    try:
+                        from datetime import datetime
+                        end_date = datetime.now().strftime("%Y-%m-%d")
+                        save_openmeteo_data(df_daily, df_weekly, "2010-01-01", end_date)
+                    except Exception as e:
+                        logger.warning(f"save_openmeteo failed: {e}")
+                    logger.info(f"OpenMeteo fresh fetched: {len(df_daily)} daily -> {len(df_weekly)} weeks {df_weekly['SE'].min()}-{df_weekly['SE'].max()}")
+                    fetched = True
+                else:
+                    logger.warning("OpenMeteo weekly empty")
+            else:
+                logger.warning("OpenMeteo daily empty")
+        except Exception as e:
+            logger.warning(f"OpenMeteo on-demand fetch failed: {e}")
+            import traceback; traceback.print_exc()
+        return fetched
+    finally:
+        try:
+            _fetch_lock.release()
+        except: pass
+
+
+def _fetch_infodengue_live() -> pd.DataFrame:
+    import requests
+    url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
+    logger.info(f"[dashboard live] Fetching InfoDengue {url}")
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data)
+    keep = [c for c in ['SE','casos','casos_est'] if c in df.columns]
+    df = df[keep].copy()
+    df['SE'] = df['SE'].astype(str).str.zfill(6)
+    df['ano'] = df['SE'].str[:4].astype(int)
+    df['semana'] = df['SE'].str[4:].astype(int)
+    if 'casos' in df.columns:
+        df['casos'] = pd.to_numeric(df['casos'], errors='coerce').fillna(0).astype(int)
+    df = df.sort_values('SE').reset_index(drop=True)
+    return df
+
+def _fetch_openmeteo_live() -> pd.DataFrame:
+    import requests
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=1200)
+    params = {
+        'latitude': LAT,
+        'longitude': LON,
+        'start_date': start_date.isoformat(),
+        'end_date': end_date.isoformat(),
+        'daily': ','.join(config['data_sources']['openmeteo']['daily_variables']),
+        'timezone': TIMEZONE
+    }
+    logger.info(f"[dashboard live] Fetching OpenMeteo {OPENMETEO_URL}")
+    r = requests.get(OPENMETEO_URL, params=params, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    daily = data.get('daily', {})
+    if not daily:
+        logger.warning("No daily OpenMeteo")
+        return pd.DataFrame()
+    df = pd.DataFrame(daily)
+    df['date'] = pd.to_datetime(df['time'])
+    df = df.drop(columns=['time'])
+    from data.epiweeks import date_to_epiweek
+    df['SE'] = df['date'].apply(lambda d: date_to_epiweek(d))
+    df['SE'] = df['SE'].astype(str).str.zfill(6)
+    df['ano'] = df['SE'].str[:4].astype(int)
+    df['semana'] = df['SE'].str[4:].astype(int)
+    agg = {}
+    for col in df.columns:
+        if col in ['date','SE','ano','semana']:
+            continue
+        if 'precip' in col.lower() or 'precipitation' in col.lower():
+            agg[col] = 'sum'
+        elif 'wind' in col.lower() or 'speed' in col.lower():
+            agg[col] = 'max'
+        else:
+            agg[col] = 'mean'
+    weekly = df.groupby(['SE','ano','semana']).agg(agg).reset_index()
+    rename_map = {
+        'temperature_2m_max': 'temp_max',
+        'temperature_2m_min': 'temp_min',
+        'temperature_2m_mean': 'temp_mean',
+        'precipitation_sum': 'precip_total',
+        'relative_humidity_2m_mean': 'humidity_mean',
+        'wind_speed_10m_max': 'wind_max'
+    }
+    weekly = weekly.rename(columns=rename_map)
+    weekly = weekly.sort_values('SE').reset_index(drop=True)
+    logger.info(f"[dashboard live] OpenMeteo weeks {len(weekly)}")
+    return weekly
+
+def _merge_and_prepare_live(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.DataFrame:
+    dengue_df['SE'] = dengue_df['SE'].astype(str).str.zfill(6)
+    weather_df['SE'] = weather_df['SE'].astype(str).str.zfill(6)
+    merged = pd.merge(dengue_df, weather_df, on='SE', how='left', suffixes=('','_weather'))
+    cols_to_drop = [c for c in merged.columns if c.endswith('_weather') and c.replace('_weather','') in merged.columns]
+    merged = merged.drop(columns=cols_to_drop)
+    from data.epiweeks import weeks_in_year
+    min_se = int(merged['SE'].min())
+    max_se = int(merged['SE'].max())
+    all_weeks=[]
+    for year in range(min_se//100, max_se//100+1):
+        for week in range(1, weeks_in_year(year)+1):
+            se=f"{year}{week:02d}"
+            if min_se <= int(se) <= max_se:
+                all_weeks.append(se)
+    all_weeks_df=pd.DataFrame({'SE': all_weeks})
+    all_weeks_df['SE']=all_weeks_df['SE'].astype(str).str.zfill(6)
+    merged=pd.merge(all_weeks_df, merged, on='SE', how='left')
+    if 'casos' in merged.columns:
+        merged['casos']=merged['casos'].fillna(0).astype(int)
+    weather_cols=[c for c in merged.columns if c not in ['SE','ano','semana','casos','casos_est']]
+    for col in weather_cols:
+        if merged[col].dtype in ['float64','int64']:
+            merged[col]=merged[col].ffill()
+    merged['ano']=merged['SE'].str[:4].astype(int)
+    merged['semana']=merged['SE'].str[4:].astype(int)
+    if 'casos_est' in merged.columns:
+        merged=merged.sort_values('SE').reset_index(drop=True)
+        merged['casos']=pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
+        merged['casos_est']=pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
+        n=len(merged)
+        mask=(merged['casos_est']>merged['casos']) & (merged.index >= n-12)
+        if mask.any():
+            merged.loc[mask,'casos']=np.round(merged.loc[mask,'casos_est']).astype(int)
+            logger.info(f"[dashboard live] Nowcast {mask.sum()} semanas")
+    merged['log_casos']=np.log1p(merged['casos'])
+    try:
+        from data.epiweeks import weeks_in_year
+        weeks=merged['ano'].apply(lambda y: weeks_in_year(int(y)))
+        merged['sin_semana']=np.sin(2*np.pi*merged['semana']/weeks)
+        merged['cos_semana']=np.cos(2*np.pi*merged['semana']/weeks)
+    except Exception:
+        merged['sin_semana']=np.sin(2*np.pi*merged['semana']/52)
+        merged['cos_semana']=np.cos(2*np.pi*merged['semana']/52)
+    for lag in range(1,9):
+        merged[f'log_lag{lag}']=merged['log_casos'].shift(lag)
+    temp_col=None
+    for c in ['temp_mean','temp_mean_mean','tempmed']:
+        if c in merged.columns:
+            temp_col=c; break
+    if temp_col:
+        merged['temp_lag2']=merged[temp_col].shift(2)
+        merged['temp_lag4']=merged[temp_col].shift(4)
+    precip_col=None
+    for c in ['precip_total','precip']:
+        if c in merged.columns:
+            precip_col=c; break
+    if precip_col:
+        merged['precip_lag2']=merged[precip_col].shift(2)
+        merged['precip_lag4']=merged[precip_col].shift(4)
+    hum_col=None
+    for c in ['humidity_mean','relative_humidity_2m_mean','umidmed']:
+        if c in merged.columns:
+            hum_col=c; break
+    if hum_col:
+        merged['humidity_lag2']=merged[hum_col].shift(2)
+        merged['humidity_lag4']=merged[hum_col].shift(4)
+    return merged
+
+def _get_live_engineered():
+    global _live_cache
+    now=time.time()
+    if _live_cache['df'] is not None and (now - _live_cache['timestamp']) < _live_cache['ttl']:
+        logger.info("[dashboard live] using cached engineered")
+        return _live_cache['df']
+    logger.info("[dashboard live] Fetching fresh data from APIs (same as 8001)...")
+    dengue=_fetch_infodengue_live()
+    weather=_fetch_openmeteo_live()
+    if dengue.empty or weather.empty:
+        raise RuntimeError("fresh fetch empty")
+    if len(weather) < 156:
+        logger.warning(f"weather weeks {len(weather)} <156")
+    merged=_merge_and_prepare_live(dengue, weather)
+    from data.features import EpisenseFeatureEngineer
+    fe=EpisenseFeatureEngineer(config)
+    engineered=fe.run_full_feature_engineering(merged, convention='advanced', target_horizons=TARGET_HORIZONS, legacy_mode=False)
+    _live_cache['df']=engineered
+    _live_cache['timestamp']=now
+    logger.info(f"[dashboard live] engineered {engineered.shape} last {engineered.iloc[-1].get('SE')}")
+    # invalidate forecast cache when live data refreshes (new week)
+    with _forecast_cache_lock:
+        _forecast_cache.clear()
+    return engineered
+
+
+def _ensure_fresh_data():
+    """On-demand refresh (no cron) — called at start of each API request / dashboard load.
+    If raw infodengue has newer SE than processed base, rebuild base via processor.
+    Debounced 60s, thread-safe, preserves forecast history.
+    """
+    global _last_refresh_check, _df_full_cache, _feat_cache, _forecast_cache, _df_full_mtime, _feat_cache_mtime
+    now = time.time()
+    if now - _last_refresh_check < _refresh_cooldown:
+        return
+    with _refresh_lock:
+        if time.time() - _last_refresh_check < _refresh_cooldown:
+            return
+        _last_refresh_check = time.time()
+        try:
+            # First, try to update raw files from external APIs if cooldown expired
+            # This makes infodengue_cg_full.csv / openmeteo_weekly*.csv stay current without cron
+            try:
+                _fetch_fresh_raw()
+            except Exception as fe:
+                logger.warning(f"fetch fresh raw failed (continuing with local raw): {fe}")
+            raw_max = _get_raw_max_se()
+            base_max = _get_base_max_se()
+            # also check mtime of raw vs base for revised weeks (same max but newer mtime)
+            raw_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+            base_path = ROOT / "data/processed/episense_base.csv"
+            raw_mtime = raw_path.stat().st_mtime if raw_path.exists() else 0
+            base_mtime = base_path.stat().st_mtime if base_path.exists() else 0
+            # Need rebuild if raw has newer SE or raw mtime newer than base mtime (revised weeks)
+            need_rebuild = False
+            reason = ""
+            if raw_max > base_max:
+                need_rebuild = True
+                reason = f"raw {raw_max} > base {base_max}"
+            elif raw_mtime > base_mtime + 5:  # 5s grace
+                # Check if content actually changed (hash) to avoid rebuild on touch
+                # quick: compare file sizes or SE content; for now treat mtime as signal for revisions
+                need_rebuild = True
+                reason = f"raw mtime {raw_mtime} > base {base_mtime} (possible revisao)"
+            if not need_rebuild:
+                # Also check openmeteo freshness: base anchor guard may have dropped last week due to partial weather,
+                # waiting for full 7 days. No rebuild needed until weather completes.
+                return
+            logger.info(f"On-demand refresh triggered: {reason} — rebuilding episense_base.csv")
+            from data.process_data import EpisenseDataProcessor
+            proc = EpisenseDataProcessor()
+            df_new = proc.run_full_pipeline()
+            if df_new is None or df_new.empty:
+                logger.warning("Processor returned empty, abort refresh")
+                return
+            new_max = str(df_new["SE"].max()).zfill(6)
+            # reload global df_base
+            _reload_df_base()
+            # invalidate caches
+            with _feat_cache_lock:
+                _df_full_cache = None
+                _feat_cache = None
+                _df_full_mtime = None
+                _feat_cache_mtime = None
+            with _forecast_cache_lock:
+                _forecast_cache.clear()
+            # Archive forecast for new latest (and also for previous if not yet archived)
+            # Archive new latest
+            try:
+                _archive_forecast(new_max)
+                # Also ensure previous base_max archived (if missing)
+                if base_max != new_max and int(base_max) > 201400:
+                    _archive_forecast(base_max)
+            except Exception as e:
+                logger.warning(f"archive after rebuild failed: {e}")
+            logger.info(f"On-demand refresh done: base {base_max} -> {new_max}, forecast archived")
+        except Exception as e:
+            logger.warning(f"_ensure_fresh_data failed: {e}")
+            import traceback; traceback.print_exc()
 
 # lazy inference engine
 _inference = None
@@ -118,21 +551,42 @@ def add_epiweeks(se: str, n: int) -> str:
 
 @app.get("/api/real")
 def api_real(limit: int = Query(52, ge=10, le=200), end_se: str = None):
+    _ensure_fresh_data()
+    # usa live fresh para "real" (nowcast nos ultimos 12, igual API 8001) se disponivel
+    try:
+        eng = _get_live_engineered()
+        if eng is not None and "SE" in eng.columns and "casos" in eng.columns:
+            eng = eng.copy()
+            eng["SE"] = eng["SE"].astype(str).str.zfill(6)
+            eng = eng.sort_values("SE")
+            # filtra por end_se se pedido
+            if end_se:
+                eng = eng[eng["SE"] <= str(end_se).zfill(6)]
+            df = eng.tail(limit)[["SE","casos","data_inicio_semana"]].copy() if "data_inicio_semana" in eng.columns else eng.tail(limit)[["SE","casos"]].copy()
+            # garante data_inicio_semana via df_base map se faltar
+            if "data_inicio_semana" not in df.columns:
+                m = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["data_inicio_semana"]))
+                # fallback para SE futuras: usa SE como string
+                df["data_inicio_semana"] = df["SE"].map(m).fillna(df["SE"])
+            return {"data": df.to_dict(orient="records"), "source": "live"}
+    except Exception as e:
+        logger.warning(f"api_real live fallback to df_base: {e}")
     if end_se:
-        # filter up to end_se inclusive
         df = df_base[df_base["SE"] <= str(end_se)].tail(limit)
     else:
         df = df_base.tail(limit)
-    return {"data": df.to_dict(orient="records")}
+    return {"data": df.to_dict(orient="records"), "source": "csv"}
 
 @app.get("/api/weeks")
 def api_weeks(limit: int = 100):
+    _ensure_fresh_data()
     # return last N SEs for selector
     df = df_base.tail(limit)
     return {"weeks": df["SE"].tolist(), "dates": df["data_inicio_semana"].tolist()}
 
 @app.get("/api/metrics")
 def api_metrics():
+    _ensure_fresh_data()
     # Fold periods (epi weeks) derived from validation_predictions (final 4 folds 2022-2025)
     # Keep in sync with dashboard fold labels
     fold_info = {
@@ -149,24 +603,25 @@ def api_metrics():
         avg = val_res[h].get("ensemble_avg", {})
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
+        # advanced keys exposed for toggle
+        adv_keys = ["wmape","wis","rWIS","coverage_90","maxae","etp","wis_sharpness","mase","wis_over","wis_under","mae","baseline_wis"]
+        def pick(src):
+            return {k: src.get(k) for k in adv_keys} if src else None
         out[h] = {
-            "avg": {
-                "wmape": avg.get("wmape", avg.get("wmape_weighted")),
-                "wis": avg.get("wis"),
-                "rWIS": avg.get("rWIS"),
-                "coverage_90": avg.get("coverage_90"),
-                "maxae": avg.get("maxae"),
-                "etp": avg.get("etp"),
-            },
-            "0": {k: by_fold.get("0", {}).get(k) for k in ["wmape","wis","rWIS","coverage_90","maxae","etp"]} if "0" in by_fold else None,
-            "1": {k: by_fold.get("1", {}).get(k) for k in ["wmape","wis","rWIS","coverage_90","maxae","etp"]} if "1" in by_fold else None,
-            "2": {k: by_fold.get("2", {}).get(k) for k in ["wmape","wis","rWIS","coverage_90","maxae","etp"]} if "2" in by_fold else None,
-            "3": {k: by_fold.get("3", {}).get(k) for k in ["wmape","wis","rWIS","coverage_90","maxae","etp"]} if "3" in by_fold else None,
+            "avg": pick(avg) | {"wmape": avg.get("wmape", avg.get("wmape_weighted"))},
+            "0": pick(by_fold.get("0", {})),
+            "1": pick(by_fold.get("1", {})),
+            "2": pick(by_fold.get("2", {})),
+            "3": pick(by_fold.get("3", {})),
         }
+        # ensure wmape_weighted alias
+        if out[h]["avg"] and out[h]["avg"].get("wmape") is None:
+            out[h]["avg"]["wmape"] = avg.get("wmape_weighted")
     return out
 
 @app.get("/api/history")
 def api_history(horizon: str = "1", window: int = 52):
+    _ensure_fresh_data()
     """Historical walk-forward predictions for one horizon.
 
     The dashboard must use the same final evaluation scope as validation_results.json:
@@ -211,59 +666,224 @@ def api_history(horizon: str = "1", window: int = 52):
                 if se in points:
                     points[se]["pred_high"] = float(pred)
 
-    # Real must be horizon-independent: use df_base window for stable rightmost week and Hoje marker
-    se_map = dict(zip(df_base["SE"], df_base["data_inicio_semana"]))
-    case_map = dict(zip(df_base["SE"], df_base["casos"]))
-    base_window = df_base.sort_values("SE").tail(window)
+    # Real deve ser live (mesma lógica API 8001 com nowcast), não CSV defasado
+    try:
+        eng_live = _get_live_engineered()
+        if eng_live is not None and "SE" in eng_live.columns:
+            eng_live = eng_live.copy()
+            eng_live["SE"] = eng_live["SE"].astype(str).str.zfill(6)
+            live_map = dict(zip(eng_live["SE"], eng_live["casos"]))
+            live_date = dict(zip(eng_live["SE"], eng_live.get("data_inicio_semana", eng_live["SE"])))
+            # usa live como base_window quando live está mais recente que CSV
+            live_max = eng_live["SE"].max()
+            base_max = str(df_base["SE"].max()).zfill(6)
+            if live_max > base_max:
+                # live tem semanas novas ainda não em df_base (caso CSV ainda não rebuildou)
+                base_window = eng_live.sort_values("SE").tail(window)[["SE","casos","data_inicio_semana"]].copy() if "data_inicio_semana" in eng_live.columns else eng_live.sort_values("SE").tail(window)[["SE","casos"]].copy()
+                if "data_inicio_semana" not in base_window.columns:
+                    base_window["data_inicio_semana"] = base_window["SE"]
+                se_map = dict(zip(base_window["SE"], base_window["data_inicio_semana"]))
+                case_map = dict(zip(base_window["SE"], base_window["casos"]))
+            else:
+                # live cobre mesmas SEs, mas com nowcast (casos corrigidos nos ultimos 12)
+                # mescla: usa live para real nas ultimas 12, CSV para historico antigo (igual API)
+                se_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["data_inicio_semana"]))
+                # sobrescreve com live onde houver
+                for k,v in live_date.items():
+                    se_map[k]=v
+                case_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["casos"]))
+                for k,v in live_map.items():
+                    # só sobrescreve se live tem valor diferente (nowcast) e SE existe no window
+                    case_map[k]=v
+                base_window = df_base.sort_values("SE").tail(window).copy()
+                base_window["SE"] = base_window["SE"].astype(str).str.zfill(6)
+                # aplica live casos no base_window para exibição
+                base_window["casos"] = base_window["SE"].map(case_map).fillna(base_window["casos"])
+                # também atualiza se_map já feito
+        else:
+            raise RuntimeError("no live")
+    except Exception as e:
+        logger.info(f"api_history live map fallback to csv: {e}")
+        se_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["data_inicio_semana"]))
+        case_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["casos"]))
+        base_window = df_base.sort_values("SE").tail(window)
+    # Stitch archive live (todos os quantis) — preenche historico além da validacao walk-forward
+    # Para cada SE sem pred (gap honesto pos 202632), usa a previsao live mais recente que mirava aquela SE.
+    # Ex: 202633 H1 vem de origin 202632 H1; 202634 H1 vem de origin 202633 H1 (mais recente que 202632 H2).
+    archive_map = {}  # target_se -> {pred_low, pred, pred_high, origin_se, h, q05, q50, q95}
+    try:
+        if FORECAST_ARCHIVE.exists():
+            import json as _json
+            arch = _json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+            # arch é lista de {origin_se, forecast: [{h,target_se,q05,q50,q95}]}
+            # Para um dado horizon h, só nos interessa o item com h == int(h)
+            hh = int(h)
+            # ordena por origin_se crescente, o ultimo vence (mais recente)
+            for entry in sorted(arch, key=lambda x: str(x.get("origin_se")).zfill(6)):
+                orig = str(entry.get("origin_se")).zfill(6)
+                for fc in entry.get("forecast", []):
+                    if int(fc.get("h", -1)) != hh:
+                        continue
+                    tgt = str(fc.get("target_se")).zfill(6)
+                    # salva todos os quantis, e mantém também pred_* para compat
+                    archive_map[tgt] = {
+                        "pred_low": fc.get("q05"),
+                        "pred": fc.get("q50"),
+                        "pred_high": fc.get("q95"),
+                        "q05": fc.get("q05"),
+                        "q50": fc.get("q50"),
+                        "q95": fc.get("q95"),
+                        "origin_se": orig,
+                        "h": fc.get("h"),
+                    }
+    except Exception as e:
+        logger.warning(f"archive stitch failed for h={h}: {e}")
+
     # Build history from base window so last week is identical for every horizon (fix shrinking chart / missing Hoje)
     all_points = []
     for _, row in base_window.iterrows():
-        se = str(row["SE"])
+        se = str(row["SE"]).zfill(6)
         # validation pred may be missing for long horizons at the very end (expected gap)
         pv = points.get(se, {})
-        # Correcao non-crossing: validation_predictions.json foi salvo sem sort (bug train.py 781-788), mediana ficava > q95 em 8 semanas do pico 2022-2023.
-        # Garante Q05 <= Q50 <= Q95 aqui sem leakage (apenas ordena os 3 valores ja previstos para a mesma SE).
         p_low = pv.get("pred_low")
         p_med = pv.get("pred")
         p_high = pv.get("pred_high")
+        stitched = False
+        stitch_meta = None
+        # Se gap honesto (sem validacao), preenche com archive live mais recente para esse horizonte
+        if (p_med is None or p_low is None or p_high is None) and se in archive_map:
+            am = archive_map[se]
+            # só usa se archive tem os 3 quantis completos (q05/q50/q95)
+            if am.get("q05") is not None and am.get("q50") is not None and am.get("q95") is not None:
+                p_low = am["q05"]
+                p_med = am["q50"]
+                p_high = am["q95"]
+                stitched = True
+                stitch_meta = am
+        # Fallback: se ainda gap e archive não tinha essa SE/horizonte, gera live na hora para origin=SE-h e arquiva
+        if (p_med is None or p_low is None or p_high is None):
+            try:
+                # origin que prediz 'se' no horizonte hh
+                hh_int = int(h)
+                # calcula origin = se - hh semanas (via epiweeks)
+                from data.epiweeks import epiweek_to_date, date_to_epiweek
+                import pandas as _pd
+                se_str = str(se).zfill(6)
+                y = int(se_str[:4]); w = int(se_str[4:])
+                origin_try = date_to_epiweek(epiweek_to_date(y, w) - _pd.Timedelta(weeks=hh_int))
+                origin_try = str(origin_try).zfill(6)
+                # só tenta se origin existe no historico (não futuro) e não é além do base/live
+                try:
+                    # verifica se origin existe em base ou live
+                    exists = False
+                    if origin_try in df_base["SE"].astype(str).str.zfill(6).values:
+                        exists = True
+                    else:
+                        eng_chk = _live_cache.get('df')
+                        if eng_chk is not None and "SE" in eng_chk.columns:
+                            if origin_try in eng_chk["SE"].astype(str).str.zfill(6).values:
+                                exists = True
+                    if exists:
+                        # tenta gerar e arquivar (salva todos os quantis q05/q50/q95)
+                        _archive_forecast(origin_try)
+                        # recarrega archive_map para esta SE
+                        if FORECAST_ARCHIVE.exists():
+                            import json as _js2
+                            arch2 = _js2.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+                            for entry in arch2:
+                                if str(entry.get("origin_se")).zfill(6) != origin_try:
+                                    continue
+                                for fc in entry.get("forecast", []):
+                                    if int(fc.get("h",-1)) != hh_int:
+                                        continue
+                                    if str(fc.get("target_se")).zfill(6) == se:
+                                        if fc.get("q05") is not None and fc.get("q50") is not None and fc.get("q95") is not None:
+                                            p_low = fc["q05"]; p_med = fc["q50"]; p_high = fc["q95"]
+                                            stitched = True
+                                            stitch_meta = {"origin_se": origin_try, "h": hh_int, "q05": p_low, "q50": p_med, "q95": p_high, "pred_low": p_low, "pred": p_med, "pred_high": p_high}
+                                            # atualiza archive_map para próximas iterações
+                                            archive_map[se] = stitch_meta
+                                        break
+                except Exception as ie:
+                    logger.info(f"on-demand stitch fallback skip {se} h={h}: {ie}")
+            except Exception as fe:
+                logger.info(f"stitch fallback calc failed {se} h={h}: {fe}")
+        # Correcao non-crossing: garante Q05 <= Q50 <= Q95 (tanto validacao quanto archive)
         if p_low is not None and p_med is not None and p_high is not None:
             try:
                 vals = sorted([float(p_low), float(p_med), float(p_high)])
+                # reatribui ordenado mas preserva q05/q50/q95 ordenados também
                 p_low, p_med, p_high = vals[0], vals[1], vals[2]
+                if stitched and stitch_meta:
+                    # mantém q05/q50/q95 coerentes com ordenação
+                    stitch_meta = dict(stitch_meta)
+                    stitch_meta["q05"], stitch_meta["q50"], stitch_meta["q95"] = vals[0], vals[1], vals[2]
             except Exception:
                 pass
         pt = {
             "SE": se,
-            "pred": p_med,
-            "pred_low": p_low,
-            "pred_high": p_high,
+            "pred": float(p_med) if p_med is not None else None,
+            "pred_low": float(p_low) if p_low is not None else None,
+            "pred_high": float(p_high) if p_high is not None else None,
+            # expõe também q05/q50/q95 explicitamente para o frontend (todos os quantis)
+            "q05": float(p_low) if p_low is not None else None,
+            "q50": float(p_med) if p_med is not None else None,
+            "q95": float(p_high) if p_high is not None else None,
             "true": float(pv.get("true", row["casos"])) if "true" in pv else float(row["casos"]),
             "real": float(row["casos"]),
             "date": se_map.get(se, se),
+            "stitched": stitched,
+            "stitch_origin": stitch_meta.get("origin_se") if stitch_meta else None,
         }
         all_points.append(pt)
-    # Gap honesto: ultimas h semanas sem validacao permanecem null (spanGaps false no chart).
-    # Nao faz forward-fill: evita linha falsa e preserva erro real de cobertura para horizontes longos.
+    # Gap honesto: ultimas h semanas SEM archive permanecem null (spanGaps false no chart).
+    # Com archive, gap é preenchido automaticamente quando nova semana é publicada.
+    has_stitched = any(p.get("stitched") for p in all_points)
     return {
         "horizon": h,
         "history": all_points,
-        "source": "validation_predictions",
-        "scope": "wf_2022_2025_gap8_expanding",
-        "quantiles": {"low": q_low, "median": q_mid, "high": q_high},
+        "source": "validation_predictions+archive" if has_stitched else "validation_predictions",
+        "scope": "wf_2022_2025_gap8_expanding+live_archive" if has_stitched else "wf_2022_2025_gap8_expanding",
+        "quantiles": {"low": q_low or "0.05", "median": q_mid or "0.5", "high": q_high or "0.95"},
+        "stitched_count": sum(1 for p in all_points if p.get("stitched")),
+        "archive_entries": len(archive_map),
     }
 
 @app.get("/api/forecast")
 def api_forecast(origin_se: str, horizon: str = None):
-    """Forecast from origin_se.
+    _ensure_fresh_data()
+    """Forecast from origin_se - LIVE like API 8001.
 
-    Historical origins are served from validation_predictions.json first. That keeps chart
-    interactions fast and uses the same walk-forward predictions displayed in /api/history.
-    If the selected origin needs targets beyond the validation file, fall back to live inference.
+    Quando alguém entra no dashboard a previsão futura é feita na hora via inferência
+    com dados frescos da InfoDengue+OpenMeteo (mesma lógica da API 8001), não lida
+    de arquivo estático. Origens históricas ainda podem usar validação para auditoria,
+    mas a origem mais recente SEMPRE é live.
     """
     origin_se = str(origin_se)
     cache_key = origin_se
+    # verifica se origin existe em df_base OU no live fresco (para SE recém-publicada)
+    # tenta live primeiro para freshness check
+    live_latest = None
+    try:
+        # peek live cache without forcing fetch if already fresh
+        if _live_cache['df'] is not None:
+            live_latest = str(_live_cache['df']['SE'].iloc[-1]).zfill(6)
+        else:
+            # fallback ao df_base
+            live_latest = _get_base_max_se()
+    except Exception:
+        live_latest = _get_base_max_se()
+
     if origin_se not in df_base["SE"].values:
-        return {"error": f"SE {origin_se} not found", "origin_se": origin_se}
+        # se não está no CSV mas pode estar no live fresco, tenta buscar live
+        try:
+            eng = _get_live_engineered()
+            if origin_se in eng["SE"].astype(str).str.zfill(6).values:
+                pass
+            else:
+                return {"error": f"SE {origin_se} not found", "origin_se": origin_se}
+        except Exception:
+            return {"error": f"SE {origin_se} not found", "origin_se": origin_se}
 
     def lookup_validation():
         result = {
@@ -296,44 +916,78 @@ def api_forecast(origin_se: str, horizon: str = None):
             })
         return result if complete else None
 
-    # fast cache check
-    with _forecast_cache_lock:
-        if cache_key in _forecast_cache:
-            return _forecast_cache[cache_key]
-    val_lookup = lookup_validation()
-    if val_lookup is not None:
-        with _forecast_cache_lock:
-            if cache_key not in _forecast_cache:
-                if len(_forecast_cache) >= _forecast_cache_max:
-                    oldest = next(iter(_forecast_cache))
-                    del _forecast_cache[oldest]
-                _forecast_cache[cache_key] = val_lookup
-        return val_lookup
+    # Se a origem é a mais recente, SEMPRE faz live fresco (mesma lógica da API 8001)
+    is_latest = (origin_se == live_latest) or (origin_se == _get_base_max_se())
+    # também considera live_latest após fetch fresco
+    try:
+        # força checagem de freshness se for latest (TTL 5min igual API)
+        if is_latest:
+            # tenta live primeiro - ignora cache de forecast validado
+            pass
+        else:
+            # para origens antigas, mantém cache rápido (validação)
+            with _forecast_cache_lock:
+                if cache_key in _forecast_cache:
+                    # se cache é live para latest, não retorna validado antigo
+                    cached = _forecast_cache[cache_key]
+                    if is_latest and cached.get("source") == "validation":
+                        pass
+                    else:
+                        return cached
+            val_lookup = lookup_validation()
+            if val_lookup is not None and not is_latest:
+                with _forecast_cache_lock:
+                    if cache_key not in _forecast_cache:
+                        if len(_forecast_cache) >= _forecast_cache_max:
+                            oldest = next(iter(_forecast_cache))
+                            del _forecast_cache[oldest]
+                        _forecast_cache[cache_key] = val_lookup
+                return val_lookup
+    except Exception:
+        pass
+    # LIVE path - igual API 8001: dados frescos in-memory
+    
 
     inf = get_inference()
     if inf:
         try:
-            # Fast path: use cached engineered full and slice to origin
-            feat_full = _get_feat_full()
-            if feat_full is not None:
-                # slice engineered frame up to origin_se inclusive
-                # feat_full already sorted by SE
-                if "SE" in feat_full.columns:
-                    mask = feat_full["SE"].astype(str) <= origin_se
-                    # ensure at least one row
-                    if mask.sum() == 0:
-                        feat_full = _get_feat_full()
-                        mask = feat_full["SE"].astype(str) <= origin_se
-                    df_feat = feat_full[mask].copy()
+            # LIVE: mesma lógica da API 8001 - dados frescos InfoDengue+OpenMeteo in-memory
+            # Tenta primeiro o cache live fresco (TTL 300s igual API)
+            try:
+                engineered = _get_live_engineered()
+            except Exception as e:
+                logger.warning(f"live engineered failed, fallback to CSV cache: {e}")
+                engineered = None
+            if engineered is not None and "SE" in engineered.columns:
+                # slice engineered até origin_se inclusive
+                engineered["SE"] = engineered["SE"].astype(str).str.zfill(6)
+                mask = engineered["SE"] <= origin_se
+                if mask.sum() == 0:
+                    # origin além do live (SE futura), usa tudo
+                    df_feat = engineered.copy()
                 else:
-                    df_feat = feat_full.copy()
-                # predict directly on sliced engineered frame without re-engineering
+                    # inf.predict espera full engineered mas usa só última linha;
+                    # precisamos dar o slice até origin para prever a partir dali
+                    # Truque: passa o slice, o predict vai engenheirar novamente? Não, já está engenheirado
+                    # Mas predict() chama prepare_inference_features que detecta já-engenheirado via target_h1
+                    # Então podemos passar o slice direto
+                    df_feat = engineered[mask].copy()
                 preds = inf.predict(df_feat)
             else:
-                df_full = _get_df_full()
-                df_full = df_full[df_full["SE"] <= origin_se].copy().sort_values("SE")
-                df_feat = inf.prepare_inference_features(df_full)
-                preds = inf.predict(df_feat)
+                # fallback CSV
+                feat_full = _get_feat_full()
+                if feat_full is not None and "SE" in feat_full.columns:
+                    mask = feat_full["SE"].astype(str).str.zfill(6) <= origin_se
+                    if mask.sum() == 0:
+                        feat_full = _get_feat_full()
+                        mask = feat_full["SE"].astype(str).str.zfill(6) <= origin_se
+                    df_feat = feat_full[mask].copy()
+                    preds = inf.predict(df_feat)
+                else:
+                    df_full = _get_df_full()
+                    df_full = df_full[df_full["SE"].astype(str).str.zfill(6) <= origin_se].copy().sort_values("SE")
+                    df_feat = inf.prepare_inference_features(df_full)
+                    preds = inf.predict(df_feat)
             result = {"origin_se": origin_se, "origin_date": se_to_date(origin_se), "forecast": [], "source": "live"}
             for hh in range(1, 9):
                 if hh not in preds:
@@ -359,6 +1013,11 @@ def api_forecast(origin_se: str, horizon: str = None):
                     oldest = next(iter(_forecast_cache))
                     del _forecast_cache[oldest]
                 _forecast_cache[cache_key] = result
+            # persist live forecast for origin_se (on-demand archive)
+            try:
+                _archive_forecast(origin_se)
+            except Exception:
+                pass
             return result
         except Exception as e:
             print(f"live inference failed {e}, fallback to partial validation")
@@ -368,6 +1027,38 @@ def api_forecast(origin_se: str, horizon: str = None):
     if partial is not None:
         return partial
     return {"origin_se": origin_se, "origin_date": se_to_date(origin_se), "forecast": [], "source": "none"}
+
+@app.get("/api/forecast-history")
+def api_forecast_history():
+    _ensure_fresh_data()
+    try:
+        if FORECAST_ARCHIVE.exists():
+            data = json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+            return {"history": data, "count": len(data)}
+        return {"history": [], "count": 0}
+    except Exception as e:
+        return {"history": [], "count": 0, "error": str(e)}
+
+@app.get("/api/status")
+def api_status():
+    _ensure_fresh_data()
+    try:
+        raw_max = _get_raw_max_se()
+        base_max = _get_base_max_se()
+        archive_count = 0
+        if FORECAST_ARCHIVE.exists():
+            try:
+                archive_count = len(json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8")))
+            except: pass
+        return {
+            "base_max": base_max,
+            "raw_max": raw_max,
+            "stale": raw_max > base_max,
+            "forecast_archive": archive_count,
+            "last_check": _last_refresh_check,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.on_event("startup")
 async def preload():
@@ -414,5 +1105,6 @@ def index():
 
 @app.get("/health")
 def health():
+    _ensure_fresh_data()
     return {"status": "ok", "models": len(list((ROOT/"models").glob("lgbm_h*_seed*_q*.pkl")))}
 

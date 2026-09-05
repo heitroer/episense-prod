@@ -310,7 +310,10 @@ def _get_latest_engineered_data() -> pd.DataFrame:
 class PredictionResponse(BaseModel):
     horizonte_semanas: int = Field(..., description="Prediction horizon in weeks (1-8)")
     semana_epidemiologica: str = Field(..., description="Epidemiological week in YYYYWW format")
-    casos_previstos: int = Field(..., description="Predicted number of dengue cases")
+    casos_previstos: int = Field(..., description="Predicted number of dengue cases (median q0.50)")
+    q05: int = Field(..., description="Quantile 0.05 lower bound")
+    q50: int = Field(..., description="Quantile 0.50 median")
+    q95: int = Field(..., description="Quantile 0.95 upper bound")
     alerta: str = Field(..., description="Alert level: baixo, medio, alto, critico")
 
 
@@ -395,10 +398,25 @@ async def predict(request: Request):
         previsoes = []
         for horizon in sorted(predictions.keys()):
             pred = predictions[horizon]
+            quantis = pred.get('quantis', {})
+            # quantis keys like q0050, q0500, q0950
+            q05 = quantis.get('q0050', pred['casos_previstos'])
+            q50 = quantis.get('q0500', pred['casos_previstos'])
+            q95 = quantis.get('q0950', pred['casos_previstos'])
+            # fallback for dict with float keys if needed
+            if q05 == pred['casos_previstos'] and 'quantis' in pred:
+                # try alternative keys
+                for k,v in quantis.items():
+                    if '0050' in k: q05=v
+                    if '0500' in k: q50=v
+                    if '0950' in k: q95=v
             previsoes.append(PredictionResponse(
                 horizonte_semanas=pred['horizonte_semanas'],
                 semana_epidemiologica=pred['semana_epidemiologica'],
                 casos_previstos=pred['casos_previstos'],
+                q05=int(q05),
+                q50=int(q50),
+                q95=int(q95),
                 alerta=pred['alerta']
             ))
         

@@ -41,7 +41,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .brand{display:flex;align-items:baseline;gap:12px;min-width:0}.brand h1{font-size:24px;letter-spacing:-.04em;line-height:1;font-weight:700}.brand span{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);white-space:nowrap}.statusbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.status{border:1px solid var(--line);background:rgba(11,15,25,.8);color:var(--text-2);height:32px;border-radius:999px;padding:0 12px;display:inline-flex;align-items:center;gap:8px;font:500 12px "IBM Plex Mono",monospace}.status[data-state=ok]::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ok)}.status[data-state=error]::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--danger)}.status[data-state=loading]::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--warn)}.ghost{height:28px;border:1px solid var(--line);background:transparent;color:var(--text-2);border-radius:999px;padding:0 10px;font-size:11px;font-weight:600}.ghost:hover{border-color:var(--accent);color:var(--text)}
 .grid{display:grid;grid-template-columns:1fr;gap:16px}.main{min-width:0;display:flex;flex-direction:column;gap:16px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}.hero-block{background:linear-gradient(180deg,rgba(16,22,34,.96),rgba(11,15,25,.96));padding:22px}.kicker{font:600 11px "IBM Plex Mono",monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}.hero h2{font-size:clamp(30px,4vw,56px);line-height:.96;letter-spacing:-.055em;max-width:780px}.hero p{margin-top:14px;color:var(--text-2);max-width:62ch;font-size:14px}.readout{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line)}.readout .cell{background:var(--panel);padding:14px}.cell label{font:600 10px "IBM Plex Mono",monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}.cell strong{display:block;margin-top:8px;font:500 28px "IBM Plex Mono",monospace;letter-spacing:-.04em}.cell small{display:block;color:var(--muted);font-size:11px;margin-top:4px}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:stretch}.control{background:rgba(11,15,25,.92);border:1px solid var(--line);border-radius:var(--radius);padding:8px 10px}.control h3{font-size:11px;color:var(--text-2);font-weight:700;margin-bottom:6px}.horizon{display:grid;grid-template-columns:repeat(8,1fr);gap:4px}.pill{height:28px;border:1px solid var(--line);background:var(--panel-2);color:var(--text-2);border-radius:8px;font:600 11px "IBM Plex Mono",monospace;letter-spacing:-.01em;transition:transform .16s ease,border-color .16s ease,background .16s ease,color .16s ease,box-shadow .16s ease}.pill:hover{border-color:var(--line-2)}
 .pill.active{background:var(--accent);border-color:var(--accent);color:#031412;box-shadow:0 2px 10px rgba(45,212,191,.22)}
-.pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.range-wrap{display:flex;align-items:center;gap:12px}.range-wrap input{width:100%;accent-color:var(--accent)}.range-value{min-width:48px;height:26px;border-radius:999px;background:var(--panel-3);display:grid;place-items:center;font:500 11px "IBM Plex Mono",monospace;color:var(--text)}.originbox{display:flex;flex-direction:column;gap:8px}.originline{font:500 12px "IBM Plex Mono",monospace;color:var(--text)}.hint{font-size:12px;color:var(--muted);line-height:1.45}.chart-panel{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}.chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:12px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,43,.9),rgba(11,15,25,.9))}.chart-head h3{font-size:16px;letter-spacing:-.02em}.chart-head p{font-size:12px;color:var(--muted);margin-top:4px}.chart-meta{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.tag{height:28px;border:1px solid var(--line);background:var(--panel-2);border-radius:999px;padding:0 10px;display:inline-flex;align-items:center;font:500 11px "IBM Plex Mono",monospace;color:var(--text-2);white-space:nowrap}.plot-wrap{height:420px;padding:8px 8px 4px}.chart-shell{position:relative;height:100%;width:100%}.legend{display:flex;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding:10px 18px;background:rgba(5,7,13,.82)}.legend span{display:inline-flex;align-items:center;gap:7px;color:var(--text-2);font-size:12px}.sw{width:20px;height:3px;border-radius:99px;background:var(--accent)}.sw.real{background:#e8eef7}.sw.hist{background:#38bdf8;border-top:2px dashed #38bdf8;height:0}.sw.fc{background:var(--forecast)}.sw.band{height:10px;background:rgba(245,158,11,.18);border:1px solid rgba(245,158,11,.5)}.forecast{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden}.forecast h3{padding:14px 16px;border-bottom:1px solid var(--line);font-size:14px}.fc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line)}.fc{background:var(--panel);padding:12px}.fc label{display:flex;align-items:center;justify-content:space-between;font:600 11px "IBM Plex Mono",monospace;color:var(--muted)}.fc strong{display:block;font:500 28px "IBM Plex Mono",monospace;letter-spacing:-.04em;margin-top:6px}.fc small{color:var(--muted);font-size:11px}.fc.active{background:linear-gradient(180deg,rgba(45,212,191,.14),var(--panel))}.side-card{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);padding:16px}.side-card h3{font-size:14px;margin-bottom:10px}.side-card p{font-size:12px;color:var(--text-2);line-height:1.55}.note-list{display:flex;flex-direction:column;gap:10px}.note{border-left:2px solid var(--line-2);padding-left:10px}.note b{display:block;font-size:12px;color:var(--text)}.note span{display:block;font-size:12px;color:var(--muted);margin-top:2px}.skeleton{position:relative;overflow:hidden;background:var(--panel-2);border-radius:10px;min-height:90px}.skeleton:after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.08),transparent);animation:shimmer 1.1s infinite}@keyframes shimmer{to{transform:translateX(100%)}}.error{border:1px solid rgba(251,113,133,.45);background:rgba(251,113,133,.1);color:#fecdd3;border-radius:12px;padding:14px;font-size:13px}.fade-in{animation:none}
+.pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.range-wrap{display:flex;align-items:center;gap:12px}.range-wrap input{width:100%;accent-color:var(--accent)}.range-value{min-width:48px;height:26px;border-radius:999px;background:var(--panel-3);display:grid;place-items:center;font:500 11px "IBM Plex Mono",monospace;color:var(--text)}.originbox{display:flex;flex-direction:column;gap:8px}.originline{font:500 12px "IBM Plex Mono",monospace;color:var(--text)}.hint{font-size:12px;color:var(--muted);line-height:1.45}.chart-panel{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}.chart-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:12px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,43,.9),rgba(11,15,25,.9))}.chart-head h3{font-size:16px;letter-spacing:-.02em}.chart-head p{font-size:12px;color:var(--muted);margin-top:4px}.chart-meta{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.tag{height:28px;border:1px solid var(--line);background:var(--panel-2);border-radius:999px;padding:0 10px;display:inline-flex;align-items:center;font:500 11px "IBM Plex Mono",monospace;color:var(--text-2);white-space:nowrap}.plot-wrap{height:560px;padding:8px 8px 4px}.chart-shell{position:relative;height:100%;width:100%}.legend{display:flex;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding:10px 18px;background:rgba(5,7,13,.82)}.legend span{display:inline-flex;align-items:center;gap:7px;color:var(--text-2);font-size:12px}.sw{width:20px;height:3px;border-radius:99px;background:var(--accent)}.sw.real{background:#e8eef7}.sw.hist{background:#38bdf8;border-top:2px dashed #38bdf8;height:0}.sw.fc{background:var(--forecast)}.sw.band{height:10px;background:rgba(245,158,11,.18);border:1px solid rgba(245,158,11,.5)}.forecast{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden}.forecast h3{padding:14px 16px;border-bottom:1px solid var(--line);font-size:14px}.fc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line)}.fc{background:var(--panel);padding:12px}.fc label{display:flex;align-items:center;justify-content:space-between;font:600 11px "IBM Plex Mono",monospace;color:var(--muted)}.fc strong{display:block;font:500 28px "IBM Plex Mono",monospace;letter-spacing:-.04em;margin-top:6px}.fc small{color:var(--muted);font-size:11px}.fc.active{background:linear-gradient(180deg,rgba(45,212,191,.14),var(--panel))}.side-card{border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);padding:16px}.side-card h3{font-size:14px;margin-bottom:10px}.side-card p{font-size:12px;color:var(--text-2);line-height:1.55}.note-list{display:flex;flex-direction:column;gap:10px}.note{border-left:2px solid var(--line-2);padding-left:10px}.note b{display:block;font-size:12px;color:var(--text)}.note span{display:block;font-size:12px;color:var(--muted);margin-top:2px}.skeleton{position:relative;overflow:hidden;background:var(--panel-2);border-radius:10px;min-height:90px}.skeleton:after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.08),transparent);animation:shimmer 1.1s infinite}@keyframes shimmer{to{transform:translateX(100%)}}.error{border:1px solid rgba(251,113,133,.45);background:rgba(251,113,133,.1);color:#fecdd3;border-radius:12px;padding:14px;font-size:13px}.fade-in{animation:none}
 
 .metrics{margin-top:16px;border:1px solid var(--line);background:rgba(11,15,25,.94);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
 .metrics-head{padding:16px 18px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,43,.9),rgba(11,15,25,.9))}
@@ -72,7 +72,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .year-row .pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.controls{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.readout{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:760px){.page{padding:12px}.top{height:auto;align-items:flex-start;flex-direction:column;padding-bottom:12px}.brand{align-items:flex-start;flex-direction:column;gap:4px}.hero-block{padding:18px}.readout{grid-template-columns:repeat(2,1fr)}.horizon{grid-template-columns:repeat(4,1fr)}.plot-wrap{height:420px}.chart-head{flex-direction:column}.chart-meta{justify-content:flex-start}.fc-grid{grid-template-columns:1fr}}
+@media(max-width:760px){.page{padding:12px}.top{height:auto;align-items:flex-start;flex-direction:column;padding-bottom:12px}.brand{align-items:flex-start;flex-direction:column;gap:4px}.hero-block{padding:18px}.readout{grid-template-columns:repeat(2,1fr)}.horizon{grid-template-columns:repeat(4,1fr)}.plot-wrap{height:360px}.chart-head{flex-direction:column}.chart-meta{justify-content:flex-start}.fc-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>
 </head>
@@ -101,14 +101,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     <main class="main">
       <section class="chart-panel">
         <div class="chart-head">
-          <div><h3>Histórico observado e projeção probabilística</h3><p id="chart-subtitle">Casos confirmados, previsto em validação e projeção futura a partir da origem.</p></div>
+          <div><h3>Gráfico de previsões históricas e futuras</h3><p id="chart-subtitle">Casos confirmados, previsto em validação e projeção futura a partir da origem.</p></div>
 
         </div>
         <div class="plot-wrap"><div class="chart-shell"><canvas id="chart"></canvas></div></div>
         <div class="legend">
           <span><i class="sw real"></i>Real</span>
           <span><i class="sw hist"></i>Histórico H<span id="legend-h">1</span></span>
-          <span><i class="sw band"></i>Intervalo futuro</span>
           <span><i class="sw fc"></i>Previsão futura</span>
         </div>
       </section>
@@ -120,30 +119,35 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
         </div>
         <div class="control">
           <h3>Período do gráfico</h3>
-          <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+          <div id="fold-indicators" style="position:relative;height:14px;margin:0 76px 2px;font:600 9px 'IBM Plex Mono',monospace;color:var(--muted);letter-spacing:.04em;pointer-events:none"></div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:2px">
             <span class="range-value" id="year-start-val">2022</span>
             <div id="year-dual-slider" style="position:relative;flex:1;height:26px;display:flex;align-items:center;user-select:none;touch-action:none">
               <div style="position:absolute;left:8px;right:8px;top:50%;height:4px;transform:translateY(-50%);background:var(--panel-3);border-radius:999px"></div>
-              <div id="year-range-fill" style="position:absolute;top:50%;height:4px;transform:translateY(-50%);background:var(--accent);border-radius:999px;left:8px;right:8px"></div>
-              <div id="handle-start" role="slider" aria-label="Início" aria-valuemin="2022" aria-valuemax="2026" tabindex="0" style="position:absolute;width:16px;height:16px;background:var(--text);border:2px solid var(--accent);border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,.4);cursor:grab;transform:translate(-50%,-50%);top:50%;left:8px"></div>
-              <div id="handle-end" role="slider" aria-label="Fim" aria-valuemin="2022" aria-valuemax="2026" tabindex="0" style="position:absolute;width:16px;height:16px;background:var(--text);border:2px solid var(--accent);border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,.4);cursor:grab;transform:translate(-50%,-50%);top:50%;left:calc(100% - 8px)"></div>
+              <div id="year-range-fill" style="position:absolute;top:50%;height:4px;transform:translateY(-50%);background:var(--accent);border-radius:999px;left:8px;right:8px;z-index:1"></div>
+              <div id="year-ticks-year" style="position:absolute;left:8px;right:8px;top:50%;height:10px;transform:translateY(-50%);pointer-events:none;z-index:0"></div>
+              <div id="year-ticks-fold" style="position:absolute;left:8px;right:8px;top:50%;height:14px;transform:translateY(-50%);pointer-events:none;z-index:0"></div>
+              <div id="handle-start" role="slider" aria-label="Início" aria-valuemin="2022" aria-valuemax="2026" tabindex="0" style="position:absolute;width:16px;height:16px;background:var(--text);border:2px solid var(--accent);border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,.4);cursor:grab;transform:translate(-50%,-50%);top:50%;left:8px;z-index:2"></div>
+              <div id="handle-end" role="slider" aria-label="Fim" aria-valuemin="2022" aria-valuemax="2026" tabindex="0" style="position:absolute;width:16px;height:16px;background:var(--text);border:2px solid var(--accent);border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,.4);cursor:grab;transform:translate(-50%,-50%);top:50%;left:calc(100% - 8px);z-index:2"></div>
             </div>
             <span class="range-value" id="year-end-val">2026</span>
           </div>
+          <div id="year-ticks-legend" style="position:relative;height:12px;margin:2px 76px 0;font:600 9px 'IBM Plex Mono',monospace;color:var(--muted);letter-spacing:.06em;pointer-events:none"></div>
         </div>
         </section>
     </main>
   </div>
 
   <section class="metrics" id="metrics-section">
-    <div class="metrics-head">
-      <h3>Desempenho por horizonte</h3>
-      <p>Validação walk-forward 4 folds 2022 a 2025, gap de 8 semanas, janela expansiva.</p>
+    <div class="metrics-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div style="min-width:0"><h3>Métricas de validação</h3>
+      <p>Validação Walk-Forward Expanding Window, 4 folds por ano epidemiológico (2022-2025)</p></div>
+      <button id="metrics-advanced-toggle" class="ghost" type="button" aria-pressed="false" style="height:28px;white-space:nowrap">Ver métricas avançadas</button>
     </div>
     <div class="metrics-tabs" id="metrics-tabs"></div>
     <div class="metrics-table-wrap">
       <table class="metrics-table" id="metrics-table">
-        <thead>
+        <thead id="metrics-head-row">
           <tr>
             <th><span>Horizonte</span><small>Semanas à frente</small></th>
             <th><span>WMAPE</span><small>Erro médio da previsão</small></th>
@@ -162,7 +166,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 const css = getComputedStyle(document.documentElement);
 const C = name => css.getPropertyValue(name).trim();
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const YEARS=[2022,2023,2024,2025,2026];let yearStart=2022,yearEnd=2026;
+const YEARS=[2022,2023,2024,2025,2026];
+// slider agora seleciona por SE (snap em anos e folds), não só ano inteiro
+let selStart='202236',selEnd='202652';
+let yearStart=2022,yearEnd=2026; // alias legado sincronizado com selStart/selEnd
+const SNAP_SES=['202236','202301','202336','202401','202436','202501','202537','202601','202652'].sort();
+function syncYearAlias(){ try{ yearStart=parseInt(selStart.slice(0,4),10); yearEnd=parseInt(selEnd.slice(0,4),10);}catch(e){} }
+function isFullRange(){ return selEnd===SNAP_SES[SNAP_SES.length-1]; }
 const state = {h:'1', win:104, originSE:null, originDate:null, history:[], forecast:null, chart:null, cache:new Map(), forecastCache:new Map(), loading:false};
 const el = {
   horizon:document.getElementById('horizon-control'), chart:document.getElementById('chart'),
@@ -176,16 +186,30 @@ function pct(v){return v==null||Number.isNaN(v)?'--':(v*100).toFixed(1)+'%'}
 function num(v){return v==null||Number.isNaN(v)?'--':Math.round(v).toLocaleString('pt-BR')}
 function level(v){if(v==null)return ['--',C('--muted')]; if(v<10)return ['Baixo',C('--ok')]; if(v<50)return ['Médio',C('--warn')]; if(v<100)return ['Alto',C('--forecast')]; return ['Crítico',C('--danger')]}
 function hButtons(){el.horizon.innerHTML=''; for(let h=1;h<=8;h++){const b=document.createElement('button');b.type='button';b.className='pill'+(String(h)===state.h?' active':'');b.textContent='H'+h;b.onclick=()=>setH(String(h));el.horizon.appendChild(b)}}
-let metricsData=null;let metricsFold='avg';
+let metricsData=null;let metricsFold='avg';let metricsAdvanced=false;
+function formatNum(v, digits=1){return v==null||Number.isNaN(v)?'--':Number(v).toFixed(digits)}
 function renderMetrics(){
   if(!metricsData) return;
+  // rebuild header based on advanced
+  const thead=document.getElementById('metrics-head-row');
+  if(thead){
+    if(metricsAdvanced){
+      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>WMAPE</span><small>Erro médio</small></th><th><span>WIS</span><small>Interval score</small></th><th><span>rWIS</span><small>vs baseline</small></th><th><span>Sharpness</span><small>Largura intervalo</small></th><th><span>Cobertura 90%</span><small>Acerto intervalo</small></th><th><span>Etp</span><small>Semanas até pico</small></th><th><span>MASE</span><small>Erro escalado</small></th></tr>';
+    } else {
+      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>WMAPE</span><small>Erro médio da previsão</small></th><th><span>Cobertura 90%</span><small>Acerto do intervalo</small></th><th><span>Etp</span><small>Semanas até o pico</small></th></tr>';
+    }
+  }
   const body=document.getElementById('metrics-body'); if(!body) return;
   body.innerHTML='';
   for(let h=1;h<=8;h++){
     const entry=metricsData[String(h)];
     const d=entry ? (entry[metricsFold] || entry['avg']) : null;
     const tr=document.createElement('tr');
-    tr.innerHTML='<td>H'+h+'</td><td class="v-wmape">'+pct(d?.wmape)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td><td class="v-etp">'+(d?.etp!=null?Number(d.etp).toFixed(1)+' semanas':'--')+'</td>';
+    if(metricsAdvanced){
+      tr.innerHTML='<td>H'+h+'</td><td class="v-wmape">'+pct(d?.wmape)+'</td><td class="v-wis">'+formatNum(d?.wis,1)+'</td><td class="v-rw">'+(d?.rWIS!=null?d.rWIS.toFixed(2):'--')+'</td><td class="v-sh">'+formatNum(d?.wis_sharpness,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td><td class="v-etp">'+(d?.etp!=null?Number(d.etp).toFixed(1)+' semanas':'--')+'</td><td class="v-mase">'+(d?.mase!=null?d.mase.toFixed(2):'--')+'</td>';
+    } else {
+      tr.innerHTML='<td>H'+h+'</td><td class="v-wmape">'+pct(d?.wmape)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td><td class="v-etp">'+(d?.etp!=null?Number(d.etp).toFixed(1)+' semanas':'--')+'</td>';
+    }
     body.appendChild(tr);
   }
   // update hero readout from selected fold
@@ -218,7 +242,12 @@ function buildMetricsTabs(){
 }
 async function loadMetrics(){try{const m=await json('/api/metrics');metricsData=m;metricsFold='avg';buildMetricsTabs();renderMetrics();const health=await json('/health');if(health.status==='ok'){el.modelStatus.textContent='Api funcionando';el.modelStatus.dataset.state='ok'}else{el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error'}}catch(e){el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error';const body=document.getElementById('metrics-body');if(body)body.innerHTML='<tr><td colspan=\"4\" style=\"text-align:center;color:var(--muted);padding:22px\">Erro ao carregar métricas</td></tr>'}}
 function seYear(se){return parseInt(String(se).slice(0,4),10)}
-function filterByYears(points){return points.filter(p=>{const y=seYear(p.SE); return y>=yearStart && y<=yearEnd})}
+function filterByYears(points){ // agora filtra por SE exata (snap), compat com slider de folds
+  const s=String(selStart).zfill?String(selStart).padStart(6,'0'):String(selStart);
+  const e=String(selEnd).padStart(6,'0');
+  return points.filter(p=>{const se=String(p.SE).padStart(6,'0'); return se>=s && se<=e;});
+}
+function filterBySE(points){ return filterByYears(points); }
 function buildYearPills(){
   const slider=document.getElementById('year-dual-slider');
   const fill=document.getElementById('year-range-fill');
@@ -226,22 +255,110 @@ function buildYearPills(){
   const sVal=document.getElementById('year-start-val'), eVal=document.getElementById('year-end-val');
   if(!slider||!hS||!hE) return;
   const MIN=2022, MAX=2026;
+  const SLIDER_MIN_SE='202236', SLIDER_MAX_SE='202652';
+  // folds walk-forward - apenas inícios (fim do último fold removido a pedido)
+  const FOLD_BOUNDS=[
+    {se:'202236',type:'start',label:'2022S36'},
+    {se:'202336',type:'start',label:'2023S36'},
+    {se:'202436',type:'start',label:'2024S36'},
+    {se:'202537',type:'start',label:'2025S37'},
+  ];
+  function weeksInYear(y){ return (y===2014||y===2020||y===2025)?53:52; }
+  function seToAbsIdx(se){
+    const s=String(se); const y=parseInt(s.slice(0,4),10), w=parseInt(s.slice(4),10);
+    let idx=w-1; for(let yy=MIN; yy<y; yy++) idx+=weeksInYear(yy);
+    return idx;
+  }
+  function seToRatio(se){
+    const a=seToAbsIdx(se), aMin=seToAbsIdx(SLIDER_MIN_SE), aMax=seToAbsIdx(SLIDER_MAX_SE);
+    const total=aMax-aMin;
+    return total<=0?0:(a-aMin)/total;
+  }
+  function renderTicks(){
+    const yTicks=document.getElementById('year-ticks-year');
+    const fTicks=document.getElementById('year-ticks-fold');
+    if(yTicks){
+      yTicks.innerHTML='';
+      for(let y=MIN;y<=MAX;y++){
+        if(y===2022) continue; // SE1 2022 não existe no histórico - primeira divisória é fold0 2022S36
+        const seYearStart=String(y)+'01';
+        const r=seToRatio(seYearStart);
+        const d=document.createElement('div');
+        d.title=String(y);
+        d.style.cssText='position:absolute;top:50%;width:2px;height:14px;background:#2dd4bf;box-shadow:0 0 6px rgba(45,212,191,.35);transform:translate(-50%,-50%);left:'+(r*100)+'%;border-radius:999px';
+        yTicks.appendChild(d);
+      }
+    }
+    if(fTicks){
+      fTicks.innerHTML='';
+      FOLD_BOUNDS.forEach(b=>{
+        const r=seToRatio(b.se);
+        const isStart=b.type==='start';
+        const d=document.createElement('div');
+        d.title=(isStart?'Início ':'Fim ')+b.label+' ('+b.se.slice(0,4)+'S'+b.se.slice(4)+')';
+        // início = traço ciano 2px altura 14, fim = coral 2px (apenas 202632 mantido)
+        if(isStart){
+          d.style.cssText='position:absolute;top:50%;width:2px;height:14px;background:#2dd4bf;box-shadow:0 0 6px rgba(45,212,191,.5);transform:translate(-50%,-50%);left:'+(r*100)+'%;border-radius:999px';
+        } else {
+          d.style.cssText='position:absolute;top:50%;width:2px;height:10px;background:rgba(251,113,133,.9);transform:translate(-50%,-50%);left:'+(r*100)+'%;border-radius:999px;opacity:.95';
+        }
+        fTicks.appendChild(d);
+      });
+    }
+    // legend anos embaixo (sem 2022S36 fixo) e folds em cima
+    const legend=document.getElementById('year-ticks-legend');
+    if(legend){
+      legend.innerHTML='';
+      const yearLabels=[{se:'202301',txt:'2023'},{se:'202401',txt:'2024'},{se:'202501',txt:'2025'},{se:'202601',txt:'2026'}];
+      yearLabels.forEach(l=>{
+        const r=seToRatio(l.se);
+        const s=document.createElement('span');
+        s.textContent=l.txt;
+        s.style.cssText='position:absolute;left:'+(r*100)+'%;transform:translateX(-50%);white-space:nowrap';
+        legend.appendChild(s);
+      });
+    }
+    const foldInd=document.getElementById('fold-indicators');
+    if(foldInd){
+      foldInd.innerHTML='';
+      const foldLabels=[{se:'202236',txt:'Fold 2022'},{se:'202336',txt:'Fold 2023'},{se:'202436',txt:'Fold 2024'},{se:'202537',txt:'Fold 2025'}];
+      foldLabels.forEach(l=>{
+        const r=seToRatio(l.se);
+        const s=document.createElement('span');
+        s.textContent=l.txt;
+        s.style.cssText='position:absolute;left:'+(r*100)+'%;transform:translateX(-50%);white-space:nowrap;color:var(--muted)';
+        foldInd.appendChild(s);
+      });
+    }
+  }
+  // snap em anos e folds: 5 anos + 8 limites de fold = 14 posições selecionáveis
   function yearToRatio(y){ return (y-MIN)/(MAX-MIN); }
   function ratioToYear(r){ return Math.round(r*(MAX-MIN)+MIN); }
+  // lista ordenada de SEs selecionáveis (anos + folds)
+  const SNAP_LABELS={ '202236':'2022S36','202301':'2023','202336':'2023S36','202401':'2024','202436':'2024S36','202501':'2025','202537':'2025S37','202601':'2026','202652':'2026 fim' };
+  function seLabel(se){ return SNAP_LABELS[se]||se.slice(0,4)+'S'+se.slice(4); }
+  function nearestSnapByRatio(r){
+    let best=SNAP_SES[0], bestD=1e9, bestR=seToRatio(SNAP_SES[0]);
+    for(const se of SNAP_SES){ const rr=seToRatio(se); const d=Math.abs(rr-r); if(d<bestD){bestD=d; best=se; bestR=rr;}}
+    return {se:best, ratio:bestR};
+  }
   function updateUI(){
     const rect=slider.getBoundingClientRect();
     const W=rect.width;
     const pad=8;
     const usable=W - pad*2;
-    const rS=yearToRatio(yearStart), rE=yearToRatio(yearEnd);
+    const rS=seToRatio(selStart), rE=seToRatio(selEnd);
     const xS=pad + rS*usable;
     const xE=pad + rE*usable;
     hS.style.left=xS+'px'; hE.style.left=xE+'px';
-    hS.setAttribute('aria-valuenow', String(yearStart));
-    hE.setAttribute('aria-valuenow', String(yearEnd));
-    if(fill){ fill.style.left=xS+'px'; fill.style.width=(xE - xS)+'px'; }
-    if(sVal) sVal.textContent=String(yearStart);
-    if(eVal) eVal.textContent=String(yearEnd);
+    hS.setAttribute('aria-valuenow', selStart);
+    hE.setAttribute('aria-valuenow', selEnd);
+    hS.title='Início: '+seFmt(selStart);
+    hE.title='Fim: '+seFmt(selEnd);
+    if(fill){ fill.style.left=Math.min(xS,xE)+'px'; fill.style.width=Math.abs(xE - xS)+'px'; }
+    if(sVal) sVal.textContent=seFmt(selStart);
+    if(eVal) eVal.textContent=seFmt(selEnd);
+    syncYearAlias();
   }
   function setFromClientX(clientX, which){
     const rect=slider.getBoundingClientRect();
@@ -250,22 +367,25 @@ function buildYearPills(){
     let x=clientX - rect.left;
     x=Math.max(pad, Math.min(rect.width-pad, x));
     const r=(x-pad)/usable;
-    let y=ratioToYear(r);
-    y=Math.max(MIN, Math.min(MAX, y));
+    const snapped=nearestSnapByRatio(r);
+    let se=snapped.se;
     if(which==='start'){
-      if(y>yearEnd) y=yearEnd;
-      yearStart=y;
+      // não cruza: start <= end
+      if(se > selEnd) se=selEnd;
+      selStart=se;
     } else {
-      if(y<yearStart) y=yearStart;
-      yearEnd=y;
+      if(se < selStart) se=selStart;
+      selEnd=se;
     }
+    syncYearAlias();
     updateUI();
     loadHistory();
   }
   // initial
+  renderTicks();
   updateUI();
   if(slider.dataset.bound) { // ensure resize updates
-    window.addEventListener('resize', updateUI);
+    window.addEventListener('resize', ()=>{renderTicks(); updateUI();});
     return;
   }
   slider.dataset.bound='1';
@@ -289,11 +409,18 @@ function buildYearPills(){
       if(e.key==='ArrowRight'||e.key==='ArrowUp') d=1;
       if(d!==0){
         e.preventDefault();
-        let y = which==='start'? yearStart : yearEnd;
-        y+=d;
-        if(which==='start'){ y=Math.max(MIN, Math.min(yearEnd, y)); yearStart=y; }
-        else { y=Math.max(yearStart, Math.min(MAX, y)); yearEnd=y; }
-        updateUI(); loadHistory();
+        const idx = SNAP_SES.indexOf(which==='start'? selStart : selEnd);
+        let nIdx = idx + d;
+        nIdx=Math.max(0, Math.min(SNAP_SES.length-1, nIdx));
+        const nSe=SNAP_SES[nIdx];
+        if(which==='start'){
+          if(nSe > selEnd) return;
+          selStart=nSe;
+        } else {
+          if(nSe < selStart) return;
+          selEnd=nSe;
+        }
+        syncYearAlias(); updateUI(); loadHistory();
       }
     });
   }
@@ -310,20 +437,21 @@ function buildYearPills(){
     const usable=rect.width - pad*2;
     let x=e.clientX - rect.left;
     const r=(x-pad)/usable;
-    const y=ratioToYear(r);
-    const dS=Math.abs(y-yearStart), dE=Math.abs(y-yearEnd);
+    const snapped=nearestSnapByRatio(r);
+    const dS=Math.abs(seToRatio(selStart)-snapped.ratio), dE=Math.abs(seToRatio(selEnd)-snapped.ratio);
     if(dS<=dE) setFromClientX(e.clientX,'start'); else setFromClientX(e.clientX,'end');
   });
-  window.addEventListener('resize', updateUI);
+  window.addEventListener('resize', ()=>{renderTicks(); updateUI();});
 }
 async function loadHistory(){
   if(state.loading)return; state.loading=true;
-  const key=state.h+':'+yearStart+'-'+yearEnd;
+  const key=state.h+':'+selStart+'-'+selEnd;
   try{
-    // always fetch full window and filter by year on client for consistent cache
+    // sem cache estático: histórico real e previsto desatualizavam (ficavam em state.cache)
+    // busca sempre fresco (mesma lógica API 8001 live) e invalida cache quando muda
+    let data = await json('/api/history?horizon='+state.h+'&window=200');
     const cacheKey=state.h+':full';
-    let data = state.cache.get(cacheKey);
-    if(!data){ data=await json('/api/history?horizon='+state.h+'&window=200'); state.cache.set(cacheKey,data); }
+    state.cache.set(cacheKey,data);
     let points=data.history||[];
     points=filterByYears(points);
     if(!points.length){ // fallback: if filter empty (e.g. 2026 beyond validation), show last available
@@ -337,25 +465,31 @@ async function loadHistory(){
     el.legendH.textContent=state.h;
     syncOriginUI();
     renderChart(true);
-    if(yearEnd!==2026){
-      // beyond 2026: remove future forecast (no data beyond validation)
-      state.forecast=null;
-      if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura indisponível além de 2026</small></div>';
+    if(!isFullRange()){
+      // período limitado: esconde futuro mas mantém cache para retorno instantâneo
+      if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura disponível apenas com período até 2026 fim</small></div>';
       renderChart();
     } else {
       const currentOrigin = String(state.originSE);
-      const needsForecast = !state.forecast || String(state.forecast.origin_se)!==currentOrigin;
-      if(needsForecast){
+      const cached = state.forecastCache.get(currentOrigin);
+      if(cached && !cached.error){
+        state.forecast=cached;
+        if(el.forecast) renderForecast(true);
+        renderChart();
+        // revalida em segundo plano se cache antigo
+      } else if(state.forecast && String(state.forecast.origin_se)===currentOrigin){
+        if(el.forecast) renderForecast(true);
+        renderChart();
+      } else {
+        // sem cache: busca e salva para retorno instantâneo futuro
         if(el.forecast) el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
         loadForecast(currentOrigin).then(()=>{
           if(String(state.originSE)!==currentOrigin)return;
-          if(yearEnd!==2026) return;
+          if(!isFullRange()) return;
           syncOriginUI();
           if(el.forecast) renderForecast(true);
           renderChart();
         }).catch(()=>{ if(el.forecast && String(state.originSE)===currentOrigin)el.forecast.innerHTML='<div class="fc"><small>Erro ao buscar previsão</small></div>'; });
-      } else {
-        if(el.forecast) renderForecast();
       }
     }
   }catch(e){drawError('Erro ao carregar histórico: '+e.message)}
@@ -364,7 +498,14 @@ async function loadHistory(){
 async function loadForecast(se){
   if(!se)return;
   const key=String(se);
-  const data=state.forecastCache.get(key) || await json('/api/forecast?origin_se='+encodeURIComponent(key));
+  const cached=state.forecastCache.get(key);
+  if(cached && !cached.error){
+    state.forecast=cached;
+    state.originSE=String(cached.origin_se||se);
+    state.originDate=cached.origin_date||state.originDate;
+    return;
+  }
+  let data = await json('/api/forecast?origin_se='+encodeURIComponent(key));
   state.forecastCache.set(key,data);
   if(!data.error){state.forecast=data;state.originSE=String(data.origin_se||se);state.originDate=data.origin_date||state.originDate}
 }
@@ -378,19 +519,19 @@ function renderForecast(animate){
 }
 function series(){
   const hist=state.history, labels=hist.map(p=>seFmt(p.SE)), byLabel=new Map(labels.map((l,i)=>[l,i]));
-  const full=[...labels]; const fc=(yearEnd!==2026)?[]:(state.forecast?.forecast||[]); if(yearEnd<=2026) fc.forEach(f=>{const l=seFmt(f.target_se); if(!byLabel.has(l)&&!full.includes(l))full.push(l)});
+  const full=[...labels]; const fc=(!isFullRange())?[]:(state.forecast?.forecast||[]); if(isFullRange()) fc.forEach(f=>{const l=seFmt(f.target_se); if(!byLabel.has(l)&&!full.includes(l))full.push(l)});
   const base=()=>Array(full.length).fill(null);
   const real=base(), pred=base(), low=base(), high=base();
   hist.forEach((p,i)=>{real[i]=p.real;pred[i]=p.pred;low[i]=p.pred_low??null;high[i]=p.pred_high??null});
   const fLow=base(), fHigh=base(), fMed=base();
-  if(yearEnd<=2026) fc.forEach(f=>{const i=full.indexOf(seFmt(f.target_se)); if(i>=0){fLow[i]=f.q05;fHigh[i]=f.q95;fMed[i]=f.q50}});
+  if(isFullRange()) fc.forEach(f=>{const i=full.indexOf(seFmt(f.target_se)); if(i>=0){fLow[i]=f.q05;fHigh[i]=f.q95;fMed[i]=f.q50}});
   return {full,real,pred,low,high,fLow,fHigh,fMed,originIndex:full.indexOf(seFmt(state.originSE||''))};
 }
 const FOLD_START_LABELS=['2022S36','2023S36','2024S36','2025S37'];
 const FOLD_START_YEARS=['Fold 2022','Fold 2023','Fold 2024','Fold 2025'];
 const hoverLinePlugin={id:'hoverLine',afterDraw(chart){if(chart.tooltip&&chart.tooltip.getActiveElements().length){const x=chart.tooltip.caretX,top=chart.chartArea.top,bottom=chart.chartArea.bottom,ctx=chart.ctx;ctx.save();ctx.strokeStyle='rgba(125,211,252,0.95)';ctx.lineWidth=1;ctx.setLineDash([]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.restore();}}};
 const foldMarkersPlugin={id:'foldMarkers',afterDatasetsDraw(chart){const labels=chart.data.labels||[];const ctx=chart.ctx;const area=chart.chartArea;const scale=chart.scales.x;if(!scale||!area) return;FOLD_START_LABELS.forEach((lab,i)=>{const idx=labels.indexOf(lab);if(idx<0) return;const x=scale.getPixelForValue(idx);if(x<area.left-1||x>area.right+1) return;ctx.save();ctx.strokeStyle='rgba(148,163,184,0.45)';ctx.lineWidth=1;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(x,area.top);ctx.lineTo(x,area.bottom);ctx.stroke();ctx.setLineDash([]);const text=FOLD_START_YEARS[i];ctx.font='600 9px IBM Plex Mono';const w=ctx.measureText(text).width+10;const h=14;const rx=x-w/2;const ry=area.bottom+8;ctx.fillStyle='rgba(11,15,25,0.92)';ctx.strokeStyle='rgba(148,163,184,0.55)';ctx.lineWidth=1;ctx.beginPath();const r=6;ctx.moveTo(rx+r,ry);ctx.lineTo(rx+w-r,ry);ctx.quadraticCurveTo(rx+w,ry,rx+w,ry+r);ctx.lineTo(rx+w,ry+h-r);ctx.quadraticCurveTo(rx+w,ry+h,rx+w-r,ry+h);ctx.lineTo(rx+r,ry+h);ctx.quadraticCurveTo(rx,ry+h,rx,ry+h-r);ctx.lineTo(rx,ry+r);ctx.quadraticCurveTo(rx,ry,rx+r,ry);ctx.closePath();ctx.fill();ctx.stroke();ctx.fillStyle='rgba(226,232,240,0.95)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(text,x,ry+h/2+0.5);ctx.restore();});}};
-const originPlugin={id:'originLine',afterDatasetsDraw(chart,args,opts){const idx=opts.index;if(idx<0)return;const x=chart.scales.x.getPixelForValue(idx), top=chart.chartArea.top, bottom=chart.chartArea.bottom, ctx=chart.ctx;ctx.save();ctx.strokeStyle=C('--danger');ctx.lineWidth=1.4;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=C('--danger');ctx.font='600 11px IBM Plex Mono';ctx.textAlign='center';ctx.fillText('Hoje',x,top+14);ctx.restore()}};
+const originPlugin={id:'originLine',afterDatasetsDraw(chart,args,opts){const idx=opts.index;if(idx<0)return;const x=chart.scales.x.getPixelForValue(idx), top=chart.chartArea.top, bottom=chart.chartArea.bottom, ctx=chart.ctx;ctx.save();ctx.strokeStyle='rgba(251,113,133,0.95)';ctx.lineWidth=1;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='rgba(251,113,133,0.95)';ctx.font='600 11px IBM Plex Mono';ctx.textAlign='center';ctx.fillText('Hoje',x,top+14);ctx.restore()}};
 Chart.register(hoverLinePlugin,foldMarkersPlugin,originPlugin);
 function triggerChartSlide(){
   if(reducedMotion)return;
@@ -409,7 +550,7 @@ function renderChart(animate){
     {label:'Futuro superior',data:s.fHigh,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
     {label:'Previsão futura',data:s.fMed,borderColor:C('--forecast'),backgroundColor:C('--forecast'),borderWidth:2.2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.25,spanGaps:false}
   ]};
-  const opts={responsive:true,maintainAspectRatio:false,animation:false,transitions:{active:{animation:{duration:0}},show:{animation:{duration:0}},hide:{animation:{duration:0}},resize:{animation:{duration:0}}},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},originLine:{index:s.originIndex},tooltip:{backgroundColor:'#0b0f19',titleColor:C('--text'),bodyColor:C('--text-2'),borderColor:C('--line-2'),borderWidth:1,padding:10,callbacks:{title(items){return items[0]?.label||''},label(ctx){if(ctx.parsed.y==null)return null;return ctx.dataset.label+': '+num(ctx.parsed.y)}}}},scales:{x:{grid:{color:'rgba(51,65,85,.45)'},border:{color:C('--line-2')},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},maxRotation:0,minRotation:0,autoSkip:false,callback(value,index){const lab=this.getLabelForValue(value);if(index===0||index===s.full.length-1)return lab;if(index%step===0)return lab.slice(2);return ''}}},y:{beginAtZero:true,grid:{color:'rgba(51,65,85,.5)'},border:{display:false},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},callback:v=>Number(v).toLocaleString('pt-BR')}}},onClick:undefined};
+  const opts={responsive:true,maintainAspectRatio:false,animation:false,transitions:{active:{animation:{duration:0}},show:{animation:{duration:0}},hide:{animation:{duration:0}},resize:{animation:{duration:0}}},interaction:{mode:'index',intersect:false},plugins:{legend:{display:false},originLine:{index:s.originIndex},tooltip:{backgroundColor:'#0b0f19',titleColor:C('--text'),bodyColor:C('--text-2'),borderColor:C('--line-2'),borderWidth:1,padding:10,callbacks:{title(items){return items[0]?.label||''},label(ctx){if(ctx.parsed.y==null)return null;const idx=ctx.dataIndex;const ds=ctx.dataset.label;if(ds==='Real')return 'Real: '+num(ctx.parsed.y);if(ds.includes('mediana')||ds.includes('Previsão futura'))return 'Mediana: '+num(ctx.parsed.y);return null;},afterBody(items){if(!items||!items.length)return;const idx=items[0].dataIndex;const chart=items[0].chart;if(!chart)return;const get=(i)=>chart.data.datasets[i]?.data[idx];const histLow=get(1), histHigh=get(2), futLow=get(4), futHigh=get(5);let low=null, high=null;if(histLow!=null&&histHigh!=null){low=histLow;high=histHigh;}else if(futLow!=null&&futHigh!=null){low=futLow;high=futHigh;}if(low!=null&&high!=null)return ['Intervalo: '+num(low)+' - '+num(high)];return;}},filter(item){const allowed=['Real','Histórico mediana H'+state.h,'Previsão futura'];return allowed.includes(item.dataset.label);}}},scales:{x:{grid:{color:'rgba(51,65,85,.45)'},border:{color:C('--line-2')},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},maxRotation:0,minRotation:0,autoSkip:false,callback(value,index){const lab=this.getLabelForValue(value);if(index===0||index===s.full.length-1)return lab;if(index%step===0)return lab.slice(2);return ''}}},y:{beginAtZero:true,grid:{color:'rgba(51,65,85,.5)'},border:{display:false},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},callback:v=>Number(v).toLocaleString('pt-BR')}}},onClick:undefined};
   if(!state.chart){state.chart=new Chart(el.chart,{type:'line',data,options:opts})}else{state.chart.options=opts;state.chart.data=data;state.chart.update('none')}
   if(animate)triggerChartSlide();
 }
@@ -421,15 +562,23 @@ async function setOrigin(se,date){
   state.originDate=date||state.originDate;
   syncOriginUI();
   renderChart(true);
-  if(yearEnd!==2026){
-    if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura indisponível além de 2026</small></div>';
+  if(!isFullRange()){
+    if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura indisponível para período limitado</small></div>';
+    return;
+  }
+  const cached=state.forecastCache.get(String(state.originSE));
+  if(cached && !cached.error){
+    state.forecast=cached;
+    syncOriginUI();
+    if(el.forecast) renderForecast(true);
+    renderChart(true);
     return;
   }
   if(el.forecast) el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
   try{
     await loadForecast(state.originSE);
     if(requestId!==originRequest)return;
-    if(yearEnd!==2026) return;
+    if(!isFullRange()) return;
     syncOriginUI();
     if(el.forecast) renderForecast(true);
     renderChart(true);
@@ -439,6 +588,17 @@ async function setOrigin(se,date){
 }
 async function setH(h){if(state.h===h)return;state.h=h;hButtons();if(el.forecast) renderForecast(true);triggerChartSlide();await loadHistory()}
 if(el.latest) el.latest.addEventListener('click',async()=>{const last=state.history[state.history.length-1];if(last)await setOrigin(String(last.SE),last.date)});
+(function bindAdvancedToggle(){
+  const btn=document.getElementById('metrics-advanced-toggle');
+  if(btn){
+    btn.addEventListener('click',()=>{
+      metricsAdvanced=!metricsAdvanced;
+      btn.textContent=metricsAdvanced?'Ver métricas simples':'Ver métricas avançadas';
+      btn.setAttribute('aria-pressed', metricsAdvanced?'true':'false');
+      renderMetrics();
+    });
+  }
+})();
 (async function init(){hButtons();buildYearPills();await loadMetrics();await loadHistory()})();
 </script>
 </body>

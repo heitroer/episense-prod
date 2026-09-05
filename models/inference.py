@@ -81,14 +81,24 @@ class EpisenseInference:
         if feature_path.exists():
             with open(feature_path, 'r') as f:
                 feature_data = json.load(f)
-                # Support both old format (list) and new format (dict per horizon)
+                # Support three formats:
+                # 1) legacy list (same features for all horizons)
+                # 2) dict horizon->list (union mode)
+                # 3) dict horizon->dict tau->list (separate_quantile_features mode)
                 if isinstance(feature_data, dict):
-                    # Convert string keys to int for consistency with target_horizons
-                    self.feature_names = {int(k): v for k, v in feature_data.items()}
+                    self.feature_names = {}
+                    for k, v in feature_data.items():
+                        hk = int(k)
+                        if isinstance(v, dict):
+                            # per-tau dict: keys like "0.05", "0.5", "0.95"
+                            self.feature_names[hk] = {float(tau_k): cols for tau_k, cols in v.items()}
+                        else:
+                            self.feature_names[hk] = v
                 else:
-                    # Backward compatibility: assume same features for all horizons
                     self.feature_names = {h: feature_data for h in self.target_horizons}
-            logger.info(f"Loaded feature names for {len(self.feature_names)} horizons")
+            # detectar modo separado
+            is_separate = any(isinstance(v, dict) for v in self.feature_names.values())
+            logger.info(f"Loaded feature names for {len(self.feature_names)} horizons (separate_per_tau={is_separate})")
         
         # NOTE: DataFrameScaler was removed from pipeline (LightGBM doesn't need scaling)
         # scaler_path = self.model_dir / "scaler.pkl"
@@ -123,12 +133,25 @@ class EpisenseInference:
             self.ano_normalization_params = {}
 
     def _load_quantile_recalibration(self):
-        """Load quantile recalibration deltas for conformal calibration."""
+        """Load quantile recalibration deltas for conformal calibration.
+        Supports global (quantile_recalibration.json) and regime-aware
+        (quantile_recalibration_regime.json) with per-regime deltas.
+        """
+        self.quantile_recalibration_regime = {}
+        # regime file tem prioridade mas mantem global como fallback
+        regime_path = self.model_dir / "quantile_recalibration_regime.json"
+        if regime_path.exists():
+            try:
+                with open(regime_path, 'r') as f:
+                    self.quantile_recalibration_regime = json.load(f)
+                logger.info(f"Loaded regime recalibration: {regime_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load regime recalibration: {e}")
         recal_path = self.model_dir / "quantile_recalibration.json"
         if recal_path.exists():
             with open(recal_path, 'r') as f:
                 self.quantile_recalibration = json.load(f)
-            logger.info(f"Loaded quantile recalibration: {recal_path}")
+            logger.info(f"Loaded quantile recalibration: {recal_path} (regime={'yes' if self.quantile_recalibration_regime else 'no'})")
         elif self.quantile_recalibration:
             logger.info("Using quantile recalibration from config")
         else:
@@ -240,13 +263,28 @@ class EpisenseInference:
         
         return df
     
-    def _select_horizon_features(self, df: pd.DataFrame, horizon: int) -> pd.DataFrame:
-        """Select features for a specific horizon from the fully engineered dataframe."""
+    def _select_horizon_features(self, df: pd.DataFrame, horizon: int, tau: float = None) -> pd.DataFrame:
+        """Select features for a specific horizon (e tau) from the fully engineered dataframe."""
         if horizon not in self.feature_names:
             logger.warning(f"No feature names for horizon {horizon}, using all columns")
             return df.fillna(0)
         
-        feature_cols = self.feature_names[horizon]
+        feat_entry = self.feature_names[horizon]
+        # separate mode: feat_entry is dict tau->list; union mode: list
+        if isinstance(feat_entry, dict):
+            if tau is None:
+                # fallback para compatibilidade: usa q0.5
+                tau = 0.5
+            # chave mais proxima (float keys)
+            # tenta exato, senao mais proximo
+            if tau in feat_entry:
+                feature_cols = feat_entry[tau]
+            else:
+                # encontra tau mais proximo
+                closest = min(feat_entry.keys(), key=lambda k: abs(k - tau))
+                feature_cols = feat_entry[closest]
+        else:
+            feature_cols = feat_entry
         X = pd.DataFrame(index=df.index)
         
         # Pre-compute ano_normalizado if the trained model uses it. FAIL FAST if the
@@ -267,16 +305,16 @@ class EpisenseInference:
             ano_max = params.get('ano_max')
             df = df.copy()
             df['ano_normalizado'] = (df['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
-            # Clip to [0,1] to avoid extreme extrapolation for years beyond train range
-            # (e.g., 2026 predicting with 2014-2025 train). Log first.
+            # Sem clip rigido [0,1]: permite extrapolacao ate 1.2 para 2027-2030 (report P2)
+            # Apenas log warning e clip suave [-0.2, 1.5] para estabilidade numerica
             n_extrap = int(((df['ano_normalizado'] < 0) | (df['ano_normalizado'] > 1)).sum())
             if n_extrap > 0:
                 logger.warning(
                     f"horizon h{horizon}: ano_normalizado extrapola além da faixa de treino "
                     f"[{ano_min}, {ano_max}] em {n_extrap} linha(s) - predições para anos fora "
-                    f"do período de treino são extrapolações (clipped to [0,1])"
+                    f"do período de treino são extrapolações (sem clip rigido, clip suave [-0.2,1.5])"
                 )
-                df['ano_normalizado'] = np.clip(df['ano_normalizado'], 0, 1)
+                df['ano_normalizado'] = np.clip(df['ano_normalizado'], -0.2, 1.5)
         
         n_missing = sum(1 for f in feature_cols if f not in df.columns)
         if n_missing > 0:
@@ -328,8 +366,8 @@ class EpisenseInference:
                         predictions[horizon][tau] = np.array([])
                         continue
                 
-                    # Select features for this horizon
-                    X = self._select_horizon_features(df_last, horizon)
+                    # Select features for this horizon+tau (separate mode)
+                    X = self._select_horizon_features(df_last, horizon, tau)
                 
                     # Ensemble predictions for this quantile
                     horizon_preds = []
@@ -349,35 +387,94 @@ class EpisenseInference:
             if self.non_crossing:
                 predictions = self._apply_non_crossing(predictions)
         
-            # Apply quantile recalibration (split conformal)
-            if self.quantile_recalibration:
-                predictions = self._apply_quantile_recalibration(predictions)
+            # Apply quantile recalibration (split conformal) - with regime aware if available
+            if self.quantile_recalibration or getattr(self, 'quantile_recalibration_regime', {}):
+                # last SE for regime classification
+                try:
+                    last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
+                except Exception:
+                    last_se = None
+                predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
         
             return predictions
 
-    def _apply_quantile_recalibration(self, predictions: Dict[int, Dict[float, np.ndarray]]) -> Dict[int, Dict[float, np.ndarray]]:
+    def _apply_quantile_recalibration(self, predictions: Dict[int, Dict[float, np.ndarray]], last_se: str = None) -> Dict[int, Dict[float, np.ndarray]]:
         """Apply split conformal recalibration to q0.05 and q0.95.
-
-        FIX 2026-09-02: delta no arquivo buggy estava em escala de casos (ex: +50 a +210),
-        mas era somado diretamente aos logits (log1p). Isso gerava expm1(log+210) astronomico
-        e q0.05 negativo. Agora detecta escala: |delta|>5 => assume casos, converte via
-        expm1/log1p com clip em 0. Se arquivo nao existir, este metodo nem e chamado.
-        Desabilitado por padrao removendo quantile_recalibration.json (modelos raw ja tem
-        coverage ~0.85). Se recalibrar, recalcule deltas em escala log.
+        Suporta dois formatos:
+          - global: {"1": {"0.05": -0.20, "0.95": 0.11}} (float direto, log-scale)
+          - legacy buggy: {"1": {"q0.05": {"delta": ...}}} (caso/log diff)
+        E regime-aware (quantile_recalibration_regime.json) quando last_se disponivel:
+          {"1": {"outbreak": {"0.05": ..., "0.95": ...}, "calm": {...}}}
         """
-        if not self.quantile_recalibration:
+        # escolhe fonte: regime se disponivel e last_se conhecido, senao global
+        has_regime = bool(getattr(self, 'quantile_recalibration_regime', {}))
+        if not self.quantile_recalibration and not has_regime:
             return predictions
-        logger.warning("quantile_recalibration ativo: deltas serao aplicados em escala de CASOS (expm1/log1p) para evitar bug log+delta")
+        logger.warning("quantile_recalibration ativo: deltas log-scale (regime-aware se disponivel)")
         for horizon in list(predictions.keys()):
             hkey = str(horizon)
-            if hkey not in self.quantile_recalibration:
-                continue
-            recal = self.quantile_recalibration[hkey]
-            for qkey, tau in [('q0.05', 0.05), ('q0.95', 0.95)]:
-                if qkey not in recal or tau not in predictions[horizon]:
+            # determina delta por regime
+            delta05 = None
+            delta95 = None
+            if has_regime and last_se and hkey in self.quantile_recalibration_regime:
+                try:
+                    from data.epiweeks import epiweek_to_date
+                    # future SE = last_se + horizon
+                    ls = str(last_se).zfill(6)
+                    y = int(ls[:4]); w = int(ls[4:])
+                    fut_date = epiweek_to_date(y, w) + __import__('pandas').Timedelta(weeks=int(horizon))
+                    from data.epiweeks import date_to_epiweek
+                    fut_se = date_to_epiweek(fut_date)
+                    fut_month = epiweek_to_date(int(fut_se[:4]), int(fut_se[4:])).month
+                    outbreak_months = self.config.get('epidemiological_periods', {}).get('outbreak_months', [10,11,12,1,2,3,4,5])
+                    is_outbreak = fut_month in outbreak_months
+                    regime_key = "outbreak" if is_outbreak else "calm"
+                    reg_entry = self.quantile_recalibration_regime[hkey]
+                    # suporta tanto {"outbreak": {"0.05": val}} quanto flat
+                    if regime_key in reg_entry:
+                        d = reg_entry[regime_key]
+                        delta05 = d.get("0.05", d.get("q0.05", {}).get("delta", None) if isinstance(d.get("q0.05"), dict) else None)
+                        delta95 = d.get("0.95", d.get("q0.95", {}).get("delta", None) if isinstance(d.get("q0.95"), dict) else None)
+                        # fallback se estrutura for float direto
+                        if delta05 is None and isinstance(d.get("0.05"), (int,float)):
+                            delta05 = float(d["0.05"])
+                        if delta95 is None and isinstance(d.get("0.95"), (int,float)):
+                            delta95 = float(d["0.95"])
+                    # fallback global dentro do arquivo regime
+                    if delta05 is None:
+                        g = reg_entry.get("global", {})
+                        delta05 = g.get("0.05", 0.0) if isinstance(g.get("0.05"), (int,float)) else 0.0
+                    if delta95 is None:
+                        g = reg_entry.get("global", {})
+                        delta95 = g.get("0.95", 0.0) if isinstance(g.get("0.95"), (int,float)) else 0.0
+                except Exception as e:
+                    logger.warning(f"h{horizon} regime delta failed ({e}), fallback global")
+            # fallback global file
+            if delta05 is None or delta95 is None:
+                recal = self.quantile_recalibration.get(hkey, {})
+                # suporta float direto ou dict com delta
+                def _extract(d, key):
+                    v = d.get(key)
+                    if isinstance(v, dict):
+                        return float(v.get("delta", 0.0))
+                    if isinstance(v, (int,float)):
+                        return float(v)
+                    # legado q0.05 vs 0.05
+                    v2 = d.get("q"+key[1:] if key.startswith("0.") else key)
+                    if isinstance(v2, dict):
+                        return float(v2.get("delta", 0.0))
+                    if isinstance(v2, (int,float)):
+                        return float(v2)
+                    return 0.0
+                if delta05 is None:
+                    delta05 = _extract(recal, "0.05")
+                if delta95 is None:
+                    delta95 = _extract(recal, "0.95")
+            # aplica deltas (log-scale small => soma direta; |delta|>5 => casos)
+            for tau, delta in [(0.05, delta05), (0.95, delta95)]:
+                if delta is None or delta == 0.0:
                     continue
-                delta = recal[qkey].get('delta', 0.0)
-                if delta == 0.0:
+                if tau not in predictions[horizon]:
                     continue
                 log_pred = predictions[horizon][tau]
                 # Heuristica: delta grande => escala casos
@@ -385,13 +482,13 @@ class EpisenseInference:
                     cases = np.expm1(log_pred)
                     cases_corr = np.maximum(0, cases + delta)
                     predictions[horizon][tau] = np.log1p(cases_corr)
-                    logger.info(f"h{horizon} {qkey}: delta {delta:.1f} aplicado em casos (log->casos->log)")
+                    logger.info(f"h{horizon} q{int(tau*1000):04d}: delta {delta:.1f} aplicado em casos (log->casos->log)")
                 else:
                     predictions[horizon][tau] = log_pred + delta
-                    logger.info(f"h{horizon} {qkey}: delta {delta:.3f} aplicado em log")
-            # Re-apply non-crossing after recalibration
-            if self.non_crossing:
-                predictions = self._apply_non_crossing(predictions)
+                    logger.info(f"h{horizon} q{int(tau*1000):04d}: delta {delta:.3f} aplicado em log")
+        # Re-apply non-crossing after recalibration (once globally)
+        if self.non_crossing:
+            predictions = self._apply_non_crossing(predictions)
         return predictions
 
     def _apply_non_crossing(self, predictions: Dict[int, Dict[float, np.ndarray]]) -> Dict[int, Dict[float, np.ndarray]]:

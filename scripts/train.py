@@ -189,9 +189,10 @@ class EpisenseTrainer:
         # based on residual sign, not constant. Horizon weights disabled.
         self.horizon_weights = {h: 1.0 for h in self.target_horizons}
         self.fold_series = {}
-        asym = config.get('asymmetric_loss', {})
-        if asym.get('enabled', False):
-            logger.warning("asymmetric_loss.enabled=true requested but constant horizon weight has no effect - disabled (requires per-sample residual weighting)")
+        self.asymmetric_loss = config.get('asymmetric_loss', {})
+        # asymmetric now implemented via custom quantile gradient (per-sample residual weighting)
+        if self.asymmetric_loss.get('enabled', False):
+            logger.info(f"asymmetric_loss enabled for h>={self.asymmetric_loss.get('horizon_threshold',5)} undershoot x{self.asymmetric_loss.get('undershoot_weight',2.0)}")
 
         self.models: Dict[int, Dict] = {}          # {horizon: {seed: {tau: booster}}}
         self.feature_names: Dict[int, List[str]] = {}
@@ -253,10 +254,17 @@ class EpisenseTrainer:
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
-        # Quantile objective (spec section 3: standard pinball loss)
-        params['objective'] = 'quantile'
-        params['alpha'] = quantile
-        params['metric'] = 'quantile'
+        # Quantile objective - asymmetric custom grad for h>=5 when enabled (LightGBM 4.5: objective is callable via params)
+        fobj = self._asymmetric_quantile_obj(quantile, horizon)
+        if fobj is not None:
+            # custom objective via params['objective'] callable (fobj removed in lgb 4.x)
+            params['objective'] = fobj
+            params['alpha'] = quantile  # kept so metric 'quantile' can use it
+            params['metric'] = 'quantile'
+        else:
+            params['objective'] = 'quantile'
+            params['alpha'] = quantile
+            params['metric'] = 'quantile'
 
         feature_names = X_tr.columns.tolist()
         train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names)
@@ -279,9 +287,15 @@ class EpisenseTrainer:
         params['random_state'] = seed
         params['seed'] = seed
         params.pop('early_stopping_rounds', None)
-        params['objective'] = 'quantile'
-        params['alpha'] = quantile
-        params['metric'] = 'quantile'
+        fobj = self._asymmetric_quantile_obj(quantile, horizon)
+        if fobj is not None:
+            params['objective'] = fobj  # callable objective for LGBM 4.5
+            params['alpha'] = quantile
+            params['metric'] = 'quantile'
+        else:
+            params['objective'] = 'quantile'
+            params['alpha'] = quantile
+            params['metric'] = 'quantile'
 
         feature_names = X.columns.tolist()
         data = lgb.Dataset(X, label=y, feature_name=feature_names)
@@ -301,6 +315,30 @@ class EpisenseTrainer:
         for j, tau in enumerate(q_order):
             y_pred_dict[tau] = stack[:, j]
         return y_pred_dict
+
+    def _asymmetric_quantile_obj(self, tau: float, horizon: int):
+        """Custom gradient for asymmetric quantile loss (undershoot penalized).
+        WIS_under 8-15x indica subestimacao cronica; para h>=threshold penaliza
+        residual positivo (y_true > y_pred) com peso 2x. Per-sample, nao constante.
+        """
+        asym = getattr(self, 'asymmetric_loss', {})
+        if not asym.get('enabled', False):
+            return None
+        h_thr = int(asym.get('horizon_threshold', 5))
+        if horizon < h_thr:
+            return None
+        w_under = float(asym.get('undershoot_weight', 2.0))
+        w_over = float(asym.get('overshoot_weight', 1.0))
+        if w_under == 1.0 and w_over == 1.0:
+            return None
+        def _obj(preds, dataset):
+            y_true = dataset.get_label()
+            residual = y_true - preds  # >0 = underpredict (subestimou)
+            # Pinball grad: -tau if residual>=0 else (1-tau); scale per residual sign
+            grad = np.where(residual >= 0, -tau * w_under, (1.0 - tau) * w_over)
+            hess = np.ones_like(grad)  # quantile hess=0 -> use 1 for LGBM
+            return grad, hess
+        return _obj
 
     # ------------------------------------------------------------------
     # Metrics
@@ -659,7 +697,9 @@ class EpisenseTrainer:
             logger.error(f"No valid walk-forward splits for horizon {horizon}")
             return {}
 
-        # Per-fold preparation (shared across seeds/quantiles)
+        # Per-fold preparation: separate_quantile_features => 380 feats independentes por tau
+        fs_cfg = self.config.get('training', {}).get('feature_selection', {})
+        separate_mode = bool(fs_cfg.get('separate_quantile_features', False))
         fold_prep: Dict[int, Dict[str, Any]] = {}
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -670,33 +710,58 @@ class EpisenseTrainer:
             X_train = X_train[train_feature_cols].fillna(0)
             X_test = X_test.reindex(columns=train_feature_cols, fill_value=0)
 
-            # ano_normalizado from training only
+            # ano_normalizado from training only (fix: usa max fixo 2030 para futuro sem clip)
             if 'ano_raw' in X_train.columns:
-                ano_min = X_train['ano_raw'].min()
-                ano_max = X_train['ano_raw'].max()
+                ano_min = float(X_train['ano_raw'].min())
+                ano_max_train = float(X_train['ano_raw'].max())
+                # Fixo 2030 para permitir predicao 2026-2030 sem clip [0,1]; per-fold ainda usa treino mas escala ate 2030
+                ano_max_fixed = 2030.0
+                # den = fixed range, mas mantem ano_min 2014 => futuro 2027 -> ~0.81, 2030->1.0
+                # Se treino max <2030, usa 2030; senao usa train max (caso dados futuros)
+                ano_max = max(ano_max_train, ano_max_fixed)
                 X_train['ano_normalizado'] = (X_train['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
                 X_test['ano_normalizado'] = (X_test['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
                 X_train = X_train.drop(columns=['ano_raw'])
                 X_test = X_test.drop(columns=['ano_raw'])
+                # guarda params para debug (sera sobrescrito pelo full depois)
+                if horizon not in self.ano_normalization_params:
+                    self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
 
             gap = self.config.get('training',{}).get('validation',{}).get('gap_weeks', self.wf_config.get('gap_weeks',8))
             val_size = max(1, len(X_train) // 5)
             cutoff = len(X_train) - val_size
             assert cutoff - gap > 0, "Not enough training data for gap+val"
-            X_tr, X_val = X_train.iloc[:cutoff - gap], X_train.iloc[cutoff:]
-            y_tr, y_val = y_train.iloc[:cutoff - gap], y_train.iloc[cutoff:]
+            X_tr_base, X_val_base = X_train.iloc[:cutoff - gap], X_train.iloc[cutoff:]
+            y_tr_base, y_val_base = y_train.iloc[:cutoff - gap], y_train.iloc[cutoff:]
 
-            X_tr, X_val, X_test = self._apply_feature_selection(X_tr, y_tr, X_val, X_test)
-
-            fold_prep[fold_idx] = {
-                'X_tr': X_tr, 'X_val': X_val, 'X_test': X_test,
-                'y_tr': y_tr, 'y_val': y_val,
-                'y_test': y_test.values,
-                'y_test_raw': np.expm1(y_test.values),
-                'y_train': y_train.values,
-                'train_se': se_index[train_idx],
-                'test_se': se_index[test_idx],
-            }
+            if separate_mode:
+                # 380 por quantil independentes (sem leakage so X_tr_base)
+                per_tau_cols = self._get_selected_columns_per_quantile(X_tr_base, y_tr_base)
+                X_tr_dict = {tau: X_tr_base[cols] for tau, cols in per_tau_cols.items()}
+                X_val_dict = {tau: X_val_base.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
+                X_test_dict = {tau: X_test.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
+                fold_prep[fold_idx] = {
+                    'X_tr_dict': X_tr_dict, 'X_val_dict': X_val_dict, 'X_test_dict': X_test_dict,
+                    'X_tr': X_tr_base, 'X_val': X_val_base, 'X_test': X_test,  # base for compat
+                    'per_tau_cols': per_tau_cols,
+                    'y_tr': y_tr_base, 'y_val': y_val_base,
+                    'y_test': y_test.values,
+                    'y_test_raw': np.expm1(y_test.values),
+                    'y_train': y_train.values,
+                    'train_se': se_index[train_idx],
+                    'test_se': se_index[test_idx],
+                }
+            else:
+                X_tr, X_val, X_test_sel = self._apply_feature_selection(X_tr_base, y_tr_base, X_val_base, X_test)
+                fold_prep[fold_idx] = {
+                    'X_tr': X_tr, 'X_val': X_val, 'X_test': X_test_sel,
+                    'y_tr': y_tr_base, 'y_val': y_val_base,
+                    'y_test': y_test.values,
+                    'y_test_raw': np.expm1(y_test.values),
+                    'y_train': y_train.values,
+                    'train_se': se_index[train_idx],
+                    'test_se': se_index[test_idx],
+                }
 
         # Train: for each seed, for each quantile, for each fold.
         models = {tau: {seed: None for seed in self.ensemble_seeds} for tau in self.quantiles}
@@ -707,31 +772,51 @@ class EpisenseTrainer:
             fold_best_iters: Dict[float, List[int]] = {tau: [] for tau in self.quantiles}
             for fold_idx, prep in fold_prep.items():
                 for tau in self.quantiles:
-                    model = self.train_single_model(prep['X_tr'], prep['y_tr'],
-                                                    prep['X_val'], prep['y_val'],
+                    if separate_mode and 'X_tr_dict' in prep:
+                        X_tr_tau = prep['X_tr_dict'][tau]
+                        X_val_tau = prep['X_val_dict'][tau]
+                        X_test_tau = prep['X_test_dict'][tau]
+                    else:
+                        X_tr_tau = prep['X_tr']
+                        X_val_tau = prep['X_val']
+                        X_test_tau = prep['X_test']
+                    model = self.train_single_model(X_tr_tau, prep['y_tr'],
+                                                    X_val_tau, prep['y_val'],
                                                     seed, horizon, tau)
                     fold_best_iters[tau].append(model.best_iteration)
-                    y_pred = model.predict(prep['X_test'], num_iteration=model.best_iteration)
+                    y_pred = model.predict(X_test_tau, num_iteration=model.best_iteration)
                     fold_predictions.setdefault(fold_idx, {}).setdefault(tau, {})[seed] = y_pred
 
             # Production retrain on FULL data for each quantile
             full_feature_cols = [c for c in X.columns
                                  if not X[c].isna().all() and X[c].nunique() > 1]
-            X_full = X[full_feature_cols].fillna(0)
-            if 'ano_raw' in X_full.columns:
-                ano_min = float(X_full['ano_raw'].min())
-                ano_max = float(X_full['ano_raw'].max())
-                X_full['ano_normalizado'] = (X_full['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
-                X_full = X_full.drop(columns=['ano_raw'])
-                if horizon not in self.ano_normalization_params:
-                    self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
-            X_full, _, _ = self._apply_feature_selection(X_full, y, None, None)
-            if horizon not in self.feature_names or seed == self.ensemble_seeds[0]:
-                self.feature_names[horizon] = X_full.columns.tolist()
+            X_full_base = X[full_feature_cols].fillna(0)
+            if 'ano_raw' in X_full_base.columns:
+                ano_min = float(X_full_base['ano_raw'].min())
+                ano_max_train = float(X_full_base['ano_raw'].max())
+                ano_max = max(ano_max_train, 2030.0)
+                X_full_base['ano_normalizado'] = (X_full_base['ano_raw'] - ano_min) / (ano_max - ano_min + 1e-6)
+                X_full_base = X_full_base.drop(columns=['ano_raw'])
+                self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
+            if separate_mode:
+                per_tau_full_cols = self._get_selected_columns_per_quantile(X_full_base, y)
+                # feature_names[horizon] passa a ser dict tau->list
+                self.feature_names[horizon] = per_tau_full_cols
+                logger.info(f"  h{horizon} separate features FULL: " + ", ".join([f"q{int(t*1000):04d}:{len(c)}" for t,c in per_tau_full_cols.items()]))
+            else:
+                X_full_sel, _, _ = self._apply_feature_selection(X_full_base, y, None, None)
+                if horizon not in self.feature_names or seed == self.ensemble_seeds[0]:
+                    self.feature_names[horizon] = X_full_sel.columns.tolist()
+                per_tau_full_cols = {tau: self.feature_names[horizon] for tau in self.quantiles}
+                X_full_base = X_full_sel
 
             for tau in self.quantiles:
                 n_iters = int(np.mean(fold_best_iters[tau])) if fold_best_iters[tau] else None
-                models[tau][seed] = self.train_single_model_full(X_full, y, seed, horizon, tau, n_iters)
+                if separate_mode:
+                    X_full_tau = X_full_base[per_tau_full_cols[tau]]
+                else:
+                    X_full_tau = X_full_base
+                models[tau][seed] = self.train_single_model_full(X_full_tau, y, seed, horizon, tau, n_iters)
 
         # ------------------------------------------------------------------
         # Ensemble metrics: average predictions across seeds per (fold, quantile)
@@ -765,8 +850,38 @@ class EpisenseTrainer:
         ensemble_avg['horizon'] = horizon
         ensemble_avg['n_seeds'] = len(self.ensemble_seeds)
         ensemble_avg['n_folds'] = len(ensemble_fold_metrics)
-        # SPL matrix row (mean across folds)
-        if spl_rows:
+        # 2025 parcial (49 sem) excluido da media principal: ensemble_avg passa a ser media 3 folds completos (2022-2024)
+        # sem leakage, apenas filtragem pos-validacao por tamanho do teste
+        partial_folds = [m['fold'] for m in ensemble_fold_metrics if len(fold_prep[m['fold']]['test_se']) < 52]
+        if partial_folds:
+            filtered = [m for m in ensemble_fold_metrics if m['fold'] not in partial_folds]
+            if filtered:
+                avg_3 = self._average_metrics_list(filtered)
+                # preserva media 4 folds como referencia, mas ensemble_avg principal vira 3 folds
+                ensemble_avg_full = ensemble_avg.copy()
+                ensemble_avg = avg_3
+                ensemble_avg['horizon'] = horizon
+                ensemble_avg['n_seeds'] = len(self.ensemble_seeds)
+                ensemble_avg['n_folds'] = len(filtered)
+                ensemble_avg['n_folds_full'] = len(ensemble_fold_metrics)
+                ensemble_avg['excluded_partial_folds'] = partial_folds
+                ensemble_avg['full_4folds_avg'] = ensemble_avg_full
+                # SPL robusto (3 folds)
+                if spl_rows:
+                    # recalcula SPL apenas dos folds filtrados
+                    filtered_spl = [ensemble_fold_metrics[i]['spl_matrix_row'] for i in range(len(ensemble_fold_metrics)) if ensemble_fold_metrics[i]['fold'] not in partial_folds]
+                    if filtered_spl:
+                        ensemble_avg['spl_mean'] = list(np.mean(np.array(filtered_spl), axis=0))
+                        ensemble_avg['spl_std'] = list(np.std(np.array(filtered_spl), axis=0))
+                logger.info(f"  h{horizon} 2025 parcial {partial_folds} excluido da media: WMAPE 3folds={ensemble_avg.get('wmape', float('nan')):.3f} vs 4folds={ensemble_avg_full.get('wmape', float('nan')):.3f}")
+                # SPL matrix row (mean across folds) ja recalculado acima; pula bloco abaixo
+                spl_recalc_done = True
+            else:
+                spl_recalc_done = False
+        else:
+            spl_recalc_done = False
+        # SPL matrix row (mean across folds) - so se nao recalculado
+        if not spl_recalc_done and spl_rows:
             ensemble_avg['spl_mean'] = list(np.mean(np.array(spl_rows), axis=0))
             ensemble_avg['spl_std'] = list(np.std(np.array(spl_rows), axis=0))
 
@@ -942,6 +1057,38 @@ class EpisenseTrainer:
             X_test = X_test.reindex(columns=selected_cols, fill_value=0)
         return X_tr, X_val, X_test
 
+    def _get_selected_columns_per_quantile(self, X_tr: pd.DataFrame, y_tr: pd.Series) -> Dict[float, List[str]]:
+        """380 features INDEPENDENTES por quantil (separate_quantile_features).
+        Cada tau tem seu top 380 por ganho, sem leakage (so X_tr). Corrige q05 flat h4/h8.
+        """
+        fs = self.config.get('training', {}).get('feature_selection', {})
+        max_features = int(fs.get('max_features', 380))
+        threshold = float(fs.get('threshold', 0.001))
+        quick_params = self.model_params.copy()
+        quick_params['random_state'] = 42
+        quick_params['seed'] = 42
+        quick_params['verbosity'] = -1
+        quick_params.pop('early_stopping_rounds', None)
+        quick_params['objective'] = 'quantile'
+        per_tau_cols: Dict[float, List[str]] = {}
+        for tau in self.quantiles:
+            qp = quick_params.copy()
+            qp['alpha'] = tau
+            m = lgb.train(qp, lgb.Dataset(X_tr, label=y_tr), num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000))))
+            imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
+            # top 380 por tau, filtrado por threshold
+            filtered = imp[imp > threshold].sort_values(ascending=False)
+            cols = filtered.head(max_features).index.tolist()
+            if len(cols) < max_features:
+                # completa com proximos mesmo abaixo threshold para garantir 380
+                remaining = imp[~imp.index.isin(cols)].sort_values(ascending=False).head(max_features - len(cols)).index.tolist()
+                cols.extend(remaining)
+            if not cols:
+                cols = X_tr.columns.tolist()[:max_features]
+            per_tau_cols[tau] = cols[:max_features]
+            logger.info(f"    Separate q{int(tau*1000):04d}: {len(cols)}/{X_tr.shape[1]} feats (top gain {imp.max():.1f})")
+        return per_tau_cols
+
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
@@ -967,9 +1114,17 @@ class EpisenseTrainer:
         logger.info(f"Saved quantile models to {models_dir}")
 
         feature_path = models_dir / "feature_list.json"
+        # Handle separate_quantile_features: feature_names[h] may be dict tau->list
+        serializable = {}
+        for k, v in self.feature_names.items():
+            if isinstance(v, dict):
+                # per-tau dict: convert float keys to string
+                serializable[str(k)] = {str(tau): cols for tau, cols in v.items()}
+            else:
+                serializable[str(k)] = v
         with open(feature_path, 'w') as f:
-            json.dump({str(k): v for k, v in self.feature_names.items()}, f)
-        logger.info(f"Saved feature list: {feature_path}")
+            json.dump(serializable, f)
+        logger.info(f"Saved feature list: {feature_path} (separate={any(isinstance(v, dict) for v in self.feature_names.values())})")
 
         def _clean(d):
             if isinstance(d, dict):
@@ -992,6 +1147,81 @@ class EpisenseTrainer:
             with open(norm_path, 'w') as f:
                 json.dump(self.ano_normalization_params, f, indent=2)
             logger.info(f"Saved normalization params: {norm_path}")
+
+        # ---- Quantile recalibration (global + por regime outbreak/calm) ----
+        # Gera deltas log-scale para q05/q95 via conformal: delta = quantile(y_true_log - q_pred_log)
+        # por regime corrige Cob90 heterogeneo fold0 0.58 vs fold2 1.00 (report P1)
+        try:
+            if hasattr(self, 'fold_series') and self.fold_series:
+                # global deltas
+                recal_global = {}
+                recal_regime = {}
+                for h, tau_dict in self.fold_series.items():
+                    # tau_dict: {tau: [fold_dict,...]}
+                    # concat y_true_log e y_pred_log por fold
+                    y_true_all = []
+                    q05_all = []
+                    q95_all = []
+                    se_all = []
+                    for fold_idx in range(len(tau_dict[self.quantiles[0]])):
+                        y_true_all.extend(np.log1p(tau_dict[0.5][fold_idx]['y_test_casos']))
+                        q05_all.extend(np.log1p(tau_dict[0.05][fold_idx]['y_pred_casos']))
+                        q95_all.extend(np.log1p(tau_dict[0.95][fold_idx]['y_pred_casos']))
+                        se_all.extend(tau_dict[0.5][fold_idx]['test_se'])
+                    y_true_all = np.array(y_true_all)
+                    q05_all = np.array(q05_all)
+                    q95_all = np.array(q95_all)
+                    se_all = np.array(se_all)
+                    # global deltas (log scale)
+                    r05 = y_true_all - q05_all
+                    r95 = y_true_all - q95_all
+                    d05 = float(np.quantile(r05, 0.05))
+                    d95 = float(np.quantile(r95, 0.95))
+                    recal_global[str(h)] = {"0.05": d05, "0.95": d95}
+                    # regime split via epiweeks month
+                    try:
+                        from data.epiweeks import epiweek_to_date
+                        # classifica cada SE em outbreak (Out-Mai) vs calm (Jun-Set)
+                        outbreak_months = self.epi_periods.get('outbreak_months', [10,11,12,1,2,3,4,5])
+                        is_outbreak = []
+                        for se in se_all:
+                            se_str = str(se).zfill(6)
+                            try:
+                                y = int(se_str[:4]); w = int(se_str[4:])
+                                m = epiweek_to_date(y, w).month
+                                is_outbreak.append(m in outbreak_months)
+                            except Exception:
+                                is_outbreak.append(True)
+                        is_outbreak = np.array(is_outbreak)
+                        is_calm = ~is_outbreak
+                        def _delta(mask, r):
+                            if mask.sum() < 10:
+                                return float(np.quantile(r, 0.05 if r is r05 else 0.95))
+                            return float(np.quantile(r[mask], 0.05 if r is r05 else 0.95))
+                        # para nao confundir, calcula separado
+                        d05_out = float(np.quantile(r05[is_outbreak], 0.05)) if is_outbreak.sum()>5 else d05
+                        d95_out = float(np.quantile(r95[is_outbreak], 0.95)) if is_outbreak.sum()>5 else d95
+                        d05_calm = float(np.quantile(r05[is_calm], 0.05)) if is_calm.sum()>5 else d05
+                        d95_calm = float(np.quantile(r95[is_calm], 0.95)) if is_calm.sum()>5 else d95
+                        recal_regime[str(h)] = {
+                            "outbreak": {"0.05": d05_out, "0.95": d95_out},
+                            "calm": {"0.05": d05_calm, "0.95": d95_calm},
+                            "global": {"0.05": d05, "0.95": d95}
+                        }
+                    except Exception as e:
+                        logger.warning(f"h{h} regime recalibration failed: {e}")
+                        recal_regime[str(h)] = {"outbreak": recal_global[str(h)], "calm": recal_global[str(h)], "global": recal_global[str(h)]}
+                # salva global (compat com inference atual)
+                recal_path = models_dir / "quantile_recalibration.json"
+                with open(recal_path, 'w') as f:
+                    json.dump(recal_global, f, indent=2)
+                logger.info(f"Saved quantile recalibration (global): {recal_path}")
+                recal_regime_path = models_dir / "quantile_recalibration_regime.json"
+                with open(recal_regime_path, 'w') as f:
+                    json.dump(recal_regime, f, indent=2)
+                logger.info(f"Saved quantile recalibration (regime): {recal_regime_path}")
+        except Exception as e:
+            logger.warning(f"Quantile recalibration generation failed: {e}")
 
         # Save per-week prediction series (outbreak/weekly analysis)
         if getattr(self, 'fold_series', None):

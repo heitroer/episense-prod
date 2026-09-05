@@ -164,8 +164,9 @@ training:
   feature_selection:
     method: importance
     threshold: 0.001
-    max_features: 380  # v2: 639 feats (+111) -> 380 kept (selecao agregada 3 quantis)
-    per_quantile: false  # false=agregada (atual, 380); true=selecao separada por quantil (corrige q05 colapsado h4/h8 var~0.3, requer retreino sem leakage: usa so X_tr)
+    max_features: 380  # v2: 639 feats -> 380 kept por quantil (separado)
+    per_quantile: true  # true=uniao por quantil (legacy); se separate_quantile_features true, sobrepoe para treino separado por tau (corrige q05 flat h4/h8)
+    separate_quantile_features: false  # revertido: union 380/3 por tau melhor WMAPE 0.208 vs 0.236 separate (q05/q50/q95 cada um com seu top 380), sem leakage so X_tr
     expand_extra: false  # LGBM_swl uses seasonal+weather_long, not full expand_extra
   scaler:
     type: DataFrameScaler
@@ -184,14 +185,13 @@ non_crossing:
   enabled: true
   method: "post_process"  # "post_process" ou "monotone_constraints"
 
-# Asymmetric loss for horizons 5-8 (penalize undershooting more) - DISABLED
-# Constant sample_weight per horizon is a no-op (scales loss uniformly, does not
-# change argmin). Requires per-sample residual-based weighting (custom objective)
-# to actually penalize undershoot. Kept in config for documentation only.
+# Asymmetric loss for horizons 5-8 (penalize undershooting more) - CUSTOM GRADIENT
+# undershoot = y_true > y_pred (subestimacao) penalizada 2x para corrigir WIS_under 8-15x
+# Implementado via objetivo custom em train.py (per-sample, nao constante sample_weight)
 asymmetric_loss:
-  enabled: false  # was true but ineffective; disabled until custom loss implemented
+  enabled: false  # DESATIVADO: h5-h8 colapsou para WMAPE 1.0, WIS 113, iter 1 val 4.6 via gradiente assimetrico (undershoot_weight 2.0)
   horizon_threshold: 5  # aplicar para h >= 5
-  undershoot_weight: 2.0  # penalizar subestimação 2x mais (not applied)
+  undershoot_weight: 2.0  # penalizar subestimação 2x mais (custom grad)
   overshoot_weight: 1.0   # penalização padrão para sobreestimação
 
 # Epidemiological period classification for stratified reporting
