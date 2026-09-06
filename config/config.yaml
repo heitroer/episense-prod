@@ -37,7 +37,7 @@ features:
     log_lagn_shift: 1
     temp_lag2_shift: 1
     temp_lag4_shift: 3
-    p_rt1_rt_nivel_lag1_shift: 2  # Changed from 0 to 2: Rt/p_rt/nivel are nowcasted and revised; use proper lag
+    p_rt1_rt_nivel_lag1_shift: 2
   advanced_convention:
     log_lag1_shift: 1
     log_lagn_shift: 1
@@ -83,14 +83,14 @@ features:
   seasonal_features: true
   interaction_features: true
   horizon_features: true
-  # Experimental feature expansions (from train_exp.py / LGBM_swl experiment)
-  expand_seasonal: true    # T-52/53 lag, YoY, YTD, YTD ratios (attacks h5-h8 degradation)
-  expand_weather_long: true  # Weather lags 7-12, precip accumulations 16-26 weeks (climate long memory)
-  expand_extra: false       # Deactivated (increases features but marginal gain) - seasonal+weather_long tested better
-  # v2 - novas familias para atacar h5-h8 (WMAPE 0.47-> melhora, rWIS, SPL)
-  expand_climatology: true  # media 3y (52/104/156) + anomalias vs climatologia casos/clima
-  expand_trend: true        # slopes 4/8/12, momentum, CV, range, accel, growth rates
-  expand_outbreak: true     # semanas acima limiar, weeks_since_peak, intensidade, flags fase
+  expand_seasonal: true
+  expand_weather_long: true
+  expand_extra: false
+  expand_climatology: true
+  expand_trend: true
+  expand_outbreak: true
+  expand_regime_conditional: true
+  expand_peak_timing: true
 targets:
   horizons:
   - 1
@@ -140,73 +140,146 @@ model:
     bagging_freq: 3
     min_gain_to_split: 0.01
 training:
-  start_year: 2014  # VENCEDOR do experimento 2011 vs 2014 (6 folds, janelas identicas):
-                     # 2011-2013 (outlier 2013 = 45k casos) pioram WMAPE/RMSSE em todos os
-                     # horizontes e dobram RMSE em anos recentes de baixa (2020 h1, 2024 h8).
-                     # Features usam o histórico completo; só as LINHAS de treino < 2014 saem.
+  start_year: 2014
   walk_forward:
-    n_splits: 4  # um fold por test_year (2022-2025; 2021 removido)
+    n_splits: 4
     test_size_weeks: 52
-    gap_weeks: 8  # == max horizon (h8). Seguro: train_end = test_start - gap, ultimo alvo treino = train_end-1+h = test_start-1 < test_start (sem leakage). gap==h maximiza dados sem vazar.
+    gap_weeks: 8
     expanding_window: true
-    min_train_weeks: 100  # fold 2022: ~410 semanas de treino (2014-2021, gap 8)
-    test_years: [2022, 2023, 2024, 2025]  # Explicit test years for each fold; fold 2025 é parcial (49 sem até 202632, dados atuais) - média 4 folds inclui parcial, ver dashboard nota
-    # Validação epidemiológica: folds iniciam em setembro (SE ~35-36) e terminam em agosto
-    # Isso garante que cada fold capture o ciclo completo de calmaria (jun-set) + surto (out-maio)
+    min_train_weeks: 100
+    test_years:
+    - 2022
+    - 2023
+    - 2024
+    - 2025
     epidemiological_folds: true
-    fold_start_month: 9  # setembro
-    fold_end_month: 8    # agosto
-    # NOTA: 2017-2020 fora dos folds de teste (regime atual); 2019 permanece no
-    # TREINO (modelo aprende o surto gigante) e vira stress-test documentado.
+    fold_start_month: 9
+    fold_end_month: 8
   validation:
     gap_weeks: 4
     expanding: true
   feature_selection:
     method: importance
     threshold: 0.001
-    max_features: 380  # v2: 639 feats -> 380 kept por quantil (separado)
-    per_quantile: true  # true=uniao por quantil (legacy); se separate_quantile_features true, sobrepoe para treino separado por tau (corrige q05 flat h4/h8)
-    separate_quantile_features: false  # revertido: union 380/3 por tau melhor WMAPE 0.208 vs 0.236 separate (q05/q50/q95 cada um com seu top 380), sem leakage so X_tr
-    expand_extra: false  # LGBM_swl uses seasonal+weather_long, not full expand_extra
+    max_features: 380
+    per_quantile: true
+    separate_quantile_features: true
+    expand_extra: false
+    threshold_per_quantile:
+      0.05: 0.001
+      0.25: 0.001
+      0.5: 0.001
+      0.75: 0.001
+      0.95: 0.001
+    max_features_per_quantile:
+      0.05: 250
+      0.25: 250
+      0.5: 380
+      0.75: 250
+      0.95: 250
+  temporal_weighting:
+    enabled: true
+    half_life_years: 6.58
+  peak_weighting:
+    enabled: true
+    weight_200: 1.3
+    weight_500: 1.8
+    weight_1000: 2.2
+  gap_per_horizon: true
+  parallel_horizons:
+    enabled: true
+    n_jobs: 8
+    backend: loky
+    worker_threads: 1
+  quantile_hparams:
+    0.05:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.05
+      reg_lambda: 0.05
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
+    0.5: {}
+    0.95:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.05
+      reg_lambda: 0.05
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
+    0.25:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.05
+      reg_lambda: 0.05
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
+    0.75:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.05
+      reg_lambda: 0.05
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
   scaler:
     type: DataFrameScaler
     feature_range:
     - 0
     - 1
-
-# Quantile regression settings
 quantiles:
-  - 0.05   # piso IC 90% inferior
-  - 0.50   # mediana (previsão pontual robusta)
-  - 0.95   # teto IC 90% superior
-
-# Non-crossing quantile constraint
+- 0.05
+- 0.25
+- 0.5
+- 0.75
+- 0.95
 non_crossing:
   enabled: true
-  method: "post_process"  # "post_process" ou "monotone_constraints"
-
-# Asymmetric loss for horizons 5-8 (penalize undershooting more) - CUSTOM GRADIENT
-# undershoot = y_true > y_pred (subestimacao) penalizada 2x para corrigir WIS_under 8-15x
-# Implementado via objetivo custom em train.py (per-sample, nao constante sample_weight)
+  method: post_process
+phantom_gating:
+  enabled: true
+  calm_q95_max_factor: 3.5
+  outbreak_q95_max_factor: 4.0
 asymmetric_loss:
-  enabled: false  # DESATIVADO: h5-h8 colapsou para WMAPE 1.0, WIS 113, iter 1 val 4.6 via gradiente assimetrico (undershoot_weight 2.0)
-  horizon_threshold: 5  # aplicar para h >= 5
-  undershoot_weight: 2.0  # penalizar subestimação 2x mais (custom grad)
-  overshoot_weight: 1.0   # penalização padrão para sobreestimação
-
-# Epidemiological period classification for stratified reporting
+  enabled: false
+  horizon_threshold: 5
+  undershoot_weight: 1.35
+  overshoot_weight: 1.0
+  only_median: true
 epidemiological_periods:
-  outbreak_months: [10, 11, 12, 1, 2, 3, 4, 5]      # Outubro a Maio
-  calm_months: [6, 7, 8, 9]                           # Junho a Setembro
-  # Usado para stratificar métricas no relatório final
+  outbreak_months:
+  - 10
+  - 11
+  - 12
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  calm_months:
+  - 6
+  - 7
+  - 8
+  - 9
 inference:
   horizon_specific_features: true
   feature_alignment: strict
   scaler_path: models/scaler.pkl
-  # Padrão real produzido pelo treino multi-quantil: um .pkl por seed e quantil
-  # models/lgbm_h{horizon}_seed{seed}_q{tau:04d}.pkl (ex: lgbm_h1_seed42_q0050.pkl)
-  # A inferência deriva o nome automaticamente e NÃO usa este bloco (mantido para documentação)
-  # Inclui h1-h8 (todos os horizontes treinados)
   model_paths:
     h1: models/lgbm_h1_seed{seed}_q{tau}.pkl
     h2: models/lgbm_h2_seed{seed}_q{tau}.pkl
@@ -268,11 +341,10 @@ api:
       - 10
       - 50
       - 100
-    horizon_guidance: >-
-      h1-h4: previsoes principais de magnitude (confianca media-alta). h5-h8:
-      sinal de alerta precoce - mais confiaveis em anos de baixa incidencia;
-      em anos de surto atipico (ex.: 2019, 45k casos) subestimam a magnitude.
-      Nao tratar h5-h8 como verdade absoluta.
+    horizon_guidance: 'h1-h4: previsoes principais de magnitude (confianca media-alta).
+      h5-h8: sinal de alerta precoce - mais confiaveis em anos de baixa incidencia;
+      em anos de surto atipico (ex.: 2019, 45k casos) subestimam a magnitude. Nao
+      tratar h5-h8 como verdade absoluta.'
     alert_labels:
     - baixo
     - medio
@@ -280,69 +352,85 @@ api:
     - critico
 metrics:
   classification_thresholds:
-    outbreak_threshold: 50  # casos/semana: >= threshold classifica a semana como surto
+    outbreak_threshold: 50
   targets:
     h1:
-      wmape: 0.26
+      mae: 45
       maxae: 350
-      spl_005: 0.80
-      spl_050: 0.70
+      wis: 39
+      spl_005: 0.8
+      spl_025: 0.75
+      spl_050: 0.7
+      spl_075: 0.75
       spl_095: 0.85
       etp: 2
-      wis: 39
     h2:
-      wmape: 0.34
+      mae: 55
       maxae: 450
-      spl_005: 0.85
-      spl_050: 0.75
-      spl_095: 0.90
-      etp: 3
       wis: 45
+      spl_005: 0.85
+      spl_025: 0.75
+      spl_050: 0.75
+      spl_075: 0.75
+      spl_095: 0.9
+      etp: 3
     h3:
-      wmape: 0.39
+      mae: 65
       maxae: 500
-      spl_005: 0.90
-      spl_050: 0.80
+      wis: 52
+      spl_005: 0.9
+      spl_025: 0.75
+      spl_050: 0.8
+      spl_075: 0.75
       spl_095: 0.95
       etp: 4
-      wis: 52
     h4:
-      wmape: 0.45
+      mae: 68
       maxae: 550
-      spl_005: 0.95
-      spl_050: 0.85
-      spl_095: 1.00
-      etp: 5
       wis: 58
+      spl_005: 0.95
+      spl_025: 0.75
+      spl_050: 0.85
+      spl_075: 0.75
+      spl_095: 1.0
+      etp: 5
     h5:
-      wmape: 0.47
+      mae: 75
       maxae: 600
-      spl_005: 1.00
-      spl_050: 0.90
+      wis: 65
+      spl_005: 1.0
+      spl_025: 0.85
+      spl_050: 0.9
+      spl_075: 0.85
       spl_095: 1.05
       etp: 6
-      wis: 65
     h6:
-      wmape: 0.47
+      mae: 80
       maxae: 580
-      spl_005: 1.05
-      spl_050: 0.95
-      spl_095: 1.10
-      etp: 7
       wis: 71
+      spl_005: 1.05
+      spl_025: 0.85
+      spl_050: 0.95
+      spl_075: 0.85
+      spl_095: 1.1
+      etp: 7
     h7:
-      wmape: 0.45
+      mae: 90
       maxae: 580
-      spl_005: 1.10
-      spl_050: 1.00
+      wis: 78
+      spl_005: 1.1
+      spl_025: 0.85
+      spl_050: 1.0
+      spl_075: 0.85
       spl_095: 1.15
       etp: 8
-      wis: 78
     h8:
-      wmape: 0.47
+      mae: 95
       maxae: 650
-      spl_005: 1.15
-      spl_050: 1.05
-      spl_095: 1.20
-      etp: 9
       wis: 84
+      spl_005: 1.15
+      spl_025: 0.85
+      spl_050: 1.05
+      spl_075: 0.85
+      spl_095: 1.2
+      etp: 9

@@ -6,10 +6,10 @@ Implements:
   2. Multi-quantile regression: q in [0.05, 0.50, 0.95] for h in [1..8].
   3. Monotonic guarantee via np.sort(y_pred, axis=-1): Q.05 <= Q.50 <= Q.95.
   A) SPL (Scaled Pinball Loss) matrix (8 horizons x 3 quantiles).
-  B) WMAPE on Q.50 only (vector of 8).
+  B) MAE on Q.50 only (vector of 8).
   C) MaxAE on Q.50 only (vector of 8).
-  D) WIS (Weighted Interval Score, mean pinball across quantiles).
-  E) Etp   (peak timing error) on Q.50 only.
+  C) WIS (Weighted Interval Score, mean pinball across quantiles).
+  D) MAE etc.
   3. Horizon weights disabled (constant weight no-op).
   4. Stratified reporting: Outbreak (Oct-May) vs Calm (Jun-Sep).
 
@@ -47,6 +47,39 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# FASE1 parallel worker (top-level for loky pickling)
+def _parallel_horizon_worker(horizon, config, df_featured):
+    """Worker para treinar um horizonte isolado (ProcessPool)."""
+    import os, copy
+    # limita threads por worker para evitar oversubscription
+    worker_threads = config.get('training', {}).get('parallel_horizons', {}).get('worker_threads', 1)
+    os.environ['OMP_NUM_THREADS'] = str(worker_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(worker_threads)
+    os.environ['MKL_NUM_THREADS'] = str(worker_threads)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(worker_threads)
+    cfg = copy.deepcopy(config)
+    # força LightGBM single thread por worker
+    try:
+        cfg['model']['hyperparameters']['num_threads'] = int(worker_threads)
+        cfg['model']['hyperparameters']['n_jobs'] = int(worker_threads)
+        cfg['model']['hyperparameters']['verbosity'] = -1
+    except Exception:
+        pass
+    # importa aqui para evitar circular
+    trainer = EpisenseTrainer(cfg)
+    trainer.train_horizon(df_featured, int(horizon))
+    # retorna artefatos do horizonte
+    return {
+        'horizon': int(horizon),
+        'models': trainer.models.get(int(horizon), {}),
+        'validation': trainer.validation_results.get(int(horizon), {}),
+        'fold_series': trainer.fold_series.get(int(horizon), {}),
+        'feature_names': trainer.feature_names.get(int(horizon), None),
+        'ano_params': trainer.ano_normalization_params.get(int(horizon), None),
+    }
+
+
 
 
 def normalize_se(se) -> str:
@@ -212,6 +245,8 @@ class EpisenseTrainer:
                 'expand_climatology': bool(self.config.get('features', {}).get('expand_climatology', True)),
                 'expand_trend': bool(self.config.get('features', {}).get('expand_trend', True)),
                 'expand_outbreak': bool(self.config.get('features', {}).get('expand_outbreak', True)),
+                'expand_regime_conditional': bool(self.config.get('features', {}).get('expand_regime_conditional', True)),
+                'expand_peak_timing': bool(self.config.get('features', {}).get('expand_peak_timing', True)),
             }
         }
         fe = EpisenseFeatureEngineer(fe_cfg)
@@ -245,15 +280,77 @@ class EpisenseTrainer:
         logger.info(f"Horizon h{horizon}: {len(X)} samples, {len(feature_cols)} potential features")
         return X, y, se_index, df_clean
 
+    def _compute_sample_weights(self, y_tr: pd.Series, X_tr: Optional[pd.DataFrame] = None, se_index: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """v3: peso por recencia + pico. Retorna None se desabilitado (peso uniforme)."""
+        cfg = self.config.get('training', {})
+        tw_cfg = cfg.get('temporal_weighting', {})
+        pw_cfg = cfg.get('peak_weighting', {})
+        tw_enabled = bool(tw_cfg.get('enabled', False)) if isinstance(tw_cfg, dict) else False
+        pw_enabled = bool(pw_cfg.get('enabled', False)) if isinstance(pw_cfg, dict) else False
+        if not tw_enabled and not pw_enabled:
+            return None
+        n = len(y_tr)
+        w = np.ones(n, dtype=float)
+        # Peak weighting (em casos escala)
+        if pw_enabled:
+            y_cases = np.expm1(np.asarray(y_tr, dtype=float))
+            w200 = float(pw_cfg.get('weight_200', 1.3))
+            w500 = float(pw_cfg.get('weight_500', 1.8))
+            w1000 = float(pw_cfg.get('weight_1000', 2.2))
+            # aplica hierarquico: >1000 sobrescreve >500 etc
+            w = np.where(y_cases > 200, w200, w)
+            w = np.where(y_cases > 500, w500, w)
+            w = np.where(y_cases > 1000, w1000, w)
+        # Temporal decay por SE (exp(-lambda * anos_atras))
+        if tw_enabled and se_index is not None and len(se_index) == n:
+            try:
+                half = float(tw_cfg.get('half_life_years', 3))
+                lam = np.log(2) / max(half, 0.5)
+                # extrai ano da SE
+                anos = np.array([int(str(s)[:4]) for s in se_index], dtype=float)
+                ano_max = float(np.max(anos))
+                anos_atras = ano_max - anos
+                w_time = np.exp(-lam * anos_atras)
+                # normaliza para media 1.0 para não mudar escala global do loss
+                w_time = w_time / (np.mean(w_time) + 1e-10)
+                w = w * w_time
+            except Exception as e:
+                logger.warning(f"temporal weighting failed: {e}")
+        # normaliza para media 1
+        w = w / (np.mean(w) + 1e-10)
+        # clip para evitar peso extremo
+        w = np.clip(w, 0.3, 4.0)
+        return w
+
+    def _get_quantile_hparams(self, quantile: float) -> Dict:
+        """Overrides de hyperparams por quantil (v3)."""
+        qp_cfg = self.config.get('training', {}).get('quantile_hparams', {})
+        # chaves podem ser string \"0.05\" ou float
+        for k, v in qp_cfg.items():
+            try:
+                kf = float(k)
+            except Exception:
+                continue
+            if abs(kf - quantile) < 1e-6 and isinstance(v, dict):
+                return v
+        return {}
+
     # ------------------------------------------------------------------
     # Model training (per seed, per quantile)
     # ------------------------------------------------------------------
     def train_single_model(self, X_tr: pd.DataFrame, y_tr: pd.Series,
                            X_val: pd.DataFrame, y_val: pd.Series,
-                           seed: int, horizon: int, quantile: float) -> lgb.Booster:
+                           seed: int, horizon: int, quantile: float,
+                           se_tr: Optional[np.ndarray] = None,
+                           se_val: Optional[np.ndarray] = None) -> lgb.Booster:
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
+        # v3: override por quantil (q05 mais sensivel)
+        qh = self._get_quantile_hparams(quantile)
+        if qh:
+            params.update(qh)
+            logger.debug(f"h{horizon} q{quantile} quantile_hparams {qh}")
         # Quantile objective - asymmetric custom grad for h>=5 when enabled (LightGBM 4.5: objective is callable via params)
         fobj = self._asymmetric_quantile_obj(quantile, horizon)
         if fobj is not None:
@@ -267,8 +364,16 @@ class EpisenseTrainer:
             params['metric'] = 'quantile'
 
         feature_names = X_tr.columns.tolist()
-        train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names)
-        val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names,
+        w_tr = self._compute_sample_weights(y_tr, X_tr, se_tr)
+        w_val = self._compute_sample_weights(y_val, X_val, se_val)
+        if w_tr is not None:
+            train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names, weight=w_tr)
+        else:
+            train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names)
+        if w_val is not None:
+            val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names, weight=w_val, reference=train_data)
+        else:
+            val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_names,
                                reference=train_data)
 
         model = lgb.train(
@@ -281,11 +386,18 @@ class EpisenseTrainer:
 
     def train_single_model_full(self, X: pd.DataFrame, y: pd.Series,
                                 seed: int, horizon: int, quantile: float,
-                                n_iters: Optional[int] = None) -> lgb.Booster:
+                                n_iters: Optional[int] = None,
+                                se_full: Optional[np.ndarray] = None) -> lgb.Booster:
         """Production model on FULL data (no early stopping)."""
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
+        params.pop('early_stopping_rounds', None)
+        # v3 per-quantile hparams
+        qh = self._get_quantile_hparams(quantile)
+        if qh:
+            params.update(qh)
+        # FULL nunca usa early stopping (sem val), então remove se qh trouxe
         params.pop('early_stopping_rounds', None)
         fobj = self._asymmetric_quantile_obj(quantile, horizon)
         if fobj is not None:
@@ -298,8 +410,16 @@ class EpisenseTrainer:
             params['metric'] = 'quantile'
 
         feature_names = X.columns.tolist()
-        data = lgb.Dataset(X, label=y, feature_name=feature_names)
+        w_full = self._compute_sample_weights(y, X, se_full)
+        if w_full is not None:
+            data = lgb.Dataset(X, label=y, feature_name=feature_names, weight=w_full)
+        else:
+            data = lgb.Dataset(X, label=y, feature_name=feature_names)
         rounds = n_iters or int(params.get('n_estimators', 3000))
+        # FASE1 FIX: pop n_estimators para num_boost_round controlar (FULL usa mediana ~322, não 3000)
+        params.pop('n_estimators', None)
+        params.pop('num_iterations', None)
+        params.pop('num_iteration', None)
         return lgb.train(params, data, num_boost_round=rounds)
 
     def enforce_non_crossing(self, y_pred_dict: Dict[float, np.ndarray],
@@ -320,9 +440,13 @@ class EpisenseTrainer:
         """Custom gradient for asymmetric quantile loss (undershoot penalized).
         WIS_under 8-15x indica subestimacao cronica; para h>=threshold penaliza
         residual positivo (y_true > y_pred) com peso 2x. Per-sample, nao constante.
+        v3: only_median true => só mediana tem peso extra (q05/q95 já têm assimetria natural)
         """
         asym = getattr(self, 'asymmetric_loss', {})
         if not asym.get('enabled', False):
+            return None
+        # v3: só mediana se flag
+        if asym.get('only_median', False) and abs(tau - 0.5) > 1e-6:
             return None
         h_thr = int(asym.get('horizon_threshold', 5))
         if horizon < h_thr:
@@ -383,20 +507,17 @@ class EpisenseTrainer:
         """Compute all metrics for one evaluation window (a fold).
 
         Quantile-specific formatting:
-          - WMAPE, MaxAE, Etp, Coverage_90: Q.50 and interval [0.05,0.95]
+          - mae, MaxAE, mae, Coverage_90: Q.50 and interval [0.05,0.95]
           - WIS: mean pinball across all quantiles + decomposition for 90% interval
           - SPL: all quantiles
-          - Baseline sazonal (persistência Ano-1) para rWIS/rMAE sem vazamento
+          - Baseline sazonal (persistência Ano-1) para baseline
         """
         y_true_cases = np.expm1(y_true)
         y_pred_dict_cases = {tau: np.expm1(y_pred_dict[tau]) for tau in self.quantiles}
         y_pred_median = y_pred_dict_cases[0.50]
 
-        # ---- B) WMAPE on Q.50 only ----
+        # ---- B) MAE on Q.50 only (mae removido) ----
         metrics = {}
-        metrics['wmape'] = float(np.sum(np.abs(y_true_cases - y_pred_median)) / (np.sum(y_true_cases) + 1e-10))
-        metrics['wmape_num'] = float(np.sum(np.abs(y_true_cases - y_pred_median)))
-        metrics['wmape_den'] = float(np.sum(y_true_cases))
 
         # ---- C) MaxAE on Q.50 only ----
         metrics['maxae'] = float(np.max(np.abs(y_true_cases - y_pred_median)))
@@ -432,6 +553,14 @@ class EpisenseTrainer:
         # ---- Coverage 90% ----
         coverage_vec = (y_true_cases >= q_inf) & (y_true_cases <= q_sup)
         metrics['coverage_90'] = float(np.mean(coverage_vec)) if len(coverage_vec) else 0.0
+        # ---- Coverage 50% (q25-q75) - novo com 5 quantis ----
+        try:
+            q25 = y_pred_dict_cases.get(0.25, y_pred_median)
+            q75 = y_pred_dict_cases.get(0.75, y_pred_median)
+            coverage50_vec = (y_true_cases >= q25) & (y_true_cases <= q75)
+            metrics['coverage_50'] = float(np.mean(coverage50_vec)) if len(coverage50_vec) else 0.0
+        except Exception:
+            metrics['coverage_50'] = float('nan')
 
         # ---- MASE (Mean Absolute Scaled Error) ----
         # MAE do modelo / MAE sazonal naive (lag 52) do treino; fallback MAE se <52
@@ -457,6 +586,86 @@ class EpisenseTrainer:
                 if np.isfinite(denom_fallback) and denom_fallback > 1e-10:
                     mase = float(mae_model / denom_fallback)
         metrics['mase'] = mase
+
+        # ---- FBias: viés fracionário 2*Sum(P-R)/Sum(P+R) em [-2,2] ----
+        try:
+            sum_pred = float(np.sum(y_pred_median))
+            sum_true = float(np.sum(y_true_cases))
+            denom = sum_pred + sum_true
+            if abs(denom) < 1e-10:
+                fbias = float('nan')
+            else:
+                fbias = float(2.0 * (sum_pred - sum_true) / denom)
+                # clip para [-2,2] por segurança numérica
+                fbias = float(max(-2.0, min(2.0, fbias)))
+            # mantém compat: fbias_rel/frac espelham fbias principal
+            fbias_rel = fbias
+            fbias_frac = fbias
+        except Exception:
+            fbias = float('nan'); fbias_rel=float('nan'); fbias_frac=float('nan')
+        metrics['fbias'] = fbias
+        metrics['fbias_rel'] = fbias_rel
+        metrics['fbias_frac'] = fbias_frac
+
+        # ---- FBias estratificado por limiar dinâmico P75 anual (in-sample per fold) ----
+        try:
+            if test_se is not None and len(test_se):
+                # mapeia SE -> ano epi
+                years = {}
+                for idx, se in enumerate(test_se):
+                    try:
+                        y = int(str(se).zfill(6)[:4])
+                    except Exception:
+                        y = 0
+                    years.setdefault(y, []).append(idx)
+                surto_mask = np.zeros(len(y_true_cases), dtype=bool)
+                calm_mask = np.zeros(len(y_true_cases), dtype=bool)
+                for y, idxs in years.items():
+                    if not idxs:
+                        continue
+                    vals = y_true_cases[idxs]
+                    if len(vals) < 4:
+                        thr = float(np.median(vals)) if len(vals) else 0.0
+                    else:
+                        thr = float(np.percentile(vals, 75))
+                    for i in idxs:
+                        if y_true_cases[i] > thr:
+                            surto_mask[i]=True
+                        else:
+                            calm_mask[i]=True
+                def _fbias_mask(mask):
+                    if not np.any(mask):
+                        return float('nan')
+                    sp=float(np.sum(y_pred_median[mask]))
+                    st=float(np.sum(y_true_cases[mask]))
+                    denom=sp+st
+                    if abs(denom)<1e-10:
+                        return float('nan')
+                    v=float(2*(sp-st)/denom)
+                    return float(max(-2,min(2,v)))
+                metrics['fbias_surto'] = _fbias_mask(surto_mask)
+                metrics['fbias_calmaria'] = _fbias_mask(calm_mask)
+                metrics['fbias_surto_n'] = int(np.sum(surto_mask))
+                metrics['fbias_calmaria_n'] = int(np.sum(calm_mask))
+                # guarda thresholds por ano para debug
+                metrics['fbias_p75_thresholds'] = {str(y): float(np.percentile(y_true_cases[idxs],75)) if len(idxs)>=4 else float(np.median(y_true_cases[idxs])) for y, idxs in years.items()}
+            else:
+                metrics['fbias_surto']=float('nan'); metrics['fbias_calmaria']=float('nan')
+        except Exception as e:
+            metrics['fbias_surto']=float('nan'); metrics['fbias_calmaria']=float('nan')
+
+        # ---- Etp: time-to-peak error (semanas até pico) ----
+        try:
+            # pico na janela de teste (52 sem): compara semana do max real vs max previsto (mediana)
+            if len(y_true_cases) and len(y_pred_median):
+                true_peak = int(np.argmax(y_true_cases))
+                pred_peak = int(np.argmax(y_pred_median))
+                etp = float(abs(true_peak - pred_peak))
+            else:
+                etp = float('nan')
+        except Exception:
+            etp = float('nan')
+        metrics['etp'] = etp
 
         # ---- Baseline Sazonal (Persistência Ano-1) sem vazamento ----
         # Para cada semana t no teste, baseline = valor real da mesma semana epi no ano anterior (train)
@@ -515,13 +724,8 @@ class EpisenseTrainer:
             metrics['baseline_wis'] = baseline_wis
             metrics['baseline_mae'] = baseline_mae
             metrics['baseline_coverage_90'] = baseline_coverage
-            # rWIS e rMAE com epsilon 1e-5
-            eps = 1e-5
-            metrics['rWIS'] = float(metrics['wis'] / (baseline_wis + eps)) if baseline_wis is not None else float('nan')
-            metrics['rMAE'] = float(np.mean(median_abs_vec) / (baseline_mae + eps)) if baseline_mae is not None else float('nan')
         else:
-            metrics['rWIS'] = float('nan')
-            metrics['rMAE'] = float('nan')
+            pass
 
         # ---- A) SPL per quantile ----
         spl = {}
@@ -564,11 +768,7 @@ class EpisenseTrainer:
                 break
         metrics['quantile_crossed'] = crossed
 
-        # ---- D) Etp on Q.50 only (absolute timing error, no sign cancellation) ----
-        peak_real = int(np.argmax(y_true_cases))
-        peak_pred = int(np.argmax(y_pred_median))
-        # MAE_Etp = |idx_pred - idx_real| (abs para nao cancelar atraso/antecipacao na media)
-        metrics['etp'] = abs(peak_pred - peak_real)
+        # mae removido
 
         return metrics
 
@@ -592,8 +792,8 @@ class EpisenseTrainer:
                              train_se: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """Compute outbreak vs calm metrics for a single window.
 
-        WMAPE, MaxAE and WIS are computed on period slice; SPL scaled by
-        seasonal naive baseline per week+quantile; Etp timing error.
+        MAE, MaxAE and WIS are computed on period slice; SPL scaled by
+        seasonal naive baseline per week+quantile; mae timing error.
         """
         periods = self.stratify_months(se_array)
 
@@ -611,14 +811,13 @@ class EpisenseTrainer:
                 continue
             y_true_p = y_true_cases[mask]
             med_p = y_pred_dict_cases[0.50][mask]
-            wmape_num_p = float(np.sum(np.abs(y_true_p - med_p)))
-            wmape_den_p = float(np.sum(y_true_p))
+            mae_p = float(np.sum(np.abs(y_true_p - med_p)))
+            mae_den_p = float(np.sum(y_true_p))
             entry = {
                 'n_samples': int(mask.sum()),
-                'wmape': float(wmape_num_p / (wmape_den_p + 1e-10)),
-                'wmape_num': wmape_num_p,
-                'wmape_den': wmape_den_p,
+                'mae': float(np.mean(np.abs(y_true_p - med_p))),
                 'maxae': float(np.max(np.abs(y_true_p - med_p))),
+                'mae_den': mae_den_p,
             }
             # WIS for this period (mean pinball across quantiles)
             wis_vals_p = []
@@ -649,7 +848,6 @@ class EpisenseTrainer:
                         pl_naive = pl_model + 1e-10
                     spl_outbreak.append(float(pl_model / (pl_naive + 1e-10)))
                 entry['spl_row'] = spl_outbreak
-                entry['etp'] = abs(int(np.argmax(y_pred_dict_cases[0.50][mask])) - int(np.argmax(y_true_p)))
             result[period] = entry
         return result
 
@@ -661,7 +859,13 @@ class EpisenseTrainer:
         logger.info(f"Training quantile models for horizon h{horizon}")
         logger.info(f"{'='*60}")
 
-        gap_weeks = self.wf_config.get('gap_weeks', 4)
+        # v3: gap por horizonte (gap = h) se habilitado, senão gap fixo config
+        base_gap = self.wf_config.get('gap_weeks', 8)
+        if self.config.get('training', {}).get('gap_per_horizon', False):
+            gap_weeks = int(horizon)
+            logger.info(f"  gap_per_horizon=true: gap={gap_weeks} para h{horizon} (base {base_gap})")
+        else:
+            gap_weeks = int(base_gap)
         assert gap_weeks >= horizon, f"gap_weeks ({gap_weeks}) must be >= horizon ({horizon}) to prevent leakage"
 
         X, y, se_index, df_clean = self.prepare_horizon_data(df, horizon)
@@ -681,7 +885,7 @@ class EpisenseTrainer:
         wf = WalkForwardValidator(
             n_splits=self.wf_config.get('n_splits', 4),
             test_size_weeks=self.wf_config.get('test_size_weeks', 52),
-            gap_weeks=self.wf_config.get('gap_weeks', 8),
+            gap_weeks=gap_weeks,
             expanding_window=self.wf_config.get('expanding_window', True),
             min_train_weeks=self.wf_config.get('min_train_weeks', 100),
             test_years=self.wf_config.get('test_years', [2022, 2023, 2024, 2025]),
@@ -733,6 +937,12 @@ class EpisenseTrainer:
             assert cutoff - gap > 0, "Not enough training data for gap+val"
             X_tr_base, X_val_base = X_train.iloc[:cutoff - gap], X_train.iloc[cutoff:]
             y_tr_base, y_val_base = y_train.iloc[:cutoff - gap], y_train.iloc[cutoff:]
+            # v3: SE para temporal weighting (slice alinhado ao X_tr)
+            se_train_all = se_index[train_idx]
+            se_tr_base = se_train_all[:cutoff - gap]
+            se_val = se_train_all[cutoff:]
+            # se_full para production retrain
+            se_full_all = se_index  # será usado depois
 
             if separate_mode:
                 # 380 por quantil independentes (sem leakage so X_tr_base)
@@ -750,6 +960,9 @@ class EpisenseTrainer:
                     'y_train': y_train.values,
                     'train_se': se_index[train_idx],
                     'test_se': se_index[test_idx],
+                    'se_tr_base': se_tr_base,
+                    'se_val': se_val,
+                    'se_train_all': se_train_all,
                 }
             else:
                 X_tr, X_val, X_test_sel = self._apply_feature_selection(X_tr_base, y_tr_base, X_val_base, X_test)
@@ -761,6 +974,9 @@ class EpisenseTrainer:
                     'y_train': y_train.values,
                     'train_se': se_index[train_idx],
                     'test_se': se_index[test_idx],
+                    'se_tr_base': se_tr_base,
+                    'se_val': se_val,
+                    'se_train_all': se_train_all,
                 }
 
         # Train: for each seed, for each quantile, for each fold.
@@ -782,7 +998,9 @@ class EpisenseTrainer:
                         X_test_tau = prep['X_test']
                     model = self.train_single_model(X_tr_tau, prep['y_tr'],
                                                     X_val_tau, prep['y_val'],
-                                                    seed, horizon, tau)
+                                                    seed, horizon, tau,
+                                                    se_tr=prep.get('se_tr_base'),
+                                                    se_val=prep.get('se_val'))
                     fold_best_iters[tau].append(model.best_iteration)
                     y_pred = model.predict(X_test_tau, num_iteration=model.best_iteration)
                     fold_predictions.setdefault(fold_idx, {}).setdefault(tau, {})[seed] = y_pred
@@ -816,7 +1034,7 @@ class EpisenseTrainer:
                     X_full_tau = X_full_base[per_tau_full_cols[tau]]
                 else:
                     X_full_tau = X_full_base
-                models[tau][seed] = self.train_single_model_full(X_full_tau, y, seed, horizon, tau, n_iters)
+                models[tau][seed] = self.train_single_model_full(X_full_tau, y, seed, horizon, tau, n_iters, se_full=se_index)
 
         # ------------------------------------------------------------------
         # Ensemble metrics: average predictions across seeds per (fold, quantile)
@@ -873,7 +1091,7 @@ class EpisenseTrainer:
                     if filtered_spl:
                         ensemble_avg['spl_mean'] = list(np.mean(np.array(filtered_spl), axis=0))
                         ensemble_avg['spl_std'] = list(np.std(np.array(filtered_spl), axis=0))
-                logger.info(f"  h{horizon} 2025 parcial {partial_folds} excluido da media: WMAPE 3folds={ensemble_avg.get('wmape', float('nan')):.3f} vs 4folds={ensemble_avg_full.get('wmape', float('nan')):.3f}")
+                logger.info(f"  h{horizon} 2025 parcial {partial_folds} excluido da media: mae 3folds={ensemble_avg.get('mae', float('nan')):.3f} vs 4folds={ensemble_avg_full.get('mae', float('nan')):.3f}")
                 # SPL matrix row (mean across folds) ja recalculado acima; pula bloco abaixo
                 spl_recalc_done = True
             else:
@@ -923,8 +1141,8 @@ class EpisenseTrainer:
             'spl_matrix': list(np.mean(np.array(spl_rows), axis=0)) if spl_rows else [],
         }
 
-        logger.info(f"\n  h{horizon} ENSEMBLE: WMAPE={ensemble_avg['wmape']:.3f}, "
-                    f"MaxAE={ensemble_avg['maxae']:.1f}, WIS={ensemble_avg['wis']:.1f} (sharp {ensemble_avg.get('wis_sharpness',0):.1f} over {ensemble_avg.get('wis_over',0):.1f} under {ensemble_avg.get('wis_under',0):.1f}), Coverage90={ensemble_avg.get('coverage_90',0):.2f}, rWIS={ensemble_avg.get('rWIS',0):.2f}, Etp={ensemble_avg.get('etp', float('nan')):.2f} ")
+        logger.info(f"\n  h{horizon} ENSEMBLE: mae={ensemble_avg.get('mae', float('nan')):.3f}, "
+                    f"MaxAE={ensemble_avg['maxae']:.1f}, WIS={ensemble_avg['wis']:.1f} (sharp {ensemble_avg.get('wis_sharpness',0):.1f} over {ensemble_avg.get('wis_over',0):.1f} under {ensemble_avg.get('wis_under',0):.1f}), Coverage90={ensemble_avg.get('coverage_90',0):.2f} Etp={ensemble_avg.get('etp',0):.1f} ")
         logger.info(f"    SPL mean (Q05/Q50/Q95): "
                     f"{[f'{x:.3f}' for x in ensemble_avg.get('spl_mean', [])]}")
 
@@ -941,29 +1159,19 @@ class EpisenseTrainer:
             if not rows:
                 continue
             n = sum(r['n_samples'] for r in rows)
-            # WMAPE ponderado: sum(num)/sum(den) igual ao global, fallback ponderado por n
-            if all('wmape_num' in r and 'wmape_den' in r for r in rows):
-                total_num = float(sum(r['wmape_num'] for r in rows))
-                total_den = float(sum(r['wmape_den'] for r in rows))
-                wmape = float(total_num / (total_den + 1e-10))
-            else:
-                # fallback: media ponderada por n_samples
-                wmape = float(sum(r['wmape'] * r['n_samples'] for r in rows) / (n + 1e-10))
+            mae = float(sum(r['mae'] * r['n_samples'] for r in rows) / (n + 1e-10))
             maxae = float(np.mean([r['maxae'] for r in rows]))
             # WIS media ponderada por n (igual ao global ponderado por amostras)
             if all('wis' in r for r in rows):
                 wis = float(sum(r['wis'] * r['n_samples'] for r in rows) / (n + 1e-10))
             else:
                 wis = float(np.mean([r['wis'] for r in rows]))
-            entry = {'n_samples': n, 'wmape': wmape, 'maxae': maxae, 'wis': wis}
-            # preserva somas para debug
-            if all('wmape_num' in r for r in rows):
-                entry['wmape_num'] = float(sum(r['wmape_num'] for r in rows))
-                entry['wmape_den'] = float(sum(r['wmape_den'] for r in rows))
+            entry = {'n_samples': n, 'mae': mae, 'maxae': maxae, 'wis': wis}
+            entry['mae_den'] = float(sum(r.get('mae_den', 0) for r in rows))
             if period == 'outbreak':
                 spl_mat_rows = np.array([r['spl_row'] for r in rows])
                 entry['spl_matrix_row'] = list(np.mean(spl_mat_rows, axis=0))
-                entry['etp'] = float(np.mean([r['etp'] for r in rows]))
+
             result[period] = entry
         return result
 
@@ -971,26 +1179,16 @@ class EpisenseTrainer:
         if not metrics_list:
             return {}
         avg = {}
-        # Weighted WMAPE: sum(num)/sum(den) is the correct global aggregation,
-        # not mean of per-fold ratios. Keep 'wmape' as mean for backwards compat
-        # but also expose 'wmape_weighted'.
-        if all('wmape_num' in m and 'wmape_den' in m for m in metrics_list):
-            total_num = float(np.sum([m['wmape_num'] for m in metrics_list]))
-            total_den = float(np.sum([m['wmape_den'] for m in metrics_list]))
-            avg['wmape_weighted'] = float(total_num / (total_den + 1e-10))
         keys = set()
         for m in metrics_list:
             keys.update(m.keys())
         for key in keys:
-            if key in ['fold', 'seed', 'horizon', 'spl', 'spl_matrix_row', 'stratified', 'wmape_num', 'wmape_den', 'coverage_vec']:
+            if key in ['fold', 'seed', 'horizon', 'spl', 'spl_matrix_row', 'stratified', 'mae_den', 'coverage_vec']:
                 continue
             values = [m.get(key, np.nan) for m in metrics_list]
             if not all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
                 continue
-            avg[key] = float(np.nanmean(values)) if key in ['wmape', 'maxae', 'wis', 'wis_sharpness', 'wis_over', 'wis_under', 'wis_median_abs', 'wis_pinball', 'wis_decomp_mean', 'mae', 'mase', 'etp', 'coverage_90', 'rWIS', 'rMAE', 'baseline_wis', 'baseline_mae', 'baseline_coverage_90'] else float(np.mean(values))
-        # Preserve weighted as primary if available
-        if 'wmape_weighted' in avg:
-            avg['wmape'] = avg['wmape_weighted']
+            avg[key] = float(np.nanmean(values)) if key in ['mae', 'maxae', 'wis', 'wis_sharpness', 'wis_over', 'wis_under', 'wis_median_abs', 'wis_pinball', 'wis_decomp_mean', 'mase', 'coverage_90', 'coverage_50', 'etp', 'fbias', 'fbias_rel', 'fbias_frac', 'fbias_surto', 'fbias_calmaria', 'baseline_wis', 'baseline_mae', 'baseline_coverage_90'] else float(np.mean(values))
         return avg
 
     def _apply_feature_selection(self, X_tr: pd.DataFrame, y_tr: pd.Series,
@@ -1003,12 +1201,17 @@ class EpisenseTrainer:
             return X_tr, X_val, X_test
         threshold = float(fs.get('threshold', 0.001))
         max_features = int(fs.get('max_features', 300))
+        # v3: threshold por quantil não afeta modo union, mas mantem compat
         try:
             quick_params = self.model_params.copy()
             quick_params['random_state'] = 42
             quick_params['seed'] = 42
             quick_params['verbosity'] = -1
             quick_params.pop('early_stopping_rounds', None)
+            # FASE1 FIX: pop n_estimators/num_iterations para num_boost_round controlar (evita 3000 vs 200)
+            quick_params.pop('n_estimators', None)
+            quick_params.pop('num_iterations', None)
+            quick_params.pop('num_iteration', None)
             quick_params['objective'] = 'quantile'
             # Aggregate importance across all quantiles (median alone underrepresents tails)
             # per_quantile=true: uniao dos tops por quantil preserva caudas (q05 colapsado h4/h8 var<1 quando agregado dilui sinal)
@@ -1025,10 +1228,14 @@ class EpisenseTrainer:
                 imps.append(imp)
             if per_quantile:
                 # Uniao dos tops por quantil (max_features dividido, sem leakage: so X_tr)
+                # v3: usa threshold por quantil se disponível
+                tpq = fs.get('threshold_per_quantile', {})
                 per_q = max(1, max_features // len(self.quantiles))
                 cols_set = set()
-                for imp in imps:
-                    top = imp[imp > threshold].sort_values(ascending=False).head(per_q).index.tolist()
+                for idx, imp in enumerate(imps):
+                    tau = self.quantiles[idx]
+                    thr = float(tpq.get(str(tau), tpq.get(float(tau), threshold)) if isinstance(tpq, dict) else threshold)
+                    top = imp[imp > thr].sort_values(ascending=False).head(per_q).index.tolist()
                     cols_set.update(top)
                 # completa com media se faltar
                 if len(cols_set) < max_features:
@@ -1060,33 +1267,43 @@ class EpisenseTrainer:
     def _get_selected_columns_per_quantile(self, X_tr: pd.DataFrame, y_tr: pd.Series) -> Dict[float, List[str]]:
         """380 features INDEPENDENTES por quantil (separate_quantile_features).
         Cada tau tem seu top 380 por ganho, sem leakage (so X_tr). Corrige q05 flat h4/h8.
-        """
+        v3: usa threshold por quantil (0.0005 para q05). Fase1: suporte max_features_per_quantile {0.05:200}."""
         fs = self.config.get('training', {}).get('feature_selection', {})
-        max_features = int(fs.get('max_features', 380))
+        max_features_default = int(fs.get('max_features', 380))
+        # Fase1: per-quantil max_features (ex: q05/q95 200, q50 380) sem quebrar compat
+        mfq = fs.get('max_features_per_quantile', {})
         threshold = float(fs.get('threshold', 0.001))
+        tpq = fs.get('threshold_per_quantile', {})
         quick_params = self.model_params.copy()
         quick_params['random_state'] = 42
         quick_params['seed'] = 42
         quick_params['verbosity'] = -1
         quick_params.pop('early_stopping_rounds', None)
+        # FASE1 FIX: pop n_estimators para num_boost_round controlar
+        quick_params.pop('n_estimators', None)
+        quick_params.pop('num_iterations', None)
+        quick_params.pop('num_iteration', None)
         quick_params['objective'] = 'quantile'
         per_tau_cols: Dict[float, List[str]] = {}
         for tau in self.quantiles:
+            try:
+                mf = int(mfq.get(str(tau), mfq.get(float(tau), max_features_default)) if isinstance(mfq, dict) and mfq else max_features_default)
+            except Exception:
+                mf = max_features_default
             qp = quick_params.copy()
             qp['alpha'] = tau
             m = lgb.train(qp, lgb.Dataset(X_tr, label=y_tr), num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000))))
             imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
-            # top 380 por tau, filtrado por threshold
-            filtered = imp[imp > threshold].sort_values(ascending=False)
-            cols = filtered.head(max_features).index.tolist()
-            if len(cols) < max_features:
-                # completa com proximos mesmo abaixo threshold para garantir 380
-                remaining = imp[~imp.index.isin(cols)].sort_values(ascending=False).head(max_features - len(cols)).index.tolist()
+            thr = float(tpq.get(str(tau), tpq.get(float(tau), threshold)) if isinstance(tpq, dict) else threshold)
+            filtered = imp[imp > thr].sort_values(ascending=False)
+            cols = filtered.head(mf).index.tolist()
+            if len(cols) < mf:
+                remaining = imp[~imp.index.isin(cols)].sort_values(ascending=False).head(mf - len(cols)).index.tolist()
                 cols.extend(remaining)
             if not cols:
-                cols = X_tr.columns.tolist()[:max_features]
-            per_tau_cols[tau] = cols[:max_features]
-            logger.info(f"    Separate q{int(tau*1000):04d}: {len(cols)}/{X_tr.shape[1]} feats (top gain {imp.max():.1f})")
+                cols = X_tr.columns.tolist()[:mf]
+            per_tau_cols[tau] = cols[:mf]
+            logger.info(f"    Separate q{int(tau*1000):04d}: {len(cols)}/{X_tr.shape[1]} feats (top gain {imp.max():.1f} thr {thr} mf {mf})")
         return per_tau_cols
 
     # ------------------------------------------------------------------
@@ -1095,8 +1312,41 @@ class EpisenseTrainer:
     def train_all_horizons(self, df: pd.DataFrame) -> Dict:
         logger.info("Starting training for all horizons...")
         df_featured = self.prepare_data(df)
-        for horizon in self.target_horizons:
-            self.train_horizon(df_featured, horizon)
+        horizons = self.target_horizons
+        # FASE1 paralelização: se habilitado, treina horizontes em paralelo
+        par_cfg = self.config.get('training', {}).get('parallel_horizons', {})
+        parallel_enabled = bool(par_cfg.get('enabled', False)) if isinstance(par_cfg, dict) else False
+        if parallel_enabled:
+            n_jobs = int(par_cfg.get('n_jobs', len(horizons)))
+            n_jobs = max(1, min(n_jobs, len(horizons)))
+            backend = par_cfg.get('backend', 'loky')
+            logger.info(f"Parallel horizons: n_jobs={n_jobs} backend={backend} horizons={horizons}")
+            try:
+                from joblib import Parallel, delayed
+                # joblib precisa que df_featured seja picklável; força cópia para evitar share
+                results = Parallel(n_jobs=n_jobs, backend=backend, verbose=10)(
+                    delayed(_parallel_horizon_worker)(int(h), self.config, df_featured) for h in horizons
+                )
+                # merge resultados no self (main process)
+                for res in results:
+                    h = int(res['horizon'])
+                    self.models[h] = res.get('models', {})
+                    if res.get('validation'):
+                        self.validation_results[h] = res['validation']
+                    if res.get('fold_series') is not None:
+                        self.fold_series[h] = res['fold_series']
+                    if res.get('feature_names') is not None:
+                        self.feature_names[h] = res['feature_names']
+                    if res.get('ano_params') is not None:
+                        self.ano_normalization_params[h] = res['ano_params']
+                logger.info(f"Parallel training merged {len(results)} horizons")
+            except Exception as e:
+                logger.warning(f"Parallel training failed ({e}), fallback sequencial")
+                for horizon in horizons:
+                    self.train_horizon(df_featured, horizon)
+        else:
+            for horizon in horizons:
+                self.train_horizon(df_featured, horizon)
         self.save_artifacts()
         self.print_summary()
         return self.validation_results
@@ -1237,15 +1487,15 @@ class EpisenseTrainer:
         print("\n" + "=" * 90)
         print("EPISENSE QUANTILE TRAINING SUMMARY")
         print("=" * 90)
-        headings = ['SPL Q0.05', 'SPL Q0.50', 'SPL Q0.95', 'WMAPE', 'MaxAE', 'WIS', 'Etp']
+        headings = ['SPL Q0.05', 'SPL Q0.25', 'SPL Q0.50', 'SPL Q0.75', 'SPL Q0.95', 'MAE', 'MaxAE', 'WIS']
         print(f"{'Horizon':<9}" + "".join(f"{h:>12}" for h in headings))
         for horizon in self.target_horizons:
             if horizon not in self.validation_results:
                 continue
             a = self.validation_results[horizon].get('ensemble_avg', {})
             spl = a.get('spl_mean', [])
-            row = spl + [a.get('wmape', float('nan')), a.get('maxae', float('nan')),
-                         a.get('wis', float('nan')), a.get('etp', float('nan'))]
+            row = spl + [a.get('mae', float('nan')), a.get('maxae', float('nan')),
+                         a.get('wis', float('nan'))]
             print(f"  h{horizon:<7}" + "".join(f"{v:>12.3f}" for v in row))
         print("\n" + "=" * 90)
         print("STRATIFIED (Outbreak Oct-May / Calm Jun-Sep):")
@@ -1256,17 +1506,16 @@ class EpisenseTrainer:
             ob = st.get('outbreak', {}); cm = st.get('calm', {})
             line = f"  h{horizon}: "
             if ob:
-                line += (f"Surto: WMAPE={ob['wmape']:.3f} MaxAE={ob['maxae']:.1f} WIS={ob['wis']:.1f} "
-                         f"Etp={ob.get('etp', float('nan')):.1f} "
+                line += (f"Surto: MAE={ob['mae']:.1f} MaxAE={ob['maxae']:.1f} WIS={ob['wis']:.1f} "
                          f"SPL={[f'{v:.2f}' for v in ob.get('spl_matrix_row', [])]} n={ob['n_samples']} | ")
             if cm:
-                line += f"Calmaria: WMAPE={cm['wmape']:.3f} MaxAE={cm['maxae']:.1f} WIS={cm['wis']:.1f} n={cm['n_samples']}"
+                line += f"Calmaria: MAE={cm['mae']:.1f} MaxAE={cm['maxae']:.1f} WIS={cm['wis']:.1f} n={cm['n_samples']}"
             print(line)
         # DataFrame consolidado para feira científica
         try:
             df_metrics = self.get_metrics_dataframe()
             print("\n" + "=" * 90)
-            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, WMAPE, MaxAE, Etp, Coverage_90, rWIS, rMAE")
+            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, MaxAE, Coverage_90")
             print(df_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
             # Salva CSV para plotagem
             df_metrics.to_csv(Path("models") / "metrics_dataframe.csv")
@@ -1276,7 +1525,7 @@ class EpisenseTrainer:
 
     def get_metrics_dataframe(self) -> pd.DataFrame:
         """Retorna DataFrame indexado por Horizonte com colunas acadêmicas.
-        Colunas: [WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, WMAPE, MaxAE, Etp, Coverage_90, rWIS, rMAE]
+        Colunas: [WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, MaxAE, Coverage_90]
         Sem vazamento: todas métricas vêm de validation_results (teste não usado no treino).
         """
         rows = []
@@ -1288,16 +1537,17 @@ class EpisenseTrainer:
                 'WIS_Sharpness': float(a.get('wis_sharpness', np.nan)),
                 'WIS_Overprediction': float(a.get('wis_over', np.nan)),
                 'WIS_Underprediction': float(a.get('wis_under', np.nan)),
-                'WMAPE': float(a.get('wmape', np.nan)),
+                'MAE': float(a.get('mae', np.nan)),
                 'MaxAE': float(a.get('maxae', np.nan)),
-                'Etp': float(a.get('etp', np.nan)),
                 'Coverage_90': float(a.get('coverage_90', np.nan)),
-                'rWIS': float(a.get('rWIS', np.nan)),
-                'rMAE': float(a.get('rMAE', np.nan)),
+                'Coverage_50': float(a.get('coverage_50', np.nan)),
+                'FBias': float(a.get('fbias', np.nan)),
+                'FBias_surto': float(a.get('fbias_surto', np.nan)),
+                'FBias_calmaria': float(a.get('fbias_calmaria', np.nan)),
+                'Etp': float(a.get('etp', np.nan)),
             })
         df = pd.DataFrame(rows).set_index('Horizonte')
-        # Ordena colunas exatamente como solicitado
-        cols = ['WIS_Total','WIS_Sharpness','WIS_Overprediction','WIS_Underprediction','WMAPE','MaxAE','Etp','Coverage_90','rWIS','rMAE']
+        cols = ['WIS_Total','WIS_Sharpness','WIS_Overprediction','WIS_Underprediction','MAE','MaxAE','Coverage_90','Coverage_50','FBias','FBias_surto','FBias_calmaria','Etp']
         df = df[cols]
         return df
 
@@ -1328,11 +1578,8 @@ def main():
         logger.error("No data available")
         return
     trainer = EpisenseTrainer(config)
-    df_featured = trainer.prepare_data(df)
-    for horizon in trainer.target_horizons:
-        trainer.train_horizon(df_featured, horizon)
-    trainer.save_artifacts()
-    trainer.print_summary()
+    # FASE1: train_all_horizons com paralelismo (8 workers) se habilitado
+    trainer.train_all_horizons(df)
     logger.info("Training completed!")
 
 

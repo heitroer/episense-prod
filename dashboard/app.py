@@ -11,6 +11,7 @@ import yaml
 import sys
 from functools import lru_cache
 import time
+import threading
 from threading import Lock
 import logging
 from datetime import datetime, timedelta
@@ -23,25 +24,92 @@ logger = logging.getLogger(__name__)
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Load data
+# Load data - AUTO-RELOAD por mtime (sem cron, sem restart)
 BASE_CSV = ROOT / "data/processed/episense_base.csv"
 VAL_PRED = ROOT / "models/validation_predictions.json"
 VAL_RES = ROOT / "models/validation_results.json"
 CONFIG_PATH = ROOT / "config/config.yaml"
 
-df_base = pd.read_csv(BASE_CSV, usecols=["SE","casos","data_inicio_semana"], dtype={"SE": str})
-# ensure SE is string YYYYWW
-df_base["SE"] = df_base["SE"].astype(str).str.replace(".0","", regex=False)
-df_base = df_base.sort_values("SE")
+# Caches com mtime para reload automático quando nova semana entra (sem cron)
+_df_base_mtime = None
+_val_pred_mtime = None
+_val_res_mtime = None
+_config_mtime = None
 
-with open(VAL_PRED) as f:
-    val_pred = json.load(f)
+def _load_df_base():
+    global df_base, _df_base_mtime
+    try:
+        mtime = BASE_CSV.stat().st_mtime
+        if df_base is None or _df_base_mtime != mtime:
+            df = pd.read_csv(BASE_CSV, usecols=["SE","casos","data_inicio_semana"], dtype={"SE": str})
+            df["SE"] = df["SE"].astype(str).str.replace(".0","", regex=False)
+            df = df.sort_values("SE")
+            df_base = df
+            _df_base_mtime = mtime
+            logger.info(f"df_base recarregado: {len(df)} linhas até {df['SE'].iloc[-1]}")
+    except Exception as e:
+        logger.warning(f"falha ao recarregar df_base: {e}")
+    return df_base
 
-with open(VAL_RES) as f:
-    val_res = json.load(f)
+def _load_val_pred():
+    global val_pred, _val_pred_mtime
+    try:
+        mtime = VAL_PRED.stat().st_mtime
+        if val_pred is None or _val_pred_mtime != mtime:
+            with open(VAL_PRED) as f:
+                val_pred = json.load(f)
+            _val_pred_mtime = mtime
+            logger.info(f"val_pred recarregado: {len(val_pred)} horizontes")
+    except Exception as e:
+        logger.warning(f"falha ao recarregar val_pred: {e}")
+    return val_pred
 
-with open(CONFIG_PATH) as f:
-    config = yaml.safe_load(f)
+def _load_val_res():
+    global val_res, _val_res_mtime
+    try:
+        mtime = VAL_RES.stat().st_mtime
+        if val_res is None or _val_res_mtime != mtime:
+            with open(VAL_RES) as f:
+                val_res = json.load(f)
+            _val_res_mtime = mtime
+            logger.info(f"val_res recarregado")
+    except Exception as e:
+        logger.warning(f"falha ao recarregar val_res: {e}")
+    return val_res
+
+# Inicialização (primeiro load)
+try:
+    df_base = pd.read_csv(BASE_CSV, usecols=["SE","casos","data_inicio_semana"], dtype={"SE": str})
+    df_base["SE"] = df_base["SE"].astype(str).str.replace(".0","", regex=False)
+    df_base = df_base.sort_values("SE")
+    _df_base_mtime = BASE_CSV.stat().st_mtime
+except Exception:
+    df_base = pd.DataFrame(columns=["SE","casos","data_inicio_semana"])
+    _df_base_mtime = None
+
+try:
+    with open(VAL_PRED) as f:
+        val_pred = json.load(f)
+    _val_pred_mtime = VAL_PRED.stat().st_mtime
+except Exception:
+    val_pred = {}
+    _val_pred_mtime = None
+
+try:
+    with open(VAL_RES) as f:
+        val_res = json.load(f)
+    _val_res_mtime = VAL_RES.stat().st_mtime
+except Exception:
+    val_res = {}
+    _val_res_mtime = None
+
+try:
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    _config_mtime = CONFIG_PATH.stat().st_mtime
+except Exception:
+    config = {}
+    _config_mtime = None
 
 # Caches for forecast acceleration
 _forecast_cache = {}
@@ -60,8 +128,8 @@ _last_fetch = 0
 _fetch_cooldown = 900  # 15 min between external API fetches (infodengue+openmeteo)
 _fetch_lock = Lock()
 _df_base_lock = Lock()
-# Live in-memory cache (same as API 8001) for dashboard forecast
-_live_cache = {'df': None, 'timestamp': 0, 'ttl': 300}
+# Live in-memory cache (same as API 8001) for dashboard forecast - 60s para garantir atualização a cada abertura do site (não estático)
+_live_cache = {'df': None, 'timestamp': 0, 'ttl': 60}
 GEOCODE = config['project']['geocode']
 INFODENGUE_URL = config['data_sources']['infodengue']['base_url']
 OPENMETEO_URL = config['data_sources']['openmeteo']['base_url']
@@ -278,25 +346,81 @@ def _fetch_fresh_raw():
 
 
 def _fetch_infodengue_live() -> pd.DataFrame:
+    """Live fetch: InfoDengue /alertcity retorna apenas as últimas ~3 semanas.
+    Para histórico completo (S18+ correto), carrega o full history local
+    (infodengue_cg_full.csv) e mescla as fresh rows por SE em memória.
+    Assim o dashboard sempre mostra dados ATUALIZADOS na abertura do site,
+    sem depender de arquivo estático desatualizado, mas com histórico completo.
+    """
     import requests
     url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
-    logger.info(f"[dashboard live] Fetching InfoDengue {url}")
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    df = pd.DataFrame(data)
-    keep = [c for c in ['SE','casos','casos_est'] if c in df.columns]
-    df = df[keep].copy()
-    df['SE'] = df['SE'].astype(str).str.zfill(6)
-    df['ano'] = df['SE'].str[:4].astype(int)
-    df['semana'] = df['SE'].str[4:].astype(int)
-    if 'casos' in df.columns:
-        df['casos'] = pd.to_numeric(df['casos'], errors='coerce').fillna(0).astype(int)
-    df = df.sort_values('SE').reset_index(drop=True)
-    return df
+    # 1) carrega full history do disco (persistido por _fetch_fresh_raw)
+    full_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+    df_full = None
+    if full_path.exists():
+        try:
+            tmp = pd.read_csv(full_path, dtype={"SE": str})
+            keep_full = [c for c in ['SE','casos','casos_est'] if c in tmp.columns]
+            tmp = tmp[keep_full].copy()
+            tmp['SE'] = tmp['SE'].astype(str).str.replace(".0","", regex=False).str.zfill(6)
+            if 'casos' in tmp.columns:
+                tmp['casos'] = pd.to_numeric(tmp['casos'], errors='coerce').fillna(0).astype(int)
+            if 'casos_est' in tmp.columns:
+                tmp['casos_est'] = pd.to_numeric(tmp['casos_est'], errors='coerce').fillna(0)
+            tmp = tmp.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
+            df_full = tmp
+            logger.info(f"[dashboard live] full history loaded: {len(df_full)} rows {df_full['SE'].min()}-{df_full['SE'].max()}")
+        except Exception as e:
+            logger.warning(f"[dashboard live] failed to load full history {full_path}: {e}")
+            df_full = None
+    # 2) fetch fresh ~3 rows da API (sempre atualizado ao abrir o site)
+    try:
+        logger.info(f"[dashboard live] Fetching InfoDengue fresh {url}")
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        df_fresh = pd.DataFrame(data)
+        if df_fresh.empty:
+            if df_full is not None and not df_full.empty:
+                logger.warning("[dashboard live] fresh empty, usando full history")
+                df = df_full.copy()
+                df['ano'] = df['SE'].str[:4].astype(int)
+                df['semana'] = df['SE'].str[4:].astype(int)
+                return df.sort_values('SE').reset_index(drop=True)
+            return df_fresh
+        keep = [c for c in ['SE','casos','casos_est'] if c in df_fresh.columns]
+        df_fresh = df_fresh[keep].copy()
+        df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
+        if 'casos' in df_fresh.columns:
+            df_fresh['casos'] = pd.to_numeric(df_fresh['casos'], errors='coerce').fillna(0).astype(int)
+        if 'casos_est' in df_fresh.columns:
+            df_fresh['casos_est'] = pd.to_numeric(df_fresh['casos_est'], errors='coerce').fillna(0)
+        # 3) merge: full + fresh (fresh sobrescreve SEs recentes com nowcast atualizado)
+        if df_full is not None and not df_full.empty:
+            df_full['SE'] = df_full['SE'].astype(str).str.zfill(6)
+            df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
+            df_full_filtered = df_full[~df_full['SE'].isin(df_fresh['SE'])]
+            df_merged = pd.concat([df_full_filtered, df_fresh], ignore_index=True)
+            df_merged = df_merged.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
+            df_merged['ano'] = df_merged['SE'].str[:4].astype(int)
+            df_merged['semana'] = df_merged['SE'].str[4:].astype(int)
+            logger.info(f"[dashboard live] merged full {len(df_full)} + fresh {len(df_fresh)} -> {len(df_merged)} fresh SEs {sorted(df_fresh['SE'].tolist())}")
+            return df_merged
+        else:
+            df_fresh['ano'] = df_fresh['SE'].str[:4].astype(int)
+            df_fresh['semana'] = df_fresh['SE'].str[4:].astype(int)
+            return df_fresh.sort_values('SE').reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"[dashboard live] fetch fresh failed {e}, fallback full history")
+        if df_full is not None and not df_full.empty:
+            df = df_full.copy()
+            df['ano'] = df['SE'].str[:4].astype(int)
+            df['semana'] = df['SE'].str[4:].astype(int)
+            return df.sort_values('SE').reset_index(drop=True)
+        raise
 
 def _fetch_openmeteo_live() -> pd.DataFrame:
-    import requests
+    import requests, time
     end_date = datetime.now().date()
     start_date = end_date - timedelta(days=1200)
     params = {
@@ -308,9 +432,44 @@ def _fetch_openmeteo_live() -> pd.DataFrame:
         'timezone': TIMEZONE
     }
     logger.info(f"[dashboard live] Fetching OpenMeteo {OPENMETEO_URL}")
-    r = requests.get(OPENMETEO_URL, params=params, timeout=60)
-    r.raise_for_status()
-    data = r.json()
+    last_exc = None
+    response = None
+    for attempt in range(3):
+        try:
+            r = requests.get(OPENMETEO_URL, params=params, timeout=60)
+            r.raise_for_status()
+            response = r
+            break
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status is None and response is not None:
+                status = getattr(response, 'status_code', None)
+            if status == 429 and attempt < 2:
+                wait = 2 ** attempt * 5
+                logger.warning(f"[dashboard live] OpenMeteo 429 retry {attempt+1}/3 em {wait}s")
+                time.sleep(wait)
+                continue
+            if attempt == 2:
+                break
+            raise
+    if response is None or (hasattr(response, 'status_code') and response.status_code != 200):
+        logger.warning(f"[dashboard live] OpenMeteo falhou após retries ({last_exc}), fallback local")
+        try:
+            from data.collect_openmeteo import latest_weekly_file
+            wf = latest_weekly_file(ROOT / "data/raw/openmeteo")
+            if wf and wf.exists():
+                logger.info(f"[dashboard live] Fallback local {wf}")
+                df_fallback = pd.read_csv(wf, dtype={"SE": str})
+                df_fallback["SE"] = df_fallback["SE"].astype(str).str.zfill(6)
+                return df_fallback.sort_values("SE").reset_index(drop=True)
+        except Exception as fe:
+            logger.warning(f"[dashboard live] Fallback falhou: {fe}")
+        if last_exc:
+            # não propaga 429 como 500, retorna vazio para permitir merge só com dengue (nowcast ainda funciona)
+            logger.warning(f"[dashboard live] Retornando vazio para permitir merge dengue-only: {last_exc}")
+            return pd.DataFrame()
+    data = response.json()
     daily = data.get('daily', {})
     if not daily:
         logger.warning("No daily OpenMeteo")
@@ -377,8 +536,8 @@ def _merge_and_prepare_live(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -
         merged=merged.sort_values('SE').reset_index(drop=True)
         merged['casos']=pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
         merged['casos_est']=pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-        n=len(merged)
-        mask=(merged['casos_est']>merged['casos']) & (merged.index >= n-12)
+        # FIX histórico: casos = max(casos, casos_est) SEMPRE (antes só últimas 12, deixava 202633/202634 com 0)
+        mask=(merged['casos_est']>merged['casos'])
         if mask.any():
             merged.loc[mask,'casos']=np.round(merged.loc[mask,'casos_est']).astype(int)
             logger.info(f"[dashboard live] Nowcast {mask.sum()} semanas")
@@ -425,9 +584,12 @@ def _get_live_engineered():
     logger.info("[dashboard live] Fetching fresh data from APIs (same as 8001)...")
     dengue=_fetch_infodengue_live()
     weather=_fetch_openmeteo_live()
-    if dengue.empty or weather.empty:
-        raise RuntimeError("fresh fetch empty")
-    if len(weather) < 156:
+    if dengue.empty:
+        raise RuntimeError("fresh fetch dengue empty")
+    if weather.empty:
+        logger.warning(f"[dashboard live] weather empty ({len(weather)}), usando dengue-only com ffill histórico")
+        # weather vazio por 429 - merge ainda funciona com left join e ffill
+    if len(weather) < 156 and not weather.empty:
         logger.warning(f"weather weeks {len(weather)} <156")
     merged=_merge_and_prepare_live(dengue, weather)
     from data.features import EpisenseFeatureEngineer
@@ -446,8 +608,16 @@ def _ensure_fresh_data():
     """On-demand refresh (no cron) — called at start of each API request / dashboard load.
     If raw infodengue has newer SE than processed base, rebuild base via processor.
     Debounced 60s, thread-safe, preserves forecast history.
+    Também recarrega df_base/val_pred/val_res por mtime (sem restart) e dispara retreino em background se nova SE além da validação.
     """
     global _last_refresh_check, _df_full_cache, _feat_cache, _forecast_cache, _df_full_mtime, _feat_cache_mtime
+    # Auto-reload estático por mtime (sem cron, sem restart) - garante histórico atualizado quando nova semana entra
+    try:
+        _load_df_base()
+        _load_val_pred()
+        _load_val_res()
+    except Exception:
+        pass
     now = time.time()
     if now - _last_refresh_check < _refresh_cooldown:
         return
@@ -512,18 +682,77 @@ def _ensure_fresh_data():
             except Exception as e:
                 logger.warning(f"archive after rebuild failed: {e}")
             logger.info(f"On-demand refresh done: base {base_max} -> {new_max}, forecast archived")
+            # Auto-retreino em background se nova SE além da validação (sem bloquear request, sem cron)
+            try:
+                _load_val_pred()
+                max_val_se = "0"
+                for h in val_pred.values():
+                    if not isinstance(h, dict):
+                        continue
+                    for q in h.values():
+                        if not isinstance(q, list):
+                            continue
+                        for fold in q:
+                            ses = fold.get("test_se", [])
+                            if ses:
+                                m = max(str(s).zfill(6) for s in ses)
+                                if m > max_val_se:
+                                    max_val_se = m
+                if new_max > max_val_se:
+                    logger.info(f"Auto-retreino disparado: new_max {new_max} > val_max {max_val_se} (sem cron)")
+                    def do_retrain():
+                        try:
+                            from scripts.train import EpisenseTrainer, load_config, load_processed_data
+                            cfg = load_config()
+                            df = load_processed_data(cfg)
+                            if df is None or df.empty:
+                                logger.warning("Auto-retreino: df vazio, abort")
+                                return
+                            trainer = EpisenseTrainer(cfg)
+                            trainer.train_all_horizons(df)
+                            _load_val_pred()
+                            _load_val_res()
+                            with _forecast_cache_lock:
+                                _forecast_cache.clear()
+                            global _inference
+                            _inference = None
+                            get_inference()
+                            logger.info("Auto-retreino concluído e caches invalidados")
+                        except Exception as e:
+                            logger.warning(f"Auto-retreino falhou: {e}")
+                            import traceback; traceback.print_exc()
+                    threading.Thread(target=do_retrain, daemon=True).start()
+            except Exception as e:
+                logger.warning(f"checagem auto-retreino falhou: {e}")
         except Exception as e:
             logger.warning(f"_ensure_fresh_data failed: {e}")
             import traceback; traceback.print_exc()
 
 # lazy inference engine
 _inference = None
+_inference_mtime = None
 def get_inference():
-    global _inference
+    global _inference, _inference_mtime
+    # verifica se modelos mudaram (retreino) - recarrega automaticamente sem restart
+    try:
+        models_dir = ROOT / "models"
+        # pega mtime mais recente dos pkls
+        latest = max((p.stat().st_mtime for p in models_dir.glob("lgbm_*.pkl")), default=0)
+        if _inference is not None and _inference_mtime is not None and latest <= _inference_mtime:
+            return _inference if _inference else None
+        if latest > (_inference_mtime or 0):
+            logger.info(f"Modelos mudaram (mtime {latest}), recarregando inference")
+            _inference = None
+    except Exception:
+        pass
     if _inference is None:
         try:
             from models.inference import EpisenseInference
             _inference = EpisenseInference(model_dir=str(ROOT/"models"), config=config)
+            try:
+                _inference_mtime = max((p.stat().st_mtime for p in (ROOT/"models").glob("lgbm_*.pkl")), default=time.time())
+            except Exception:
+                _inference_mtime = time.time()
         except Exception as e:
             print(f"Inference load failed: {e}")
             _inference = False
@@ -604,19 +833,16 @@ def api_metrics():
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
         # advanced keys exposed for toggle
-        adv_keys = ["wmape","wis","rWIS","coverage_90","maxae","etp","wis_sharpness","mase","wis_over","wis_under","mae","baseline_wis"]
+        adv_keys = ["mae","wis","coverage_90","coverage_50","maxae","wis_sharpness","mase","wis_over","wis_under","baseline_wis","etp","fbias","fbias_rel","fbias_frac","fbias_surto","fbias_calmaria"]
         def pick(src):
             return {k: src.get(k) for k in adv_keys} if src else None
         out[h] = {
-            "avg": pick(avg) | {"wmape": avg.get("wmape", avg.get("wmape_weighted"))},
+            "avg": pick(avg),
             "0": pick(by_fold.get("0", {})),
             "1": pick(by_fold.get("1", {})),
             "2": pick(by_fold.get("2", {})),
             "3": pick(by_fold.get("3", {})),
         }
-        # ensure wmape_weighted alias
-        if out[h]["avg"] and out[h]["avg"].get("wmape") is None:
-            out[h]["avg"]["wmape"] = avg.get("wmape_weighted")
     return out
 
 @app.get("/api/history")
@@ -644,6 +870,8 @@ def api_history(horizon: str = "1", window: int = 52):
 
     q_mid = "0.5" if "0.5" in val_pred[h] else sorted(val_pred[h].keys())[0]
     q_low = "0.05" if "0.05" in val_pred[h] else None
+    q_low25 = "0.25" if "0.25" in val_pred[h] else None
+    q_high75 = "0.75" if "0.75" in val_pred[h] else None
     q_high = "0.95" if "0.95" in val_pred[h] else None
 
     points = {}
@@ -659,12 +887,26 @@ def api_history(horizon: str = "1", window: int = 52):
                 se = str(se)
                 if se in points:
                     points[se]["pred_low"] = float(pred)
+                    points[se]["q05"] = float(pred)
+    if q_low25:
+        for fold in final_folds(q_low25):
+            for se, pred in zip(fold["test_se"], fold["y_pred_casos"]):
+                se = str(se)
+                if se in points:
+                    points[se]["q25"] = float(pred)
+    if q_high75:
+        for fold in final_folds(q_high75):
+            for se, pred in zip(fold["test_se"], fold["y_pred_casos"]):
+                se = str(se)
+                if se in points:
+                    points[se]["q75"] = float(pred)
     if q_high:
         for fold in final_folds(q_high):
             for se, pred in zip(fold["test_se"], fold["y_pred_casos"]):
                 se = str(se)
                 if se in points:
                     points[se]["pred_high"] = float(pred)
+                    points[se]["q95"] = float(pred)
 
     # Real deve ser live (mesma lógica API 8001 com nowcast), não CSV defasado
     try:
@@ -731,7 +973,9 @@ def api_history(horizon: str = "1", window: int = 52):
                         "pred": fc.get("q50"),
                         "pred_high": fc.get("q95"),
                         "q05": fc.get("q05"),
+                        "q25": fc.get("q25"),
                         "q50": fc.get("q50"),
+                        "q75": fc.get("q75"),
                         "q95": fc.get("q95"),
                         "origin_se": orig,
                         "h": fc.get("h"),
@@ -748,6 +992,8 @@ def api_history(horizon: str = "1", window: int = 52):
         p_low = pv.get("pred_low")
         p_med = pv.get("pred")
         p_high = pv.get("pred_high")
+        p_q25 = pv.get("q25")
+        p_q75 = pv.get("q75")
         stitched = False
         stitch_meta = None
         # Se gap honesto (sem validacao), preenche com archive live mais recente para esse horizonte
@@ -755,9 +1001,11 @@ def api_history(horizon: str = "1", window: int = 52):
             am = archive_map[se]
             # só usa se archive tem os 3 quantis completos (q05/q50/q95)
             if am.get("q05") is not None and am.get("q50") is not None and am.get("q95") is not None:
-                p_low = am["q05"]
-                p_med = am["q50"]
-                p_high = am["q95"]
+                p_low = am.get("q05", p_low)
+                p_q25 = am.get("q25", p_q25)
+                p_med = am.get("q50", p_med)
+                p_q75 = am.get("q75", p_q75)
+                p_high = am.get("q95", p_high)
                 stitched = True
                 stitch_meta = am
         # Fallback: se ainda gap e archive não tinha essa SE/horizonte, gera live na hora para origin=SE-h e arquiva
@@ -798,9 +1046,9 @@ def api_history(horizon: str = "1", window: int = 52):
                                         continue
                                     if str(fc.get("target_se")).zfill(6) == se:
                                         if fc.get("q05") is not None and fc.get("q50") is not None and fc.get("q95") is not None:
-                                            p_low = fc["q05"]; p_med = fc["q50"]; p_high = fc["q95"]
+                                            p_low = fc.get("q05", p_low); p_q25 = fc.get("q25", p_q25); p_med = fc.get("q50", p_med); p_q75 = fc.get("q75", p_q75); p_high = fc.get("q95", p_high)
                                             stitched = True
-                                            stitch_meta = {"origin_se": origin_try, "h": hh_int, "q05": p_low, "q50": p_med, "q95": p_high, "pred_low": p_low, "pred": p_med, "pred_high": p_high}
+                                            stitch_meta = {"origin_se": origin_try, "h": hh_int, "q05": p_low, "q25": p_q25, "q50": p_med, "q75": p_q75, "q95": p_high, "pred_low": p_low, "pred": p_med, "pred_high": p_high}
                                             # atualiza archive_map para próximas iterações
                                             archive_map[se] = stitch_meta
                                         break
@@ -808,16 +1056,34 @@ def api_history(horizon: str = "1", window: int = 52):
                     logger.info(f"on-demand stitch fallback skip {se} h={h}: {ie}")
             except Exception as fe:
                 logger.info(f"stitch fallback calc failed {se} h={h}: {fe}")
-        # Correcao non-crossing: garante Q05 <= Q50 <= Q95 (tanto validacao quanto archive)
+        # Correcao non-crossing: garante Q05 <= Q50 <= Q95, e Q25/Q75 se disponiveis
         if p_low is not None and p_med is not None and p_high is not None:
             try:
-                vals = sorted([float(p_low), float(p_med), float(p_high)])
-                # reatribui ordenado mas preserva q05/q50/q95 ordenados também
-                p_low, p_med, p_high = vals[0], vals[1], vals[2]
+                vals_in = [float(p_low), float(p_med), float(p_high)]
+                if p_q25 is not None:
+                    vals_in.append(float(p_q25))
+                if p_q75 is not None:
+                    vals_in.append(float(p_q75))
+                vals = sorted(vals_in)
+                # reatribui ordenado: preserva ordem 90% e 50% quando disponiveis
+                if len(vals)==5:
+                    p_low, p_q25, p_med, p_q75, p_high = vals[0], vals[1], vals[2], vals[3], vals[4]
+                elif len(vals)==4:
+                    # missing one of 25/75
+                    p_low, p_med, p_high = vals[0], vals[1 if p_q25 is None else 2], vals[-1]
+                else:
+                    p_low, p_med, p_high = vals[0], vals[1], vals[2]
                 if stitched and stitch_meta:
                     # mantém q05/q50/q95 coerentes com ordenação
                     stitch_meta = dict(stitch_meta)
-                    stitch_meta["q05"], stitch_meta["q50"], stitch_meta["q95"] = vals[0], vals[1], vals[2]
+                    if len(vals)==5:
+                        stitch_meta["q05"], stitch_meta["q25"], stitch_meta["q50"], stitch_meta["q75"], stitch_meta["q95"] = vals[0], vals[1], vals[2], vals[3], vals[4]
+                    else:
+                        stitch_meta["q05"], stitch_meta["q50"], stitch_meta["q95"] = vals[0], vals[1], vals[2]
+                        if p_q25 is not None:
+                            stitch_meta["q25"]=p_q25
+                        if p_q75 is not None:
+                            stitch_meta["q75"]=p_q75
             except Exception:
                 pass
         pt = {
@@ -825,9 +1091,11 @@ def api_history(horizon: str = "1", window: int = 52):
             "pred": float(p_med) if p_med is not None else None,
             "pred_low": float(p_low) if p_low is not None else None,
             "pred_high": float(p_high) if p_high is not None else None,
-            # expõe também q05/q50/q95 explicitamente para o frontend (todos os quantis)
+            # expõe também q05/q25/q50/q75/q95 explicitamente para o frontend (5 quantis)
             "q05": float(p_low) if p_low is not None else None,
+            "q25": float(p_q25) if p_q25 is not None else None,
             "q50": float(p_med) if p_med is not None else None,
+            "q75": float(p_q75) if p_q75 is not None else None,
             "q95": float(p_high) if p_high is not None else None,
             "true": float(pv.get("true", row["casos"])) if "true" in pv else float(row["casos"]),
             "real": float(row["casos"]),
@@ -897,9 +1165,9 @@ def api_forecast(origin_se: str, horizon: str = None):
         for hh in range(1, 9):
             hstr = str(hh)
             target_se = add_epiweeks(origin_se, hh)
-            qvals = {"q05": None, "q50": None, "q95": None}
+            qvals = {"q05": None, "q25": None, "q50": None, "q75": None, "q95": None}
             if hstr in val_pred:
-                for q, out_key in [("0.05", "q05"), ("0.5", "q50"), ("0.95", "q95")]:
+                for q, out_key in [("0.05", "q05"), ("0.25", "q25"), ("0.5", "q50"), ("0.75", "q75"), ("0.95", "q95")]:
                     for fold in val_pred[hstr].get(q, []):
                         ses = [str(x) for x in fold.get("test_se", [])]
                         if target_se in ses:
@@ -993,7 +1261,7 @@ def api_forecast(origin_se: str, horizon: str = None):
                 if hh not in preds:
                     continue
                 fut_se = add_epiweeks(origin_se, hh)
-                q05 = q50 = q95 = None
+                q05 = q25 = q50 = q75 = q95 = None
                 for tau, arr in preds[hh].items():
                     if len(arr) == 0:
                         continue
@@ -1001,11 +1269,15 @@ def api_forecast(origin_se: str, horizon: str = None):
                     casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
                     if abs(tau - 0.05) < 0.01:
                         q05 = casos
+                    elif abs(tau - 0.25) < 0.01:
+                        q25 = casos
                     elif abs(tau - 0.50) < 0.01:
                         q50 = casos
+                    elif abs(tau - 0.75) < 0.01:
+                        q75 = casos
                     elif abs(tau - 0.95) < 0.01:
                         q95 = casos
-                result["forecast"].append({"h": hh, "target_se": str(fut_se), "target_date": se_to_date(fut_se), "q05": q05, "q50": q50, "q95": q95})
+                result["forecast"].append({"h": hh, "target_se": str(fut_se), "target_date": se_to_date(fut_se), "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95})
             # cache live result
             with _forecast_cache_lock:
                 if len(_forecast_cache) >= _forecast_cache_max:

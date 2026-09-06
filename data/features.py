@@ -62,6 +62,8 @@ class EpisenseFeatureEngineer:
         self.expand_climatology = bool(self.config.get('features', {}).get('expand_climatology', False))
         self.expand_trend = bool(self.config.get('features', {}).get('expand_trend', False))
         self.expand_outbreak = bool(self.config.get('features', {}).get('expand_outbreak', False))
+        self.expand_regime_conditional = bool(self.config.get('features', {}).get('expand_regime_conditional', False))
+        self.expand_peak_timing = bool(self.config.get('features', {}).get('expand_peak_timing', False))
         self.outbreak_threshold = self.config.get('metrics', {}).get('classification_thresholds', {}).get('outbreak_threshold', 50)
         self.outbreak_thresholds = [self.outbreak_threshold, self.outbreak_threshold * 2, self.outbreak_threshold * 4]
 
@@ -544,6 +546,156 @@ class EpisenseFeatureEngineer:
         return df
 
     # ------------------------------------------------------------------
+    # NOVO v3: Regime condicional (lag sazonal gating)
+    # ------------------------------------------------------------------
+    def create_regime_conditional_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Lags sazonais condicionais ao regime do ano anterior + gating anti-phantom.
+
+        Problema Fold2: q95 phantom S52 disparou porque lag52/53 puro + climatologia
+        associam padrao seco de outono a surto, sem verificar se ano anterior teve
+        surto na mesma semana. Gate condicional suprime falso positivo quando
+        regime anterior era calma.
+
+        Features:
+        - prev_year_was_outbreak: 1 se lag52 casos > threshold (ano anterior teve surto na mesma semana)
+        - log_casos_lag52_conditional = lag52 * flag  (só vale se veio de surto)
+        - log_casos_lag53_conditional idem
+        - yoy_gated = yoy52 * flag (crescimento só relevante se baseline foi surto)
+        - clim_anomaly_gated: anomalia vs clim só quando clim indica outbreak
+        - is_calm_season: flag mes calm (jun-set) para modelo aprender q95 calm não deve ser alto
+        - precip_anomaly_x_regime: interação clima*regime
+        """
+        df = df.copy()
+        if 'log_casos' not in df.columns:
+            return df
+        # flag se mesma semana do ano anterior teve surto (>50)
+        # usa casos (não log) para threshold operacional
+        casos = df['casos'] if 'casos' in df.columns else np.expm1(df['log_casos'])
+        # lag52 casos do ano anterior
+        if 'log_casos_lag52' in df.columns:
+            casos_lag52 = np.expm1(df['log_casos_lag52'])
+            prev_outbreak_52 = (casos_lag52 > self.outbreak_threshold).astype(int)
+            # fillna 0 para primeiros 52 sem histórico
+            prev_outbreak_52 = pd.Series(prev_outbreak_52).fillna(0).astype(int).values
+            df['prev_year_was_outbreak_52'] = prev_outbreak_52
+            # lags condicionais
+            df['log_casos_lag52_conditional'] = df['log_casos_lag52'] * df['prev_year_was_outbreak_52']
+            df['log_casos_lag52_calm'] = df['log_casos_lag52'] * (1 - df['prev_year_was_outbreak_52'])
+            # yoy gated
+            if 'log_casos_yoy52' in df.columns:
+                df['log_casos_yoy52_gated'] = df['log_casos_yoy52'] * df['prev_year_was_outbreak_52']
+                df['log_casos_yoy52_calm'] = df['log_casos_yoy52'] * (1 - df['prev_year_was_outbreak_52'])
+        if 'log_casos_lag53' in df.columns:
+            casos_lag53 = np.expm1(df['log_casos_lag53'])
+            prev_outbreak_53 = (casos_lag53 > self.outbreak_threshold).astype(int)
+            prev_outbreak_53 = pd.Series(prev_outbreak_53).fillna(0).astype(int).values
+            df['prev_year_was_outbreak_53'] = prev_outbreak_53
+            df['log_casos_lag53_conditional'] = df['log_casos_lag53'] * df['prev_year_was_outbreak_53']
+
+        # flag estaçao calma vs outbreak (baseado na semana atual, conhecida em t)
+        # semana já é conhecida, então is_calm é feature válida (não vazamento futuro)
+        if 'semana' in df.columns:
+            # tenta usar mes aproximado ou semana->mes; semanas 22-39 ~= jun-set (calm)
+            # usa definicao config: calm_months 6,7,8,9 => semanas ~22-39
+            # heuristica semana->mes: mes_aprox já existe, mas para simplicidade usa semana
+            # 22=~jun inicio, 39=~set fim
+            is_calm_week = df['semana'].between(22, 39).astype(int)
+            df['is_calm_season'] = is_calm_week
+            df['is_outbreak_season'] = 1 - is_calm_week
+            # interação lag sazonal x estacao
+            if 'log_casos_lag52' in df.columns:
+                df['lag52_x_is_calm'] = df['log_casos_lag52'] * df['is_calm_season']
+                df['lag52_x_is_outbreak'] = df['log_casos_lag52'] * df['is_outbreak_season']
+
+        # anomalia climatologica gated: só relevante se anomalia positiva em estação outbreak
+        if 'log_casos_anomaly_clim' in df.columns and 'is_outbreak_season' in df.columns:
+            df['anomaly_clim_x_outbreak_season'] = df['log_casos_anomaly_clim'] * df['is_outbreak_season']
+            df['anomaly_clim_x_calm_season'] = df['log_casos_anomaly_clim'] * df['is_calm_season']
+
+        # clima x regime (precip anomalia só importa em estacao outbreak)
+        if 'precip_total_anomaly_clim' in df.columns and 'is_outbreak_season' in df.columns:
+            df['precip_anom_x_outbreak'] = df['precip_total_anomaly_clim'] * df['is_outbreak_season']
+            df['precip_anom_x_calm'] = df['precip_total_anomaly_clim'] * df['is_calm_season']
+        if 'temp_mean_mean_anomaly_clim' in df.columns and 'is_outbreak_season' in df.columns:
+            df['temp_anom_x_outbreak'] = df['temp_mean_mean_anomaly_clim'] * df['is_outbreak_season']
+
+        logger.info("expand_regime_conditional: lags condicionais + gating anti-phantom adicionados")
+        return df
+
+    # ------------------------------------------------------------------
+    # NOVO v3: Peak timing (corrige S6 vs S15)
+    # ------------------------------------------------------------------
+    def create_peak_timing_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Features de timing de pico para corrigir viés S6 vs S15.
+
+        Histórico: pico mediano S07, mas 2022 S18 e 2023 S15 são tardios.
+        Modelo puro sazonal prevê pico cedo (S06) porque prior puxa para média.
+        Features de timing dão ao modelo sinal de que pico pode atrasar.
+
+        - dist_to_typical_peak: distância circular (semanas) da semana atual ao pico típico (S07)
+        - weeks_to_typical_peak: semanas até S07 (negativo se passou)
+        - slope_x_dist: interação momentum atual x distância ao pico (se subindo longe do pico => picos tardio provável)
+        - lag52_x_slope: gating sazonal (lag52 só vale se slope atual concorda com yoy)
+        - yoy_x_slope: se yoy positivo e slope positivo => surto em ascensão tardia
+        - trended_peak_lag: lag52 ajustado por tendência (lag52 + momentum*weeks_to_peak)
+        """
+        df = df.copy()
+        if 'semana' not in df.columns or 'log_casos' not in df.columns:
+            return df
+
+        # pico típico histórico S07 (mediana dos picos 2015-2024)
+        typical_peak_week = 7
+
+        # distância circular mínima (considera ano circular 52 semanas)
+        def circ_dist(w, peak=typical_peak_week, total=52):
+            d = np.abs(w - peak)
+            return np.minimum(d, total - d)
+
+        df['dist_to_typical_peak'] = circ_dist(df['semana'])
+        # semanas até pico (com sinal): positivo se antes do pico, negativo se depois
+        # assume ano epi semanas 1-52/53, precisa lidar com passagem de ano
+        # simplifica: se semana <=30, diff = peak - semana, senão peak+52-semana
+        def weeks_to_peak(w, peak=typical_peak_week):
+            # se w <= 30, pico no mesmo ano (peak - w), senão pico do próximo ano (peak+52 - w)
+            return np.where(w <= 30, peak - w, peak + 52 - w)
+
+        df['weeks_to_typical_peak'] = weeks_to_peak(df['semana'])
+        df['is_before_typical_peak'] = (df['weeks_to_typical_peak'] > 0).astype(int)
+        df['is_after_typical_peak'] = (df['weeks_to_typical_peak'] <= 0).astype(int)
+
+        # interação slope x distância
+        if 'log_casos_slope_4' in df.columns:
+            df['slope4_x_dist_peak'] = df['log_casos_slope_4'] * df['dist_to_typical_peak']
+            df['slope4_x_weeks_to_peak'] = df['log_casos_slope_4'] * df['weeks_to_typical_peak']
+            # se está longe do pico mas subindo => pico tardio provável
+            df['rising_far_from_peak'] = ((df['log_casos_slope_4'] > 0) & (df['dist_to_typical_peak'] > 8)).astype(int)
+        if 'log_casos_slope_8' in df.columns:
+            df['slope8_x_dist_peak'] = df['log_casos_slope_8'] * df['dist_to_typical_peak']
+
+        # gating lag52 x slope: lag sazonal só deve puxar para cima se slope atual confirma yoy positivo
+        if 'log_casos_lag52' in df.columns and 'log_casos_slope_4' in df.columns:
+            df['lag52_x_slope4'] = df['log_casos_lag52'] * df['log_casos_slope_4']
+        if 'log_casos_yoy52' in df.columns and 'log_casos_slope_4' in df.columns:
+            df['yoy52_x_slope4'] = df['log_casos_yoy52'] * df['log_casos_slope_4']
+            # confirmação dupla: yoy positivo + subindo => forte sinal tardio
+            df['yoy_positive_rising'] = ((df['log_casos_yoy52'] > 0) & (df['log_casos_slope_4'] > 0)).astype(int)
+
+        # momentum ajustado para pico esperado: lag52 + momentum * weeks_to_peak (projeção linear)
+        if 'log_casos_lag52' in df.columns and 'log_casos_momentum_4' in df.columns:
+            # momentum semanal médio
+            mom_per_week = df['log_casos_momentum_4'] / 4.0
+            df['trended_peak_lag52'] = df['log_casos_lag52'] + mom_per_week * df['weeks_to_typical_peak'].clip(lower=0)
+
+        # flag pico tardio histórico: se pico anterior foi tardio (>S12), aumentar prior tardio
+        # usa weeks_since_peak_52: se >20 e ainda subindo => tardio
+        if 'weeks_since_peak_52' in df.columns and 'log_casos_slope_4' in df.columns:
+            df['late_peak_risk'] = ((df['weeks_since_peak_52'] > 20) & (df['log_casos_slope_4'] > 0)).astype(int)
+            df['weeks_since_peak_x_slope'] = df['weeks_since_peak_52'] * df['log_casos_slope_4'].fillna(0)
+
+        logger.info("expand_peak_timing: distância ao pico típico + gating slope adicionados")
+        return df
+
+    # ------------------------------------------------------------------
     def select_features(self, df: pd.DataFrame, target_col: str = 'target',
                         exclude_cols: List[str] = None, all_horizons: List[int] = None) -> Tuple[pd.DataFrame, List[str]]:
         df = df.copy()
@@ -697,6 +849,16 @@ class EpisenseFeatureEngineer:
         # ============================================================
         if self.expand_outbreak:
             df = self.create_outbreak_features(df)
+        # ============================================================
+        # EXPANSAO 7 (expand_regime_conditional - v3): lags condicionais + gating anti-phantom
+        # ============================================================
+        if self.expand_regime_conditional:
+            df = self.create_regime_conditional_features(df)
+        # ============================================================
+        # EXPANSAO 8 (expand_peak_timing - v3): distancia ao pico tipico + gating slope
+        # ============================================================
+        if self.expand_peak_timing:
+            df = self.create_peak_timing_features(df)
 
         if legacy_mode or convention == 'legacy':
             logger.warning("legacy_mode nao suportado no modo EXP (use convention='advanced')")

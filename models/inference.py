@@ -189,6 +189,8 @@ class EpisenseInference:
                     'expand_climatology': self.config.get('features', {}).get('expand_climatology', True),
                     'expand_trend': self.config.get('features', {}).get('expand_trend', True),
                     'expand_outbreak': self.config.get('features', {}).get('expand_outbreak', True),
+                    'expand_regime_conditional': self.config.get('features', {}).get('expand_regime_conditional', True),
+                    'expand_peak_timing': self.config.get('features', {}).get('expand_peak_timing', True),
                 }
             }
             fe = EpisenseFeatureEngineer(fe_cfg)
@@ -395,6 +397,32 @@ class EpisenseInference:
                 except Exception:
                     last_se = None
                 predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
+            # v3 phantom gating (clamp q95 em calmaria)
+            if self.config.get('phantom_gating', {}).get('enabled', False):
+                try:
+                    last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
+                except Exception:
+                    last_se = None
+                predictions = self._apply_phantom_gating(predictions, last_se=last_se)
+            # FIX q05 negativo: clamp todos quantis para casos >=0 (nunca prever -1)
+            # Aplica após recal + gating + non_crossing, em escala casos e volta para log
+            try:
+                for h in list(predictions.keys()):
+                    for tau in list(predictions[h].keys()):
+                        log_arr = predictions[h][tau]
+                        # log pode ser negativo (ex: -0.2 -> casos -0.18) após delta -0.64
+                        cases = np.expm1(log_arr)
+                        cases = np.maximum(0, cases)  # nunca negativo
+                        # também garante que q05 <= q50 <= q95 após clamp (reaplica non_crossing se necessário)
+                        predictions[h][tau] = np.log1p(cases)
+                if self.non_crossing:
+                    predictions = self._apply_non_crossing(predictions)
+                # segunda passada de clamp caso non_crossing tenha reintroduzido negativo por sort (improvável)
+                for h in list(predictions.keys()):
+                    for tau in list(predictions[h].keys()):
+                        predictions[h][tau] = np.maximum(0, predictions[h][tau])  # log >=0 => casos 0
+            except Exception as e:
+                logger.warning(f"clamp q05 negativo falhou: {e}")
         
             return predictions
 
@@ -487,6 +515,48 @@ class EpisenseInference:
                     predictions[horizon][tau] = log_pred + delta
                     logger.info(f"h{horizon} q{int(tau*1000):04d}: delta {delta:.3f} aplicado em log")
         # Re-apply non-crossing after recalibration (once globally)
+        if self.non_crossing:
+            predictions = self._apply_non_crossing(predictions)
+        return predictions
+
+    def _apply_phantom_gating(self, predictions: Dict[int, Dict[float, np.ndarray]], last_se: str = None) -> Dict[int, Dict[float, np.ndarray]]:
+        """v3: clamp q95 para evitar phantom 5-10x mediana em calma.
+        Usa regime futuro (mes) igual recal: calm max_factor 3.5, outbreak 4.0.
+        Clamp em casos escala, depois volta para log, e re-aplica non_crossing.
+        """
+        cfg = self.config.get('phantom_gating', {})
+        calm_fac = float(cfg.get('calm_q95_max_factor', 3.5))
+        out_fac = float(cfg.get('outbreak_q95_max_factor', 4.0))
+        from data.epiweeks import epiweek_to_date, date_to_epiweek
+        outbreak_months = self.config.get('epidemiological_periods', {}).get('outbreak_months', [10,11,12,1,2,3,4,5])
+        for horizon in list(predictions.keys()):
+            if 0.5 not in predictions[horizon] or 0.95 not in predictions[horizon]:
+                continue
+            # determina regime da semana futura
+            is_outbreak = True  # default conservador
+            if last_se:
+                try:
+                    ls = str(last_se).zfill(6)
+                    y = int(ls[:4]); w = int(ls[4:])
+                    fut_date = epiweek_to_date(y, w) + __import__('pandas').Timedelta(weeks=int(horizon))
+                    fut_se = date_to_epiweek(fut_date)
+                    fut_month = epiweek_to_date(int(fut_se[:4]), int(fut_se[4:])).month
+                    is_outbreak = fut_month in outbreak_months
+                except Exception:
+                    is_outbreak = True
+            fac = out_fac if is_outbreak else calm_fac
+            log_med = predictions[horizon][0.5]
+            log_q95 = predictions[horizon][0.95]
+            med_cases = np.expm1(log_med)
+            q95_cases = np.expm1(log_q95)
+            # cap = median * factor, mas nunca abaixo da mediana+5 e nunca abaixo do q95 se já estiver baixo
+            cap_cases = np.maximum(med_cases * fac, med_cases + 5)
+            # aplica clamp onde excede
+            exceeded = q95_cases > cap_cases
+            if np.any(exceeded):
+                q95_cases_clamped = np.where(exceeded, cap_cases, q95_cases)
+                predictions[horizon][0.95] = np.log1p(np.maximum(0, q95_cases_clamped))
+                logger.info(f"h{horizon} phantom gating ({'outbreak' if is_outbreak else 'calm'}): {int(exceeded.sum())} clamped to median*{fac} (max {float(np.max(q95_cases)):.0f}->{float(np.max(q95_cases_clamped)):.0f})")
         if self.non_crossing:
             predictions = self._apply_non_crossing(predictions)
         return predictions

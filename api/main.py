@@ -48,11 +48,11 @@ app.add_middleware(
 # Global inference engine
 inference_engine: Optional[EpisenseInference] = None
 
-# Simple in-memory cache for API data (5 min TTL)
+# Simple in-memory cache for API data (60s TTL - atualizado a cada abertura do site, não estático)
 _data_cache = {
     'df': None,
     'timestamp': 0,
-    'ttl': 300  # 5 minutes
+    'ttl': 60
 }
 
 # Config constants
@@ -66,35 +66,79 @@ TARGET_HORIZONS = config['targets']['horizons']
 
 
 def _fetch_infodengue() -> pd.DataFrame:
-    """Fetch latest dengue data from InfoDengue API directly (no CSV storage)."""
+    """Fetch dengue data: InfoDengue API retorna apenas ~3 semanas recentes.
+    Para histórico completo (S18+ correto), carrega full history local
+    (infodengue_cg_full.csv) e mescla fresh em memória. Sempre atualizado
+    a cada request (TTL 60s), não estático.
+    """
     url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
-    logger.info(f"Fetching InfoDengue data from {url}")
-    
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    
-    data = response.json()
-    df = pd.DataFrame(data)
-    logger.info(f"Downloaded {len(df)} rows from InfoDengue")
-    
-    # Keep only needed columns
-    keep_cols = ['SE', 'casos', 'casos_est']
-    available_cols = [c for c in keep_cols if c in df.columns]
-    df = df[available_cols].copy()
-    
-    df['SE'] = df['SE'].astype(str).str.zfill(6)
-    df['ano'] = df['SE'].str[:4].astype(int)
-    df['semana'] = df['SE'].str[4:].astype(int)
-    
-    if 'casos' in df.columns:
-        df['casos'] = pd.to_numeric(df['casos'], errors='coerce').fillna(0).astype(int)
-    
-    df = df.sort_values('SE').reset_index(drop=True)
-    return df
+    # full history local
+    full_path = Path("data/raw/infodengue/infodengue_cg_full.csv")
+    df_full = None
+    if full_path.exists():
+        try:
+            tmp = pd.read_csv(full_path, dtype={"SE": str})
+            keep_full = [c for c in ['SE', 'casos', 'casos_est'] if c in tmp.columns]
+            tmp = tmp[keep_full].copy()
+            tmp['SE'] = tmp['SE'].astype(str).str.replace(".0","", regex=False).str.zfill(6)
+            if 'casos' in tmp.columns:
+                tmp['casos'] = pd.to_numeric(tmp['casos'], errors='coerce').fillna(0).astype(int)
+            if 'casos_est' in tmp.columns:
+                tmp['casos_est'] = pd.to_numeric(tmp['casos_est'], errors='coerce').fillna(0)
+            df_full = tmp.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
+            logger.info(f"[api live] full history {len(df_full)} rows {df_full['SE'].min()}-{df_full['SE'].max()}")
+        except Exception as e:
+            logger.warning(f"[api live] failed load full {e}")
+            df_full = None
+    logger.info(f"Fetching InfoDengue fresh from {url}")
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        df_fresh = pd.DataFrame(data)
+        if df_fresh.empty:
+            if df_full is not None and not df_full.empty:
+                df = df_full.copy()
+                df['SE'] = df['SE'].astype(str).str.zfill(6)
+                df['ano'] = df['SE'].str[:4].astype(int)
+                df['semana'] = df['SE'].str[4:].astype(int)
+                return df.sort_values('SE').reset_index(drop=True)
+            logger.warning("Empty fresh and no full")
+            return df_fresh
+        keep_cols = ['SE', 'casos', 'casos_est']
+        available_cols = [c for c in keep_cols if c in df_fresh.columns]
+        df_fresh = df_fresh[available_cols].copy()
+        df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
+        df_fresh['ano'] = df_fresh['SE'].str[:4].astype(int)
+        df_fresh['semana'] = df_fresh['SE'].str[4:].astype(int)
+        if 'casos' in df_fresh.columns:
+            df_fresh['casos'] = pd.to_numeric(df_fresh['casos'], errors='coerce').fillna(0).astype(int)
+        if df_full is not None and not df_full.empty:
+            df_full['SE'] = df_full['SE'].astype(str).str.zfill(6)
+            df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
+            df_full_filtered = df_full[~df_full['SE'].isin(df_fresh['SE'])]
+            df_merged = pd.concat([df_full_filtered, df_fresh], ignore_index=True)
+            df_merged = df_merged.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
+            df_merged['ano'] = df_merged['SE'].str[:4].astype(int)
+            df_merged['semana'] = df_merged['SE'].str[4:].astype(int)
+            logger.info(f"[api live] merged {len(df_full)} + {len(df_fresh)} -> {len(df_merged)} fresh {sorted(df_fresh['SE'].tolist())}")
+            return df_merged
+        df_fresh = df_fresh.sort_values('SE').reset_index(drop=True)
+        logger.info(f"Downloaded {len(df_fresh)} rows fresh (no full to merge)")
+        return df_fresh
+    except Exception as e:
+        logger.warning(f"[api live] fresh fetch failed {e}, fallback full")
+        if df_full is not None and not df_full.empty:
+            df = df_full.copy()
+            df['SE'] = df['SE'].astype(str).str.zfill(6)
+            df['ano'] = df['SE'].str[:4].astype(int)
+            df['semana'] = df['SE'].str[4:].astype(int)
+            return df.sort_values('SE').reset_index(drop=True)
+        raise
 
 
 def _fetch_openmeteo() -> pd.DataFrame:
-    """Fetch latest weather data from OpenMeteo API directly (no CSV storage)."""
+    """Fetch latest weather data from OpenMeteo API directly (no CSV storage). Com retry 429 e fallback local."""
     # Get last ~171 weeks (1200 days) of daily data — suficiente para 156 semanas (lags/rolling + cobertura minima)
     end_date = datetime.now().date()
     start_date = end_date - timedelta(days=1200)
@@ -109,8 +153,43 @@ def _fetch_openmeteo() -> pd.DataFrame:
     }
     
     logger.info(f"Fetching OpenMeteo data from {OPENMETEO_URL}")
-    response = requests.get(OPENMETEO_URL, params=params, timeout=60)
-    response.raise_for_status()
+    # Retry com backoff para 429 (rate limit) - crucial para não dar 500
+    last_exc = None
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.get(OPENMETEO_URL, params=params, timeout=60)
+            response.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            status = getattr(getattr(e, 'response', None), 'status_code', None) or getattr(response, 'status_code', None)
+            if status == 429 and attempt < 2:
+                wait = 2 ** attempt * 5  # 5s, 10s
+                logger.warning(f"OpenMeteo 429 rate limit, retry {attempt+1}/3 em {wait}s")
+                time.sleep(wait)
+                continue
+            # Se não é 429 ou última tentativa, tenta fallback antes de propagar
+            if attempt == 2:
+                break
+            raise
+    if response is None or (hasattr(response, 'status_code') and response.status_code != 200):
+        # Se ainda falhou após retries, tenta fallback local
+        logger.warning(f"OpenMeteo falhou após retries ({last_exc}), tentando fallback local")
+        try:
+            from data.collect_openmeteo import latest_weekly_file
+            from pathlib import Path
+            wf = latest_weekly_file(Path("data/raw/openmeteo"))
+            if wf and wf.exists():
+                logger.info(f"Fallback OpenMeteo local: {wf}")
+                df_fallback = pd.read_csv(wf, dtype={"SE": str})
+                df_fallback["SE"] = df_fallback["SE"].astype(str).str.zfill(6)
+                return df_fallback.sort_values("SE").reset_index(drop=True)
+        except Exception as fe:
+            logger.warning(f"Fallback local também falhou: {fe}")
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("OpenMeteo falhou sem resposta")
     
     data = response.json()
     daily = data.get('daily', {})
@@ -206,13 +285,12 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
     merged['semana'] = merged['SE'].str[4:].astype(int)
     
     # NOWCAST: treino usa casos puro, inferencia usa nowcast nas ultimas 12 semanas
-    # Aplica max(casos, casos_est) apenas nas ultimas 12 linhas (janela nowcast) ordenadas por SE
+    # Aplica max(casos, casos_est) SEMPRE (antes só últimas 12, deixava 202633/202634 com 0)
     if 'casos_est' in merged.columns:
         merged = merged.sort_values('SE').reset_index(drop=True)
         merged['casos'] = pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
         merged['casos_est'] = pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-        n = len(merged)
-        mask = (merged['casos_est'] > merged['casos']) & (merged.index >= n - 12)
+        mask = (merged['casos_est'] > merged['casos'])
         if mask.any():
             merged.loc[mask, 'casos'] = np.round(merged.loc[mask, 'casos_est']).astype(int)
             logger.info(f"Nowcast substitution: {mask.sum()} weeks updated (janela 12 semanas)")
@@ -311,9 +389,11 @@ class PredictionResponse(BaseModel):
     horizonte_semanas: int = Field(..., description="Prediction horizon in weeks (1-8)")
     semana_epidemiologica: str = Field(..., description="Epidemiological week in YYYYWW format")
     casos_previstos: int = Field(..., description="Predicted number of dengue cases (median q0.50)")
-    q05: int = Field(..., description="Quantile 0.05 lower bound")
+    q05: int = Field(..., description="Quantile 0.05 lower bound 90%")
+    q25: int = Field(..., description="Quantile 0.25 lower bound 50%")
     q50: int = Field(..., description="Quantile 0.50 median")
-    q95: int = Field(..., description="Quantile 0.95 upper bound")
+    q75: int = Field(..., description="Quantile 0.75 upper bound 50%")
+    q95: int = Field(..., description="Quantile 0.95 upper bound 90%")
     alerta: str = Field(..., description="Alert level: baixo, medio, alto, critico")
 
 
@@ -399,24 +479,35 @@ async def predict(request: Request):
         for horizon in sorted(predictions.keys()):
             pred = predictions[horizon]
             quantis = pred.get('quantis', {})
-            # quantis keys like q0050, q0500, q0950
-            q05 = quantis.get('q0050', pred['casos_previstos'])
-            q50 = quantis.get('q0500', pred['casos_previstos'])
-            q95 = quantis.get('q0950', pred['casos_previstos'])
-            # fallback for dict with float keys if needed
-            if q05 == pred['casos_previstos'] and 'quantis' in pred:
-                # try alternative keys
-                for k,v in quantis.items():
-                    if '0050' in k: q05=v
-                    if '0500' in k: q50=v
-                    if '0950' in k: q95=v
+            q05 = quantis.get('q0050', quantis.get('q0025', pred['casos_previstos'])) if 'q0050' in quantis else pred['casos_previstos']
+            # try all variants
+            # normalize: check for 5q keys
+            def get_q(key_variants, default):
+                for kv in key_variants:
+                    if kv in quantis:
+                        return quantis[kv]
+                return default
+            q05 = get_q(['q0050','q05','0.05',0.05], pred['casos_previstos'])
+            q25 = get_q(['q0250','q25','0.25',0.25], q05)
+            q50 = get_q(['q0500','q50','0.5',0.5], pred['casos_previstos'])
+            q75 = get_q(['q0750','q75','0.75',0.75], q95 if 'q95' in locals() else pred['casos_previstos'])
+            q95 = get_q(['q0950','q95','0.95',0.95], pred['casos_previstos'])
+            # fallback direct dict if quantis uses float keys
+            if isinstance(quantis, dict) and any(isinstance(k,float) for k in quantis.keys()):
+                q05 = quantis.get(0.05, q05)
+                q25 = quantis.get(0.25, q25)
+                q50 = quantis.get(0.5, q50)
+                q75 = quantis.get(0.75, q75)
+                q95 = quantis.get(0.95, q95)
             previsoes.append(PredictionResponse(
                 horizonte_semanas=pred['horizonte_semanas'],
                 semana_epidemiologica=pred['semana_epidemiologica'],
                 casos_previstos=pred['casos_previstos'],
-                q05=int(q05),
-                q50=int(q50),
-                q95=int(q95),
+                q05=int(q05) if q05 is not None else 0,
+                q25=int(q25) if q25 is not None else int(q05) if q05 is not None else 0,
+                q50=int(q50) if q50 is not None else 0,
+                q75=int(q75) if q75 is not None else int(q95) if q95 is not None else 0,
+                q95=int(q95) if q95 is not None else 0,
                 alerta=pred['alerta']
             ))
         
