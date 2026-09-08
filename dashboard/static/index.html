@@ -270,7 +270,22 @@ function buildYearPills(){
     {se:'202436',type:'start',label:'2024S36'},
     {se:'202537',type:'start',label:'2025S37'},
   ];
-  function weeksInYear(y){ return (y===2014||y===2020||y===2025)?53:52; }
+  function weeksInYear(y){
+    // Calendário brasileiro: semana 1 contém 4/jan, semana começa domingo.
+    // Replica data/epiweeks.py weeks_in_year dinamicamente — nunca hardcode [2014,2020,2025]
+    function w1Sunday(year){
+      const jan4 = new Date(year, 0, 4);
+      const dow = jan4.getDay(); // 0 Sun ..6 Sat = dias desde domingo
+      const w1 = new Date(jan4);
+      w1.setDate(jan4.getDate() - dow);
+      w1.setHours(0,0,0,0);
+      return w1;
+    }
+    const w1 = w1Sunday(y);
+    const w1Next = w1Sunday(y+1);
+    const diffDays = (w1Next - w1) / (1000*60*60*24);
+    return Math.round(diffDays/7);
+  }
   function seToAbsIdx(se){
     const s=String(se); const y=parseInt(s.slice(0,4),10), w=parseInt(s.slice(4),10);
     let idx=w-1; for(let yy=MIN; yy<y; yy++) idx+=weeksInYear(yy);

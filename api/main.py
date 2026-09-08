@@ -18,6 +18,13 @@ from datetime import datetime, timedelta
 import requests
 from io import StringIO
 import time
+import threading
+from threading import Lock
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    HAS_SCHEDULER = True
+except ImportError:
+    HAS_SCHEDULER = False
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -54,6 +61,7 @@ _data_cache = {
     'timestamp': 0,
     'ttl': 60
 }
+_data_cache_lock = Lock()
 
 # Config constants
 GEOCODE = config['project']['geocode']
@@ -63,6 +71,8 @@ LAT = config['data_sources']['openmeteo']['latitude']
 LON = config['data_sources']['openmeteo']['longitude']
 TIMEZONE = config['data_sources']['openmeteo']['timezone']
 TARGET_HORIZONS = config['targets']['horizons']
+# Single source of truth for nowcast window (also in data/live_utils.py and config.yaml)
+from data.live_utils import NOWCAST_WINDOW, apply_nowcast, anchor_guard_filter
 
 
 def _fetch_infodengue() -> pd.DataFrame:
@@ -138,10 +148,16 @@ def _fetch_infodengue() -> pd.DataFrame:
 
 
 def _fetch_openmeteo() -> pd.DataFrame:
-    """Fetch latest weather data from OpenMeteo API directly (no CSV storage). Com retry 429 e fallback local."""
-    # Get last ~171 weeks (1200 days) of daily data — suficiente para 156 semanas (lags/rolling + cobertura minima)
-    end_date = datetime.now().date()
+    """Fetch latest weather data from OpenMeteo API directly (no CSV storage). Com retry 429 e fallback local.
+    Anchor guard parity: busca até último sábado completo (não hoje incompleto) e conta clima_dias por SE.
+    """
+    # Anchor guard: último sábado completo estritamente antes de hoje (paridade com data/process_data.py)
+    today = datetime.now().date()
+    raw = (today.weekday() - 5) % 7
+    days_ago = 7 if raw == 0 else raw
+    end_date = today - timedelta(days=days_ago)
     start_date = end_date - timedelta(days=1200)
+    logger.info(f"[anchor guard] OpenMeteo end_date ajustado para último sábado completo: {end_date} (hoje {today})")
     
     params = {
         'latitude': LAT,
@@ -205,37 +221,37 @@ def _fetch_openmeteo() -> pd.DataFrame:
     # Aggregate to epidemiological weeks (Brazilian calendar - Sunday start)
     from data.epiweeks import date_to_epiweek
     
-    df['SE'] = df['date'].apply(lambda d: date_to_epiweek(d))
-    df['SE'] = df['SE'].astype(str).str.zfill(6)
-    df['ano'] = df['SE'].str[:4].astype(int)
-    df['semana'] = df['SE'].str[4:].astype(int)
-    
-    # Weekly aggregation
-    agg_dict = {}
-    for col in df.columns:
-        if col in ['date', 'SE', 'ano', 'semana']:
-            continue
-        if 'precip' in col.lower() or 'precipitation' in col.lower():
-            agg_dict[col] = 'sum'
-        elif 'wind' in col.lower() or 'speed' in col.lower():
-            agg_dict[col] = 'max'
-        else:
-            agg_dict[col] = 'mean'
-    
-    weekly = df.groupby(['SE', 'ano', 'semana']).agg(agg_dict).reset_index()
-    
-    # Rename columns to match expected names
-    rename_map = {
+    # Usa mesma agregação que data/collect_openmeteo.py para paridade treino/live
+    from data.collect_openmeteo import aggregate_to_weekly
+    # Renomeia antes para aggregate_to_weekly esperar nomes limpos
+    rename_pre = {
         'temperature_2m_max': 'temp_max',
         'temperature_2m_min': 'temp_min',
         'temperature_2m_mean': 'temp_mean',
-        'precipitation_sum': 'precip_total',
-        'relative_humidity_2m_mean': 'humidity_mean',
+        'precipitation_sum': 'precip',
+        'relative_humidity_2m_mean': 'humidity',
         'wind_speed_10m_max': 'wind_max'
     }
-    weekly = weekly.rename(columns=rename_map)
-    
-    weekly = weekly.sort_values('SE').reset_index(drop=True)
+    df = df.rename(columns=rename_pre)
+    # conta dias por SE antes de agregar (para anchor guard)
+    from data.epiweeks import date_to_epiweek as _d2e
+    tmp_se = df['date'].apply(lambda d: _d2e(d)).astype(str).str.zfill(6)
+    clima_dias = tmp_se.value_counts().to_dict()
+    weekly = aggregate_to_weekly(df)
+    weekly['SE'] = weekly['SE'].astype(str).str.zfill(6)
+    # weekly já tem week_start/week_end para dias calc, mas garante clima_dias
+    weekly['clima_dias'] = weekly['SE'].map(clima_dias)
+    # filtra semanas parciais
+    while len(weekly) > 1:
+        last_se = weekly.iloc[-1]['SE']
+        days = clima_dias.get(last_se, 0)
+        if pd.isna(days) or int(days) < 7:
+            motivo = 'clima ausente' if pd.isna(days) else f'clima parcial ({int(days)}/7 dias)'
+            logger.warning(f"Anchor guard (OpenMeteo): SE {last_se} removida ({motivo}) - ancora recua")
+            weekly = weekly.iloc[:-1]
+            clima_dias.pop(last_se, None)
+        else:
+            break
     logger.info(f"Aggregated weather to {len(weekly)} epidemiological weeks")
     return weekly
 
@@ -269,6 +285,26 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
     all_weeks_df['SE'] = all_weeks_df['SE'].astype(str).str.zfill(6)
     
     merged = pd.merge(all_weeks_df, merged, on='SE', how='left')
+
+    # ANCHOR GUARD: paridade com data/process_data.py — dropa última SE com clima parcial (<7 dias) via shared helper
+    clima_dias = None
+    if not weather_df.empty and 'clima_dias' in weather_df.columns:
+        clima_dias = dict(zip(weather_df['SE'].astype(str).str.zfill(6), weather_df['clima_dias']))
+    elif not weather_df.empty and 'clima_dias' in merged.columns:
+        clima_dias = dict(zip(merged['SE'].astype(str).str.zfill(6), merged['clima_dias']))
+    elif 'week_start' in merged.columns and 'week_end' in merged.columns:
+        try:
+            dias = (pd.to_datetime(merged['week_end']) - pd.to_datetime(merged['week_start'])).dt.days + 1
+            clima_dias = dict(zip(merged['SE'].astype(str).str.zfill(6), dias))
+        except Exception:
+            clima_dias = None
+    elif not weather_df.empty and 'week_start' in weather_df.columns and 'week_end' in weather_df.columns:
+        try:
+            dias = (pd.to_datetime(weather_df['week_end']) - pd.to_datetime(weather_df['week_start'])).dt.days + 1
+            clima_dias = dict(zip(weather_df['SE'].astype(str).str.zfill(6), dias))
+        except Exception:
+            clima_dias = None
+    merged = anchor_guard_filter(merged, clima_dias) if clima_dias else merged
     
     # Fill missing cases with 0
     if 'casos' in merged.columns:
@@ -284,16 +320,9 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
     merged['ano'] = merged['SE'].str[:4].astype(int)
     merged['semana'] = merged['SE'].str[4:].astype(int)
     
-    # NOWCAST: treino usa casos puro, inferencia usa nowcast nas ultimas 12 semanas
-    # Aplica max(casos, casos_est) SEMPRE (antes só últimas 12, deixava 202633/202634 com 0)
-    if 'casos_est' in merged.columns:
-        merged = merged.sort_values('SE').reset_index(drop=True)
-        merged['casos'] = pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
-        merged['casos_est'] = pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-        mask = (merged['casos_est'] > merged['casos'])
-        if mask.any():
-            merged.loc[mask, 'casos'] = np.round(merged.loc[mask, 'casos_est']).astype(int)
-            logger.info(f"Nowcast substitution: {mask.sum()} weeks updated (janela 12 semanas)")
+    # NOWCAST: casos_est substitui casos onde casos_est > casos apenas nas últimas NOWCAST_WINDOW semanas
+    # Treino usa casos puro; live corrige atraso de notificação (InfoDengue nowcast) nas últimas SEs
+    merged = apply_nowcast(merged, window=NOWCAST_WINDOW)
     
     # Base features for feature engineering compatibility
     merged['log_casos'] = np.log1p(merged['casos'])
@@ -343,13 +372,17 @@ def _merge_and_prepare(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.
 
 
 def _get_latest_engineered_data() -> pd.DataFrame:
-    """Get fully engineered features, cached for 5 minutes."""
+    """Get fully engineered features, cached for 60s. Usa _ensure_fresh_data para rebuild automático."""
     global _data_cache
-    
+    try:
+        _ensure_fresh_data()
+    except Exception:
+        pass
     now = time.time()
-    if _data_cache['df'] is not None and (now - _data_cache['timestamp']) < _data_cache['ttl']:
-        logger.info("Using cached engineered data")
-        return _data_cache['df']
+    with _data_cache_lock:
+        if _data_cache['df'] is not None and (now - _data_cache['timestamp']) < _data_cache['ttl']:
+            logger.info("Using cached engineered data")
+            return _data_cache['df']
     
     logger.info("Fetching fresh data from APIs...")
     
@@ -377,12 +410,178 @@ def _get_latest_engineered_data() -> pd.DataFrame:
         legacy_mode=False
     )
     
-    # Cache
-    _data_cache['df'] = engineered
-    _data_cache['timestamp'] = now
+    # Cache (thread-safe)
+    with _data_cache_lock:
+        _data_cache['df'] = engineered
+        _data_cache['timestamp'] = now
     
     logger.info(f"Engineered data shape: {engineered.shape}, latest SE: {engineered.iloc[-1].get('SE', 'N/A')}")
     return engineered
+
+
+ROOT = Path(__file__).parent.parent
+_last_refresh_check = 0
+_refresh_lock = Lock()
+_refresh_cooldown = 60  # seconds between checks
+_last_fetch = 0
+_fetch_cooldown = 900  # 15 min between external API fetches
+_fetch_lock = Lock()
+_fetch_last_error = None
+_fetch_stale = False
+
+def _get_raw_max_se() -> str:
+    """Max SE in raw infodengue full (or latest timestamped)."""
+    try:
+        raw_full = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+        if raw_full.exists():
+            df = pd.read_csv(raw_full, usecols=["SE"], dtype={"SE": str})
+            return str(df["SE"].astype(str).str.zfill(6).max())
+        import glob
+        files = list((ROOT / "data/raw/infodengue").glob("infodengue_cg_*.csv"))
+        if files:
+            latest = max(files, key=lambda p: p.stat().st_mtime)
+            df = pd.read_csv(latest, usecols=["SE"], dtype={"SE": str})
+            return str(df["SE"].astype(str).str.zfill(6).max())
+    except Exception as e:
+        logger.warning(f"_get_raw_max_se failed: {e}")
+    return "0"
+
+def _get_base_max_se() -> str:
+    try:
+        base_path = ROOT / "data/processed/episense_base.csv"
+        if base_path.exists():
+            df = pd.read_csv(base_path, usecols=["SE"], dtype={"SE": str})
+            if not df.empty:
+                return str(df["SE"].astype(str).str.zfill(6).max())
+    except Exception:
+        pass
+    return "0"
+
+def _fetch_fresh_raw():
+    """Fetch latest InfoDengue + OpenMeteo directly from external APIs and update raw CSVs.
+    Called from _ensure_fresh_data when fetch cooldown expired. 15min cooldown.
+    """
+    global _last_fetch, _fetch_last_error, _fetch_stale
+    now = time.time()
+    if now - _last_fetch < _fetch_cooldown:
+        return False
+    if not _fetch_lock.acquire(blocking=False):
+        return False
+    try:
+        if time.time() - _last_fetch < _fetch_cooldown:
+            return False
+        _last_fetch = time.time()
+        fetched = False
+        infodengue_error = None
+        openmeteo_error = None
+        try:
+            from data.collect_infodengue import collect_infodengue_data, process_infodengue_data, update_full_history, save_infodengue_data
+            logger.info("Fetching fresh InfoDengue from external API (on-demand)...")
+            df_raw = collect_infodengue_data()
+            if df_raw is not None and not df_raw.empty:
+                df_proc = process_infodengue_data(df_raw)
+                if not df_proc.empty:
+                    full_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+                    df_full = update_full_history(df_proc, full_path)
+                    df_full.to_csv(full_path, index=False)
+                    try:
+                        save_infodengue_data(df_proc)
+                    except Exception:
+                        pass
+                    logger.info(f"InfoDengue fresh fetched: {len(df_proc)} rows range {df_proc['SE'].min()}-{df_proc['SE'].max()} full {len(df_full)}")
+                    fetched = True
+                else:
+                    infodengue_error = RuntimeError("InfoDengue processing returned empty")
+            else:
+                infodengue_error = RuntimeError("InfoDengue fetch empty")
+        except Exception as e:
+            infodengue_error = e
+            _fetch_last_error = str(e)
+            logger.error(f"InfoDengue on-demand fetch failed: {e}", exc_info=True)
+        try:
+            from data.collect_openmeteo import collect_openmeteo_data, aggregate_to_weekly, save_openmeteo_data
+            logger.info("Fetching fresh OpenMeteo from external API (on-demand)...")
+            df_daily = collect_openmeteo_data()
+            if df_daily is not None and not df_daily.empty:
+                df_weekly = aggregate_to_weekly(df_daily)
+                if not df_weekly.empty:
+                    try:
+                        from datetime import datetime as _dt
+                        end_date = _dt.now().strftime("%Y-%m-%d")
+                        save_openmeteo_data(df_daily, df_weekly, "2010-01-01", end_date)
+                    except Exception as e:
+                        logger.warning(f"save_openmeteo failed: {e}")
+                    logger.info(f"OpenMeteo fresh fetched: {len(df_daily)} daily -> {len(df_weekly)} weeks {df_weekly['SE'].min()}-{df_weekly['SE'].max()}")
+                    fetched = True
+                else:
+                    openmeteo_error = RuntimeError("OpenMeteo weekly empty")
+            else:
+                openmeteo_error = RuntimeError("OpenMeteo daily empty")
+        except Exception as e:
+            openmeteo_error = e
+            _fetch_last_error = str(e)
+            logger.error(f"OpenMeteo on-demand fetch failed: {e}", exc_info=True)
+        if not fetched:
+            _fetch_stale = True
+            _fetch_last_error = _fetch_last_error or f"InfoDengue: {infodengue_error}, OpenMeteo: {openmeteo_error}"
+            logger.error(f"_fetch_fresh_raw: ambas as fontes falharam (InfoDengue: {infodengue_error}, OpenMeteo: {openmeteo_error}) — dados stale")
+        else:
+            _fetch_stale = False
+            _fetch_last_error = None
+        return fetched
+    finally:
+        try:
+            _fetch_lock.release()
+        except: pass
+
+def _ensure_fresh_data():
+    """On-demand refresh (no cron) — called at start of each request.
+    If raw infodengue has newer SE than processed base (raw_max > base_max), rebuild base via processor.
+    Debounced 60s, thread-safe, week_start/week_end anchor guard already in _merge_and_prepare.
+    """
+    global _last_refresh_check
+    now = time.time()
+    if now - _last_refresh_check < _refresh_cooldown:
+        return
+    with _refresh_lock:
+        if time.time() - _last_refresh_check < _refresh_cooldown:
+            return
+        _last_refresh_check = time.time()
+        try:
+            try:
+                _fetch_fresh_raw()
+            except Exception as fe:
+                logger.warning(f"fetch fresh raw failed (continuing with local raw): {fe}")
+            raw_max = _get_raw_max_se()
+            base_max = _get_base_max_se()
+            raw_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
+            base_path = ROOT / "data/processed/episense_base.csv"
+            raw_mtime = raw_path.stat().st_mtime if raw_path.exists() else 0
+            base_mtime = base_path.stat().st_mtime if base_path.exists() else 0
+            need_rebuild = False
+            reason = ""
+            if raw_max > base_max:
+                need_rebuild = True
+                reason = f"raw {raw_max} > base {base_max}"
+            elif raw_mtime > base_mtime + 5:
+                need_rebuild = True
+                reason = f"raw mtime {raw_mtime} > base {base_mtime} (possible revisao)"
+            if not need_rebuild:
+                return
+            logger.info(f"On-demand refresh triggered: {reason} — rebuilding episense_base.csv")
+            from data.process_data import EpisenseDataProcessor
+            proc = EpisenseDataProcessor()
+            df_new = proc.run_full_pipeline()
+            if df_new is None or df_new.empty:
+                logger.warning("Processor returned empty, abort refresh")
+                return
+            # invalidate live cache
+            global _data_cache
+            _data_cache['df'] = None
+            _data_cache['timestamp'] = 0
+            logger.info(f"On-demand refresh done: base {base_max} -> {str(df_new['SE'].max()).zfill(6)}")
+        except Exception as e:
+            logger.warning(f"_ensure_fresh_data failed: {e}", exc_info=True)
 
 
 class PredictionResponse(BaseModel):
@@ -410,10 +609,32 @@ class HealthResponse(BaseModel):
     data_source: str
 
 
+_scheduler = None
+
+def _scheduled_refresh():
+    """Job semanal automático: busca InfoDengue/OpenMeteo frescos e rebuilda base se nova SE."""
+    try:
+        logger.info("[scheduler] Verificando nova SE InfoDengue (agendado)")
+        # força fetch fresco ignorando cooldown para job agendado
+        global _last_fetch
+        _last_fetch = 0
+        try:
+            _fetch_fresh_raw()
+        except Exception as e:
+            logger.warning(f"[scheduler] fetch_fresh_raw falhou: {e}")
+        _ensure_fresh_data()
+        # invalida cache live para próxima requisição usar dados novos
+        with _data_cache_lock:
+            _data_cache['df'] = None
+            _data_cache['timestamp'] = 0
+        logger.info("[scheduler] Refresh concluído")
+    except Exception as e:
+        logger.error(f"[scheduler] Erro: {e}", exc_info=True)
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize inference engine on startup."""
-    global inference_engine
+    global inference_engine, _scheduler
     logger.info("Starting Episense API (Production - No CSV)...")
     
     try:
@@ -422,6 +643,28 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to load inference engine: {e}")
         inference_engine = None
+
+    # Agendamento automático semanal (seg 06:05 + diário 06:05 para capturar revisões)
+    if HAS_SCHEDULER:
+        try:
+            _scheduler = BackgroundScheduler(timezone=config['data_sources']['openmeteo'].get('timezone', 'America/Campo_Grande'))
+            _scheduler.add_job(_scheduled_refresh, 'cron', day_of_week='mon', hour=6, minute=5, id='weekly_refresh')
+            _scheduler.add_job(_scheduled_refresh, 'cron', hour=6, minute=10, id='daily_refresh')
+            _scheduler.start()
+            logger.info("Scheduler iniciado: weekly seg 06:05 + daily 06:10")
+        except Exception as e:
+            logger.warning(f"Scheduler não iniciado: {e}")
+    else:
+        logger.warning("APScheduler não disponível, atualização depende de requisições on-demand")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _scheduler
+    if _scheduler:
+        try:
+            _scheduler.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -450,9 +693,9 @@ async def predict(request: Request):
     if not geocode:
         raise HTTPException(status_code=422, detail="geocode required (JSON body)")
     
-    # Validate geocode
-    expected_geocode = config['project']['geocode']
-    if geocode != expected_geocode:
+    # Validate geocode (accept int or string, compare zfill 7)
+    expected_geocode = str(config['project']['geocode']).zfill(7)
+    if str(geocode).zfill(7) != expected_geocode:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid geocode. Expected {expected_geocode} for Campo Grande, MS"
@@ -490,8 +733,9 @@ async def predict(request: Request):
             q05 = get_q(['q0050','q05','0.05',0.05], pred['casos_previstos'])
             q25 = get_q(['q0250','q25','0.25',0.25], q05)
             q50 = get_q(['q0500','q50','0.5',0.5], pred['casos_previstos'])
-            q75 = get_q(['q0750','q75','0.75',0.75], q95 if 'q95' in locals() else pred['casos_previstos'])
             q95 = get_q(['q0950','q95','0.95',0.95], pred['casos_previstos'])
+            # FIX Bug6: q95 definido antes de q75; fallback explícito para q95 (paridade com treino q0950)
+            q75 = get_q(['q0750','q75','0.75',0.75], q95)
             # fallback direct dict if quantis uses float keys
             if isinstance(quantis, dict) and any(isinstance(k,float) for k in quantis.keys()):
                 q05 = quantis.get(0.05, q05)
@@ -520,8 +764,8 @@ async def predict(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        logger.error(f"Prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Prediction failed")
 
 
 @app.get("/predict/{geocode}", response_model=PredictResponse)
@@ -566,14 +810,22 @@ async def get_metrics():
                     return [clean_nan(v) for v in obj]
                 return obj
             metrics = clean_nan(metrics)
+            # Remove MaxAE if present (not to be exposed)
+            def strip_maxae(obj):
+                if isinstance(obj, dict):
+                    return {k: strip_maxae(v) for k, v in obj.items() if k.lower() != "maxae"}
+                elif isinstance(obj, list):
+                    return [strip_maxae(v) for v in obj]
+                return obj
+            metrics = strip_maxae(metrics)
             return metrics
         else:
             raise HTTPException(status_code=404, detail="Metrics not found")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Metrics error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load metrics: {str(e)}")
+        logger.error(f"Metrics error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load metrics")
 
 
 @app.get("/metadata")

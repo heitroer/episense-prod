@@ -1,5 +1,5 @@
 """Episense Dashboard - FastAPI"""
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -15,6 +15,11 @@ import threading
 from threading import Lock
 import logging
 from datetime import datetime, timedelta
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    HAS_SCHEDULER = True
+except ImportError:
+    HAS_SCHEDULER = False
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -127,9 +132,12 @@ _refresh_cooldown = 60  # seconds between checks
 _last_fetch = 0
 _fetch_cooldown = 900  # 15 min between external API fetches (infodengue+openmeteo)
 _fetch_lock = Lock()
+_fetch_last_error = None
+_fetch_stale = False
 _df_base_lock = Lock()
 # Live in-memory cache (same as API 8001) for dashboard forecast - 60s para garantir atualização a cada abertura do site (não estático)
 _live_cache = {'df': None, 'timestamp': 0, 'ttl': 60}
+_live_cache_lock = Lock()
 GEOCODE = config['project']['geocode']
 INFODENGUE_URL = config['data_sources']['infodengue']['base_url']
 OPENMETEO_URL = config['data_sources']['openmeteo']['base_url']
@@ -137,6 +145,7 @@ LAT = config['data_sources']['openmeteo']['latitude']
 LON = config['data_sources']['openmeteo']['longitude']
 TIMEZONE = config['data_sources']['openmeteo']['timezone']
 TARGET_HORIZONS = config['targets']['horizons']
+from data.live_utils import NOWCAST_WINDOW, apply_nowcast, anchor_guard_filter
 
 def _get_df_full():
     global _df_full_cache, _df_full_mtime
@@ -275,9 +284,9 @@ def _archive_forecast(origin_se: str):
 
 def _fetch_fresh_raw():
     """Fetch latest InfoDengue + OpenMeteo directly from external APIs and update raw CSVs.
-    Called from _ensure_fresh_data when fetch cooldown expired. Never throws.
+    Called from _ensure_fresh_data when fetch cooldown expired. Falhas são explícitas (error log + stale flag).
     """
-    global _last_fetch
+    global _last_fetch, _fetch_last_error, _fetch_stale
     now = time.time()
     if now - _last_fetch < _fetch_cooldown:
         return False
@@ -289,6 +298,8 @@ def _fetch_fresh_raw():
             return False
         _last_fetch = time.time()
         fetched = False
+        infodengue_error = None
+        openmeteo_error = None
         # --- InfoDengue ---
         try:
             from data.collect_infodengue import collect_infodengue_data, process_infodengue_data, update_full_history, save_infodengue_data
@@ -308,10 +319,14 @@ def _fetch_fresh_raw():
                     fetched = True
                 else:
                     logger.warning("InfoDengue fetch returned empty after processing")
+                    infodengue_error = RuntimeError("InfoDengue processing returned empty")
             else:
                 logger.warning("InfoDengue fetch empty or failed")
+                infodengue_error = RuntimeError("InfoDengue fetch empty")
         except Exception as e:
-            logger.warning(f"InfoDengue on-demand fetch failed: {e}")
+            infodengue_error = e
+            _fetch_last_error = str(e)
+            logger.error(f"InfoDengue on-demand fetch failed: {e}")
             import traceback; traceback.print_exc()
         # --- OpenMeteo ---
         try:
@@ -333,11 +348,22 @@ def _fetch_fresh_raw():
                     fetched = True
                 else:
                     logger.warning("OpenMeteo weekly empty")
+                    openmeteo_error = RuntimeError("OpenMeteo weekly empty")
             else:
                 logger.warning("OpenMeteo daily empty")
+                openmeteo_error = RuntimeError("OpenMeteo daily empty")
         except Exception as e:
-            logger.warning(f"OpenMeteo on-demand fetch failed: {e}")
+            openmeteo_error = e
+            _fetch_last_error = str(e)
+            logger.error(f"OpenMeteo on-demand fetch failed: {e}")
             import traceback; traceback.print_exc()
+        if not fetched:
+            _fetch_stale = True
+            _fetch_last_error = _fetch_last_error or f"InfoDengue: {infodengue_error}, OpenMeteo: {openmeteo_error}"
+            logger.error(f"_fetch_fresh_raw: ambas as fontes falharam (InfoDengue: {infodengue_error}, OpenMeteo: {openmeteo_error}) — dados stale, fallback local será usado; se fallback também indisponível caller deve levantar 503")
+        else:
+            _fetch_stale = False
+            _fetch_last_error = None
         return fetched
     finally:
         try:
@@ -421,8 +447,13 @@ def _fetch_infodengue_live() -> pd.DataFrame:
 
 def _fetch_openmeteo_live() -> pd.DataFrame:
     import requests, time
-    end_date = datetime.now().date()
+    # Anchor guard parity: último sábado completo estritamente antes de hoje
+    today = datetime.now().date()
+    raw = (today.weekday() - 5) % 7
+    days_ago = 7 if raw == 0 else raw
+    end_date = today - timedelta(days=days_ago)
     start_date = end_date - timedelta(days=1200)
+    logger.info(f"[anchor guard] OpenMeteo live end_date ajustado para último sábado completo: {end_date} (hoje {today})")
     params = {
         'latitude': LAT,
         'longitude': LON,
@@ -454,7 +485,7 @@ def _fetch_openmeteo_live() -> pd.DataFrame:
                 break
             raise
     if response is None or (hasattr(response, 'status_code') and response.status_code != 200):
-        logger.warning(f"[dashboard live] OpenMeteo falhou após retries ({last_exc}), fallback local")
+        logger.error(f"[dashboard live] OpenMeteo falhou após retries ({last_exc}), tentando fallback local")
         try:
             from data.collect_openmeteo import latest_weekly_file
             wf = latest_weekly_file(ROOT / "data/raw/openmeteo")
@@ -462,12 +493,13 @@ def _fetch_openmeteo_live() -> pd.DataFrame:
                 logger.info(f"[dashboard live] Fallback local {wf}")
                 df_fallback = pd.read_csv(wf, dtype={"SE": str})
                 df_fallback["SE"] = df_fallback["SE"].astype(str).str.zfill(6)
+                logger.warning(f"[dashboard live] Usando fallback local stale: {wf} — dados de clima podem estar desatualizados")
                 return df_fallback.sort_values("SE").reset_index(drop=True)
         except Exception as fe:
-            logger.warning(f"[dashboard live] Fallback falhou: {fe}")
+            logger.error(f"[dashboard live] Fallback local também falhou: {fe}")
         if last_exc:
-            # não propaga 429 como 500, retorna vazio para permitir merge só com dengue (nowcast ainda funciona)
-            logger.warning(f"[dashboard live] Retornando vazio para permitir merge dengue-only: {last_exc}")
+            # Falha explícita: fallback também falhou — retorna vazio mas marca stale para caller levantar 503 ou flag
+            logger.error(f"[dashboard live] OpenMeteo fresh e fallback falharam — retornando vazio (stale) para permitir merge dengue-only: {last_exc}")
             return pd.DataFrame()
     data = response.json()
     daily = data.get('daily', {})
@@ -478,31 +510,33 @@ def _fetch_openmeteo_live() -> pd.DataFrame:
     df['date'] = pd.to_datetime(df['time'])
     df = df.drop(columns=['time'])
     from data.epiweeks import date_to_epiweek
-    df['SE'] = df['date'].apply(lambda d: date_to_epiweek(d))
-    df['SE'] = df['SE'].astype(str).str.zfill(6)
-    df['ano'] = df['SE'].str[:4].astype(int)
-    df['semana'] = df['SE'].str[4:].astype(int)
-    agg = {}
-    for col in df.columns:
-        if col in ['date','SE','ano','semana']:
-            continue
-        if 'precip' in col.lower() or 'precipitation' in col.lower():
-            agg[col] = 'sum'
-        elif 'wind' in col.lower() or 'speed' in col.lower():
-            agg[col] = 'max'
-        else:
-            agg[col] = 'mean'
-    weekly = df.groupby(['SE','ano','semana']).agg(agg).reset_index()
-    rename_map = {
+    # Usa mesma agregação que data/collect_openmeteo.py para paridade treino/live
+    from data.collect_openmeteo import aggregate_to_weekly
+    rename_pre = {
         'temperature_2m_max': 'temp_max',
         'temperature_2m_min': 'temp_min',
         'temperature_2m_mean': 'temp_mean',
-        'precipitation_sum': 'precip_total',
-        'relative_humidity_2m_mean': 'humidity_mean',
+        'precipitation_sum': 'precip',
+        'relative_humidity_2m_mean': 'humidity',
         'wind_speed_10m_max': 'wind_max'
     }
-    weekly = weekly.rename(columns=rename_map)
-    weekly = weekly.sort_values('SE').reset_index(drop=True)
+    df = df.rename(columns=rename_pre)
+    from data.epiweeks import date_to_epiweek as _d2e
+    tmp_se = df['date'].apply(lambda d: _d2e(d)).astype(str).str.zfill(6)
+    clima_dias = tmp_se.value_counts().to_dict()
+    weekly = aggregate_to_weekly(df)
+    weekly['SE'] = weekly['SE'].astype(str).str.zfill(6)
+    weekly['clima_dias'] = weekly['SE'].map(clima_dias)
+    while len(weekly) > 1:
+        last_se = weekly.iloc[-1]['SE']
+        days = clima_dias.get(last_se, 0)
+        if pd.isna(days) or int(days) < 7:
+            motivo = 'clima ausente' if pd.isna(days) else f'clima parcial ({int(days)}/7 dias)'
+            logger.warning(f"Anchor guard (OpenMeteo live): SE {last_se} removida ({motivo}) - ancora recua")
+            weekly = weekly.iloc[:-1]
+            clima_dias.pop(last_se, None)
+        else:
+            break
     logger.info(f"[dashboard live] OpenMeteo weeks {len(weekly)}")
     return weekly
 
@@ -524,6 +558,25 @@ def _merge_and_prepare_live(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -
     all_weeks_df=pd.DataFrame({'SE': all_weeks})
     all_weeks_df['SE']=all_weeks_df['SE'].astype(str).str.zfill(6)
     merged=pd.merge(all_weeks_df, merged, on='SE', how='left')
+    # ANCHOR GUARD: paridade com data/process_data.py — dropa última SE com clima parcial (<7 dias) via shared helper
+    clima_dias = None
+    if not weather_df.empty and 'clima_dias' in weather_df.columns:
+        clima_dias = dict(zip(weather_df['SE'].astype(str).str.zfill(6), weather_df['clima_dias']))
+    elif not weather_df.empty and 'clima_dias' in merged.columns:
+        clima_dias = dict(zip(merged['SE'].astype(str).str.zfill(6), merged['clima_dias']))
+    elif 'week_start' in merged.columns and 'week_end' in merged.columns:
+        try:
+            dias = (pd.to_datetime(merged['week_end']) - pd.to_datetime(merged['week_start'])).dt.days + 1
+            clima_dias = dict(zip(merged['SE'].astype(str).str.zfill(6), dias))
+        except Exception:
+            clima_dias = None
+    elif not weather_df.empty and 'week_start' in weather_df.columns and 'week_end' in weather_df.columns:
+        try:
+            dias = (pd.to_datetime(weather_df['week_end']) - pd.to_datetime(weather_df['week_start'])).dt.days + 1
+            clima_dias = dict(zip(weather_df['SE'].astype(str).str.zfill(6), dias))
+        except Exception:
+            clima_dias = None
+    merged = anchor_guard_filter(merged, clima_dias) if clima_dias else merged
     if 'casos' in merged.columns:
         merged['casos']=merged['casos'].fillna(0).astype(int)
     weather_cols=[c for c in merged.columns if c not in ['SE','ano','semana','casos','casos_est']]
@@ -532,15 +585,7 @@ def _merge_and_prepare_live(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -
             merged[col]=merged[col].ffill()
     merged['ano']=merged['SE'].str[:4].astype(int)
     merged['semana']=merged['SE'].str[4:].astype(int)
-    if 'casos_est' in merged.columns:
-        merged=merged.sort_values('SE').reset_index(drop=True)
-        merged['casos']=pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
-        merged['casos_est']=pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-        # FIX histórico: casos = max(casos, casos_est) SEMPRE (antes só últimas 12, deixava 202633/202634 com 0)
-        mask=(merged['casos_est']>merged['casos'])
-        if mask.any():
-            merged.loc[mask,'casos']=np.round(merged.loc[mask,'casos_est']).astype(int)
-            logger.info(f"[dashboard live] Nowcast {mask.sum()} semanas")
+    merged = apply_nowcast(merged, window=NOWCAST_WINDOW)
     merged['log_casos']=np.log1p(merged['casos'])
     try:
         from data.epiweeks import weeks_in_year
@@ -576,27 +621,37 @@ def _merge_and_prepare_live(dengue_df: pd.DataFrame, weather_df: pd.DataFrame) -
     return merged
 
 def _get_live_engineered():
-    global _live_cache
+    global _live_cache, _fetch_stale
     now=time.time()
-    if _live_cache['df'] is not None and (now - _live_cache['timestamp']) < _live_cache['ttl']:
-        logger.info("[dashboard live] using cached engineered")
-        return _live_cache['df']
+    with _live_cache_lock:
+        if _live_cache['df'] is not None and (now - _live_cache['timestamp']) < _live_cache['ttl']:
+            logger.info("[dashboard live] using cached engineered")
+            return _live_cache['df']
     logger.info("[dashboard live] Fetching fresh data from APIs (same as 8001)...")
     dengue=_fetch_infodengue_live()
     weather=_fetch_openmeteo_live()
     if dengue.empty:
-        raise RuntimeError("fresh fetch dengue empty")
+        logger.error("[dashboard live] dengue empty e fallback full também falhou — sem dados para predição (stale)")
+        raise HTTPException(status_code=503, detail="Falha ao buscar dados InfoDengue (fresh e fallback falharam) — dados stale")
     if weather.empty:
-        logger.warning(f"[dashboard live] weather empty ({len(weather)}), usando dengue-only com ffill histórico")
-        # weather vazio por 429 - merge ainda funciona com left join e ffill
+        logger.error(f"[dashboard live] weather empty ({len(weather)}), fallback local também falhou — usando dengue-only com ffill histórico (stale)")
+        _fetch_stale = True
+        # merge ainda funciona com left join e ffill, mas marca stale para /api/status e callers
     if len(weather) < 156 and not weather.empty:
         logger.warning(f"weather weeks {len(weather)} <156")
     merged=_merge_and_prepare_live(dengue, weather)
+    if merged is None or merged.empty:
+        logger.error("[dashboard live] merged vazio após _merge_and_prepare_live — falha explícita")
+        raise HTTPException(status_code=503, detail="Falha ao preparar dados live (merged vazio) — dados stale")
     from data.features import EpisenseFeatureEngineer
     fe=EpisenseFeatureEngineer(config)
     engineered=fe.run_full_feature_engineering(merged, convention='advanced', target_horizons=TARGET_HORIZONS, legacy_mode=False)
-    _live_cache['df']=engineered
-    _live_cache['timestamp']=now
+    if engineered is None or engineered.empty:
+        logger.error("[dashboard live] engineered vazio após feature engineering — falha explícita")
+        raise HTTPException(status_code=503, detail="Falha ao gerar features live (engineered vazio) — dados stale")
+    with _live_cache_lock:
+        _live_cache['df']=engineered
+        _live_cache['timestamp']=now
     logger.info(f"[dashboard live] engineered {engineered.shape} last {engineered.iloc[-1].get('SE')}")
     # invalidate forecast cache when live data refreshes (new week)
     with _forecast_cache_lock:
@@ -767,21 +822,68 @@ def se_to_date(se):
     except: return se
 
 def add_epiweeks(se: str, n: int) -> str:
+    """Soma n semanas epidemiológicas a SE (YYYYWW) usando calendário brasileiro (domingo).
+    Falha explicitamente se SE inválida — nunca usa fallback int(SE)+n que ignora virada de ano e semana 53.
+    """
+    from data.epiweeks import epiweek_to_date, date_to_epiweek
+    import pandas as pd
+    se_str = str(se).zfill(6)
     try:
-        from data.epiweeks import epiweek_to_date, date_to_epiweek
-        import pandas as pd
-        se = str(se)
-        y = int(se[:4]); w = int(se[4:])
+        y = int(se_str[:4]); w = int(se_str[4:])
         d = epiweek_to_date(y, w) + pd.Timedelta(weeks=n)
-        return date_to_epiweek(d)
-    except Exception:
-        # fallback
-        return str(int(str(se)) + n)
+        result = date_to_epiweek(d)
+        if not isinstance(result, str) or len(result) != 6 or not result.isdigit():
+            raise ValueError(f"SE inválida gerada: {result} de {se}+{n}")
+        return result
+    except Exception as e:
+        logger.error(f"add_epiweeks falhou para se={se} n={n}: {e}")
+        raise ValueError(f"Falha ao calcular SE {se}+{n} semanas: {e}") from e
+
+_dashboard_scheduler = None
+
+def _dashboard_scheduled_refresh():
+    try:
+        logger.info("[dashboard scheduler] Verificando nova SE")
+        global _last_fetch
+        _last_fetch = 0
+        try:
+            _fetch_fresh_raw()
+        except Exception as e:
+            logger.warning(f"[dashboard scheduler] fetch falhou: {e}")
+        _ensure_fresh_data()
+        with _live_cache_lock:
+            _live_cache['df'] = None
+            _live_cache['timestamp'] = 0
+        logger.info("[dashboard scheduler] Refresh concluído")
+    except Exception as e:
+        logger.error(f"[dashboard scheduler] Erro: {e}", exc_info=True)
+
+@app.on_event("startup")
+async def dashboard_startup():
+    global _dashboard_scheduler
+    if HAS_SCHEDULER:
+        try:
+            _dashboard_scheduler = BackgroundScheduler(timezone=config['data_sources']['openmeteo'].get('timezone', 'America/Campo_Grande'))
+            _dashboard_scheduler.add_job(_dashboard_scheduled_refresh, 'cron', day_of_week='mon', hour=6, minute=7, id='dash_weekly')
+            _dashboard_scheduler.add_job(_dashboard_scheduled_refresh, 'cron', hour=6, minute=12, id='dash_daily')
+            _dashboard_scheduler.start()
+            logger.info("Dashboard scheduler iniciado: seg 06:07 + daily 06:12")
+        except Exception as e:
+            logger.warning(f"Dashboard scheduler não iniciado: {e}")
+
+@app.on_event("shutdown")
+async def dashboard_shutdown():
+    global _dashboard_scheduler
+    if _dashboard_scheduler:
+        try:
+            _dashboard_scheduler.shutdown(wait=False)
+        except Exception:
+            pass
 
 @app.get("/api/real")
 def api_real(limit: int = Query(52, ge=10, le=200), end_se: str = None):
     _ensure_fresh_data()
-    # usa live fresh para "real" (nowcast nos ultimos 12, igual API 8001) se disponivel
+    # usa live fresh para "real" (nowcast nas ultimas 16 semanas, igual API 8001) se disponivel
     try:
         eng = _get_live_engineered()
         if eng is not None and "SE" in eng.columns and "casos" in eng.columns:
@@ -797,14 +899,19 @@ def api_real(limit: int = Query(52, ge=10, le=200), end_se: str = None):
                 m = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["data_inicio_semana"]))
                 # fallback para SE futuras: usa SE como string
                 df["data_inicio_semana"] = df["SE"].map(m).fillna(df["SE"])
-            return {"data": df.to_dict(orient="records"), "source": "live"}
+            # flag stale: se _fetch_stale True, indica clima/dengue fallback stale
+            stale = globals().get("_fetch_stale", False)
+            return {"data": df.to_dict(orient="records"), "source": "live", "stale": stale}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"api_real live fallback to df_base: {e}")
+        logger.warning(f"api_real live fallback to df_base (stale): {e}")
     if end_se:
         df = df_base[df_base["SE"] <= str(end_se)].tail(limit)
     else:
         df = df_base.tail(limit)
-    return {"data": df.to_dict(orient="records"), "source": "csv"}
+    # fallback csv é stale por definição quando live falhou
+    return {"data": df.to_dict(orient="records"), "source": "csv", "stale": True, "warning": "dados live indisponíveis, usando CSV stale"}
 
 @app.get("/api/weeks")
 def api_weeks(limit: int = 100):
@@ -832,8 +939,8 @@ def api_metrics():
         avg = val_res[h].get("ensemble_avg", {})
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
-        # advanced keys exposed for toggle
-        adv_keys = ["mae","wis","coverage_90","coverage_50","maxae","wis_sharpness","mase","wis_over","wis_under","baseline_wis","etp","fbias","fbias_rel","fbias_frac","fbias_surto","fbias_calmaria"]
+        # advanced keys exposed for toggle (maxae removido)
+        adv_keys = ["mae","wis","coverage_90","coverage_50","wis_sharpness","mase","wis_over","wis_under","baseline_wis","etp","fbias","fbias_rel","fbias_frac","fbias_surto","fbias_calmaria"]
         def pick(src):
             return {k: src.get(k) for k in adv_keys} if src else None
         out[h] = {
@@ -1309,7 +1416,8 @@ def api_forecast_history():
             return {"history": data, "count": len(data)}
         return {"history": [], "count": 0}
     except Exception as e:
-        return {"history": [], "count": 0, "error": str(e)}
+        logger.error(f"forecast-history error: {e}", exc_info=True)
+        return {"history": [], "count": 0, "error": "failed to load forecast history"}
 
 @app.get("/api/status")
 def api_status():
@@ -1322,15 +1430,20 @@ def api_status():
             try:
                 archive_count = len(json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8")))
             except: pass
+        fetch_stale = globals().get("_fetch_stale", False)
+        fetch_error = globals().get("_fetch_last_error", None)
         return {
             "base_max": base_max,
             "raw_max": raw_max,
-            "stale": raw_max > base_max,
+            "stale": raw_max > base_max or fetch_stale,
+            "fetch_stale": fetch_stale,
+            "fetch_error": fetch_error,
             "forecast_archive": archive_count,
             "last_check": _last_refresh_check,
         }
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"status error: {e}", exc_info=True)
+        return {"error": "failed to load status"}
 
 @app.on_event("startup")
 async def preload():

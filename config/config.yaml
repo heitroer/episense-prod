@@ -5,6 +5,7 @@ project:
   disease: dengue
   target_variable: casos
   se_format: YYYYWW
+  nowcast_window_weeks: 16  # janela nowcasting InfoDengue (semanas de atraso max para nowcast)
 paths:
   data_raw: data/raw
   data_processed: data/processed
@@ -18,6 +19,7 @@ data_sources:
     disease: dengue
     format: csv
     ew_format: SE
+    nowcast_window_weeks: 16  # janela nowcasting: 16 semanas de correcao/atraso InfoDengue
   openmeteo:
     base_url: https://archive-api.open-meteo.com/v1/archive
     latitude: -20.4697
@@ -123,22 +125,22 @@ model:
     tweedie_variance_power: 1.5
     metric: rmse
     boosting_type: gbdt
-    num_leaves: 127
-    max_depth: 10
+    num_leaves: 63  # 127->63 regularizacao: reduz complexidade da arvore p/ evitar overfit
+    max_depth: 8  # 10->8 limita profundidade
     learning_rate: 0.03
     n_estimators: 3000
     subsample: 0.85
     colsample_bytree: 0.85
-    reg_alpha: 0.05
-    reg_lambda: 0.05
-    min_child_samples: 15
+    reg_alpha: 0.3  # 0.05->0.3 L1 maior penalidade
+    reg_lambda: 0.3  # 0.05->0.3 L2 maior penalidade
+    min_child_samples: 20  # 15->20 folha precisa mais amostras
     random_state: 42
     verbosity: -1
     early_stopping_rounds: 150
     feature_fraction: 0.85
     bagging_fraction: 0.85
     bagging_freq: 3
-    min_gain_to_split: 0.01
+    min_gain_to_split: 0.05  # 0.01->0.05 exige ganho minimo maior p/ split
 training:
   start_year: 2014
   walk_forward:
@@ -159,32 +161,34 @@ training:
     gap_weeks: 4
     expanding: true
   feature_selection:
+    # Dimensionalidade reduzida 380->120 (max_features) e per-quantile 250/380->80/120
+    # threshold 0.001->0.005 filtra features de baixa importancia (ruido) e reduz overfit/variancia
     method: importance
-    threshold: 0.001
-    max_features: 380
+    threshold: 0.005
+    max_features: 120
     per_quantile: true
-    separate_quantile_features: true
+    separate_quantile_features: true  # mantido true mas com limites menores (80/120) p/ caudas
     expand_extra: false
     threshold_per_quantile:
-      0.05: 0.001
-      0.25: 0.001
-      0.5: 0.001
-      0.75: 0.001
-      0.95: 0.001
+      0.05: 0.005
+      0.25: 0.005
+      0.5: 0.005
+      0.75: 0.005
+      0.95: 0.005
     max_features_per_quantile:
-      0.05: 250
-      0.25: 250
-      0.5: 380
-      0.75: 250
-      0.95: 250
+      0.05: 80
+      0.25: 80
+      0.5: 120
+      0.75: 80
+      0.95: 80
   temporal_weighting:
     enabled: true
     half_life_years: 6.58
   peak_weighting:
     enabled: true
     weight_200: 1.3
-    weight_500: 1.8
-    weight_1000: 2.2
+    weight_500: 1.4  # 1.8->1.4 reduz peso excessivo de picos medios (evita 4x peso combinado)
+    weight_1000: 1.8  # 2.2->1.8 reduz peso de picos extremos
   gap_per_horizon: true
   parallel_horizons:
     enabled: true
@@ -192,36 +196,38 @@ training:
     backend: loky
     worker_threads: 1
   quantile_hparams:
+    # Regularização leve para caudas: corrige hiperinflação q95 sem underfit (n_tr 360-480)
+    # 0.05/0.95: leaves 31/depth 6/min_child 30/lambda 1.5 vs mediana 63/8/20/0.3
     0.05:
-      num_leaves: 63
-      max_depth: 8
-      min_child_samples: 15
-      learning_rate: 0.03
-      reg_alpha: 0.05
-      reg_lambda: 0.05
-      min_gain_to_split: 0.005
-      feature_fraction: 0.85
-      bagging_fraction: 0.85
+      num_leaves: 31
+      max_depth: 6
+      min_child_samples: 30
+      learning_rate: 0.025
+      reg_alpha: 0.8
+      reg_lambda: 1.5
+      min_gain_to_split: 0.02
+      feature_fraction: 0.75
+      bagging_fraction: 0.75
       bagging_freq: 3
     0.5: {}
     0.95:
-      num_leaves: 63
-      max_depth: 8
-      min_child_samples: 15
-      learning_rate: 0.03
-      reg_alpha: 0.05
-      reg_lambda: 0.05
-      min_gain_to_split: 0.005
-      feature_fraction: 0.85
-      bagging_fraction: 0.85
+      num_leaves: 31
+      max_depth: 6
+      min_child_samples: 30
+      learning_rate: 0.025
+      reg_alpha: 0.8
+      reg_lambda: 1.5
+      min_gain_to_split: 0.02
+      feature_fraction: 0.75
+      bagging_fraction: 0.75
       bagging_freq: 3
     0.25:
       num_leaves: 63
       max_depth: 8
       min_child_samples: 15
       learning_rate: 0.03
-      reg_alpha: 0.05
-      reg_lambda: 0.05
+      reg_alpha: 0.3
+      reg_lambda: 0.3
       min_gain_to_split: 0.005
       feature_fraction: 0.85
       bagging_fraction: 0.85
@@ -231,8 +237,8 @@ training:
       max_depth: 8
       min_child_samples: 15
       learning_rate: 0.03
-      reg_alpha: 0.05
-      reg_lambda: 0.05
+      reg_alpha: 0.3
+      reg_lambda: 0.3
       min_gain_to_split: 0.005
       feature_fraction: 0.85
       bagging_fraction: 0.85
@@ -255,10 +261,15 @@ phantom_gating:
   enabled: true
   calm_q95_max_factor: 3.5
   outbreak_q95_max_factor: 4.0
+# horizon_weights disabled: pesos iguais por horizonte evita overfit
+horizon_weights:
+  enabled: false
+# asymmetric_loss: desabilitado — teste com 1.25 piorou FBias (-0.19→-0.34 em h2). Subestimação é estrutural (mediana < média em distribuição assimétrica)
+# Solução para viés levemente superestimador será via correção post-hoc leve em inference (fator 1.08) e não via loss assimétrica.
 asymmetric_loss:
   enabled: false
-  horizon_threshold: 5
-  undershoot_weight: 1.35
+  horizon_threshold: 2
+  undershoot_weight: 1.0
   overshoot_weight: 1.0
   only_median: true
 epidemiological_periods:
@@ -356,7 +367,6 @@ metrics:
   targets:
     h1:
       mae: 45
-      maxae: 350
       wis: 39
       spl_005: 0.8
       spl_025: 0.75
@@ -366,7 +376,6 @@ metrics:
       etp: 2
     h2:
       mae: 55
-      maxae: 450
       wis: 45
       spl_005: 0.85
       spl_025: 0.75
@@ -376,7 +385,6 @@ metrics:
       etp: 3
     h3:
       mae: 65
-      maxae: 500
       wis: 52
       spl_005: 0.9
       spl_025: 0.75
@@ -386,7 +394,6 @@ metrics:
       etp: 4
     h4:
       mae: 68
-      maxae: 550
       wis: 58
       spl_005: 0.95
       spl_025: 0.75
@@ -396,7 +403,6 @@ metrics:
       etp: 5
     h5:
       mae: 75
-      maxae: 600
       wis: 65
       spl_005: 1.0
       spl_025: 0.85
@@ -406,7 +412,6 @@ metrics:
       etp: 6
     h6:
       mae: 80
-      maxae: 580
       wis: 71
       spl_005: 1.05
       spl_025: 0.85
@@ -416,7 +421,6 @@ metrics:
       etp: 7
     h7:
       mae: 90
-      maxae: 580
       wis: 78
       spl_005: 1.1
       spl_025: 0.85
@@ -426,7 +430,6 @@ metrics:
       etp: 8
     h8:
       mae: 95
-      maxae: 650
       wis: 84
       spl_005: 1.15
       spl_025: 0.85

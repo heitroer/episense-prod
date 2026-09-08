@@ -158,6 +158,24 @@ class EpisenseFeatureEngineer:
             for t in temp_cols[:2]:
                 if cl in df.columns and t in df.columns:
                     df[f'{cl}_x_{t}'] = df[cl] * df[t]
+        # Interação biológica Temp × sazonalidade (EIP termodependente): mesma T em verão vs inverno tem competência vetorial distinta
+        # Usa lag2 (janela extrínseca 8-12 dias) e sin/cos já existentes; respeita shift>=1
+        try:
+            temp_lag2 = None
+            for c in ['temp_mean_mean_lag2', 'temp_mean_lag2', 'tempmed_lag2']:
+                if c in df.columns:
+                    temp_lag2 = c
+                    break
+            if temp_lag2 and 'sin_semana' in df.columns and 'cos_semana' in df.columns:
+                df[f'{temp_lag2}_x_sin_semana'] = df[temp_lag2] * df['sin_semana']
+                df[f'{temp_lag2}_x_cos_semana'] = df[temp_lag2] * df['cos_semana']
+            # Variante com anomalia climatológica (desvio vs 3y) × sazonalidade
+            if 'temp_mean_mean_anomaly_clim_lag1' in df.columns and 'sin_semana' in df.columns:
+                df['temp_anomaly_clim_x_sin'] = df['temp_mean_mean_anomaly_clim_lag1'] * df['sin_semana'] if 'temp_mean_mean_anomaly_clim_lag1' in df.columns else df['temp_mean_mean_anomaly_clim'] * df['sin_semana']
+            if 'precip_total_lag2' in df.columns and 'sin_semana' in df.columns:
+                df['precip_lag2_x_sin_semana'] = df['precip_total_lag2'] * df['sin_semana']
+        except Exception:
+            pass
         return df
 
     def create_horizon_specific_features(self, df: pd.DataFrame,
@@ -837,6 +855,15 @@ class EpisenseFeatureEngineer:
         # ============================================================
         if self.expand_climatology:
             df = self.create_climatology_features(df)
+            # Interação climatológica × sazonalidade (pós-climatologia): anomalia vs estação
+            try:
+                if 'temp_mean_mean_anomaly_clim' in df.columns and 'sin_semana' in df.columns:
+                    # usa lag1 se existir (evita leak), senão valor atual já é shift-safe via climatologia lag52
+                    col = 'temp_mean_mean_anomaly_clim_lag1' if 'temp_mean_mean_anomaly_clim_lag1' in df.columns else 'temp_mean_mean_anomaly_clim'
+                    df['temp_anomaly_clim_x_sin'] = df[col] * df['sin_semana']
+                    df['temp_anomaly_clim_x_cos'] = df[col] * df['cos_semana']
+            except Exception:
+                pass
 
         # ============================================================
         # EXPANSAO 5 (expand_trend - v2): slopes, momentum, CV, accel

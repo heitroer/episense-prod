@@ -35,7 +35,26 @@ class EpisenseInference:
         self.ano_max = None
         self.non_crossing = self.config.get('non_crossing', {}).get('enabled', True)
         self.non_crossing_method = self.config.get('non_crossing', {}).get('method', 'post_process')
-        self.quantile_recalibration = self.config.get('quantile_recalibration', {})
+        # BUGFIX Bug1 - recalibration circular: opt-in only, disabled by default to avoid leakage
+        # FULL model in train.py includes all folds (train_single_model_full uses all data), so
+        # deltas computed on those folds would be circular (future data leaks into production).
+        # Only enable if config quantile_recalibration.enabled==true AND train.py excluded last fold from FULL.
+        # Default disabled; when enabled logs WARNING and deltas are applied in log-scale.
+        self.quantile_recalibration_config = self.config.get('quantile_recalibration', {}) if isinstance(self.config.get('quantile_recalibration', {}), dict) else {}
+        self.quantile_recalibration_enabled = bool(self.quantile_recalibration_config.get('enabled', False))
+        self.quantile_recalibration = {}
+        self.quantile_recalibration_regime = {}
+        # BUGFIX Bug9 - phantom gating: disabled by default to avoid masking early outbreak;
+        # optionally per-horizon (H1-H4 disabled by default, as they are main magnitude forecasts).
+        self.phantom_gating_config = self.config.get('phantom_gating', {}) if isinstance(self.config.get('phantom_gating', {}), dict) else {}
+        self.phantom_gating_enabled = bool(self.phantom_gating_config.get('enabled', False))
+        # disabled_horizons allows e.g. [1,2,3,4] to keep H1-H4 unclamped (early outbreak signal preserved)
+        _disabled = self.phantom_gating_config.get('disabled_horizons', [1, 2, 3, 4])
+        try:
+            self.phantom_gating_disabled_horizons = set(int(x) for x in _disabled) if _disabled else set()
+        except Exception:
+            self.phantom_gating_disabled_horizons = {1, 2, 3, 4}
+        self._gated_info: Dict[int, bool] = {}
         
         self._load_models()
         self._load_metadata()
@@ -99,6 +118,19 @@ class EpisenseInference:
             # detectar modo separado
             is_separate = any(isinstance(v, dict) for v in self.feature_names.values())
             logger.info(f"Loaded feature names for {len(self.feature_names)} horizons (separate_per_tau={is_separate})")
+            # BUGFIX Bug10 - validate feature_list horizons == target_horizons (config targets.horizons)
+            try:
+                loaded_hs = set(self.feature_names.keys()) if isinstance(self.feature_names, dict) else set()
+                expected_hs = set(self.target_horizons)
+                if loaded_hs and loaded_hs != expected_hs:
+                    logger.warning(
+                        f"Horizon mismatch: feature_list has {sorted(loaded_hs)} but config target_horizons={sorted(expected_hs)}. "
+                        f"Inference will use feature_list per horizon where available and fill missing with 0; check training vs inference config alignment."
+                    )
+                elif loaded_hs:
+                    logger.info(f"Horizon validation OK: feature_list {sorted(loaded_hs)} == target_horizons")
+            except Exception as e:
+                logger.warning(f"Horizon validation failed: {e}")
         
         # NOTE: DataFrameScaler was removed from pipeline (LightGBM doesn't need scaling)
         # scaler_path = self.model_dir / "scaler.pkl"
@@ -136,26 +168,55 @@ class EpisenseInference:
         """Load quantile recalibration deltas for conformal calibration.
         Supports global (quantile_recalibration.json) and regime-aware
         (quantile_recalibration_regime.json) with per-regime deltas.
+
+        BUGFIX Bug1 - circular recalibration:
+        * Disabled by default (opt-in). FULL model in train.py is trained on all data
+          including folds used to compute deltas, so applying deltas in production is
+          circular leakage (deltas derived from data that FULL already saw).
+        * Only loads/applies if config quantile_recalibration.enabled==true.
+        * When enabled, logs WARNING (not silently) and documents that train.py must
+          exclude last fold from FULL to be non-circular.
         """
         self.quantile_recalibration_regime = {}
-        # regime file tem prioridade mas mantem global como fallback
+        self.quantile_recalibration = {}
+        # Opt-in check: disabled by default to avoid circular leakage
+        if not getattr(self, 'quantile_recalibration_enabled', False):
+            # Still detect files to warn that they exist but are being ignored
+            regime_path = self.model_dir / "quantile_recalibration_regime.json"
+            recal_path = self.model_dir / "quantile_recalibration.json"
+            if regime_path.exists() or recal_path.exists():
+                logger.warning(
+                    "Quantile recalibration files found but DISABLED (quantile_recalibration.enabled=false, default). "
+                    "Skipping deltas to avoid circular leakage: FULL model includes calibration folds. " 
+                    "Set quantile_recalibration.enabled=true only if FULL was trained excluding calibration fold."
+                )
+            else:
+                logger.info("Quantile recalibration DISABLED (opt-in, enabled=false) - using raw quantile predictions (no circular delta)")
+            return
+        # enabled==true: load files (regime has priority, global as fallback)
         regime_path = self.model_dir / "quantile_recalibration_regime.json"
         if regime_path.exists():
             try:
                 with open(regime_path, 'r') as f:
                     self.quantile_recalibration_regime = json.load(f)
-                logger.info(f"Loaded regime recalibration: {regime_path}")
+                logger.warning(f"Loaded regime recalibration (ENABLED, opt-in): {regime_path} - WARNING: ensure FULL excluded calibration folds to avoid circular leakage")
             except Exception as e:
                 logger.warning(f"Failed to load regime recalibration: {e}")
         recal_path = self.model_dir / "quantile_recalibration.json"
         if recal_path.exists():
             with open(recal_path, 'r') as f:
                 self.quantile_recalibration = json.load(f)
-            logger.info(f"Loaded quantile recalibration: {recal_path} (regime={'yes' if self.quantile_recalibration_regime else 'no'})")
-        elif self.quantile_recalibration:
-            logger.info("Using quantile recalibration from config")
+            logger.warning(f"Loaded quantile recalibration (ENABLED, opt-in): {recal_path} (regime={'yes' if self.quantile_recalibration_regime else 'no'}) - deltas will be added in log-scale with WARNING per horizon")
+        elif self.quantile_recalibration_config and any(k not in ('enabled',) for k in self.quantile_recalibration_config.keys()):
+            # support inline deltas in config when enabled (exclude 'enabled' key itself)
+            inline = {k: v for k, v in self.quantile_recalibration_config.items() if k != 'enabled'}
+            if inline:
+                self.quantile_recalibration = inline
+                logger.warning("Using quantile recalibration deltas from config (ENABLED, opt-in) - WARNING circular if FULL includes those folds")
+            else:
+                logger.info("Quantile recalibration enabled but no file/inline deltas found - using raw predictions")
         else:
-            logger.info("No quantile recalibration found - using raw quantile predictions")
+            logger.info("Quantile recalibration enabled but no file found - using raw quantile predictions")
             self.quantile_recalibration = {}
     
     def prepare_inference_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -194,10 +255,16 @@ class EpisenseInference:
                 }
             }
             fe = EpisenseFeatureEngineer(fe_cfg)
+            # BUGFIX Bug10 - use self.target_horizons from config instead of hardcoded 1-9 range
+            # Training creates horizon-specific features for ALL horizons in config targets.horizons;
+            # inference must match exactly. Validates feature_list horizon set == target_horizons in _load_metadata.
+            horizons_for_fe = sorted(set(self.target_horizons)) if self.target_horizons else [1, 2, 3, 4, 5, 6, 7, 8]
+            if set(horizons_for_fe) != set(self.target_horizons or []):
+                logger.warning(f"prepare_inference_features: horizons_for_fe {horizons_for_fe} != self.target_horizons {self.target_horizons} - check config")
             df = fe.run_full_feature_engineering(
                 df, 
                 convention='advanced',
-                target_horizons=list(range(1, 9)),  # Use ALL horizons 1-8 to match training
+                target_horizons=horizons_for_fe,
                 legacy_mode=False  # Match training
             )
     
@@ -319,8 +386,15 @@ class EpisenseInference:
                 df['ano_normalizado'] = np.clip(df['ano_normalizado'], -0.2, 1.5)
         
         n_missing = sum(1 for f in feature_cols if f not in df.columns)
+        if n_missing / len(feature_cols) > 0.5:
+            raise ValueError(
+                f"h{horizon}: {n_missing}/{len(feature_cols)} features ausentes "
+                f"({n_missing/len(feature_cols):.1%} >50%) - falha crítica de feature "
+                f"engineering; fillna(0) silencioso não permitido"
+            )
         if n_missing > 0:
-            logger.warning(f"h{horizon}: {n_missing}/{len(feature_cols)} features ausentes - preenchidas com 0 (verifique feature engineering)")
+            lvl = logger.warning if n_missing / len(feature_cols) <= 0.3 else logger.error
+            lvl(f"h{horizon}: {n_missing}/{len(feature_cols)} features ausentes ({n_missing/len(feature_cols):.1%}) - preenchidas com 0 (verifique feature engineering - live vs train shape mismatch)")
         for feat in feature_cols:
             if feat in df.columns:
                 X[feat] = df[feat]
@@ -389,21 +463,33 @@ class EpisenseInference:
             if self.non_crossing:
                 predictions = self._apply_non_crossing(predictions)
         
-            # Apply quantile recalibration (split conformal) - with regime aware if available
-            if self.quantile_recalibration or getattr(self, 'quantile_recalibration_regime', {}):
-                # last SE for regime classification
+            # BUGFIX Bug1 - quantile recalibration opt-in (disabled by default to avoid circular leakage)
+            # Only apply if quantile_recalibration.enabled==true in config; otherwise skip even if files exist.
+            # When enabled, _apply_quantile_recalibration logs WARNING per horizon (not silent).
+            has_recal = bool(self.quantile_recalibration or getattr(self, 'quantile_recalibration_regime', {}))
+            if getattr(self, 'quantile_recalibration_enabled', False) and has_recal:
                 try:
                     last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
                 except Exception:
                     last_se = None
+                logger.warning("Applying quantile recalibration (opt-in enabled=true) - deltas in log-scale; ensure FULL excluded calibration folds else circular leakage")
                 predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
-            # v3 phantom gating (clamp q95 em calmaria)
-            if self.config.get('phantom_gating', {}).get('enabled', False):
+            elif has_recal:
+                logger.info("Quantile recalibration files present but skipped (enabled=false, default) to avoid circular leakage")
+            # BUGFIX Bug9 - phantom gating opt-in per horizon, disabled by default
+            # Gating clamps q95 to median*3.5 in calm (Jun-Set) which hides early outbreak; now:
+            # * disabled by default (phantom_gating.enabled=false) - matches _load default
+            # * when enabled, H1-H4 disabled by default (disabled_horizons=[1,2,3,4]) to preserve short-horizon outbreak signal
+            # * logs WARNING when clamp occurs and exposes gated flag in API (get_latest_predictions)
+            if getattr(self, 'phantom_gating_enabled', False):
                 try:
                     last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
                 except Exception:
                     last_se = None
                 predictions = self._apply_phantom_gating(predictions, last_se=last_se)
+            else:
+                # clear gated info when disabled
+                self._gated_info = {h: False for h in predictions.keys()}
             # FIX q05 negativo: clamp todos quantis para casos >=0 (nunca prever -1)
             # Aplica após recal + gating + non_crossing, em escala casos e volta para log
             try:
@@ -428,17 +514,26 @@ class EpisenseInference:
 
     def _apply_quantile_recalibration(self, predictions: Dict[int, Dict[float, np.ndarray]], last_se: str = None) -> Dict[int, Dict[float, np.ndarray]]:
         """Apply split conformal recalibration to q0.05 and q0.95.
+
+        BUGFIX Bug1 - circular: this method is now opt-in only. It should only be called
+        when quantile_recalibration.enabled==true and train.py's FULL excluded calibration folds.
+        Otherwise deltas are circular (FULL already saw those folds). Logs WARNING per application.
+
         Suporta dois formatos:
           - global: {"1": {"0.05": -0.20, "0.95": 0.11}} (float direto, log-scale)
           - legacy buggy: {"1": {"q0.05": {"delta": ...}}} (caso/log diff)
         E regime-aware (quantile_recalibration_regime.json) quando last_se disponivel:
           {"1": {"outbreak": {"0.05": ..., "0.95": ...}, "calm": {...}}}
         """
+        # BUGFIX Bug1 - opt-in guard: if not enabled, no-op (should have been skipped earlier)
+        if not getattr(self, 'quantile_recalibration_enabled', False):
+            logger.warning("quantile_recalibration _apply called but enabled=false - skipping (avoid circular leakage)")
+            return predictions
         # escolhe fonte: regime se disponivel e last_se conhecido, senao global
         has_regime = bool(getattr(self, 'quantile_recalibration_regime', {}))
         if not self.quantile_recalibration and not has_regime:
             return predictions
-        logger.warning("quantile_recalibration ativo: deltas log-scale (regime-aware se disponivel)")
+        logger.warning("quantile_recalibration ativo (opt-in, enabled=true): deltas log-scale (regime-aware se disponivel) - WARNING: circular if FULL includes calibration folds")
         for horizon in list(predictions.keys()):
             hkey = str(horizon)
             # determina delta por regime
@@ -523,14 +618,33 @@ class EpisenseInference:
         """v3: clamp q95 para evitar phantom 5-10x mediana em calma.
         Usa regime futuro (mes) igual recal: calm max_factor 3.5, outbreak 4.0.
         Clamp em casos escala, depois volta para log, e re-aplica non_crossing.
+
+        BUGFIX Bug9 - phantom gating masks early outbreak (Jun-Set clamp hides off-season surge):
+        * Now opt-in per config phantom_gating.enabled (default false) and per-horizon.
+        * Default disabled_horizons=[1,2,3,4] (H1-H4 not gated) to preserve main forecast outbreak signal.
+        * Logs WARNING when clamp occurs and exposes gated flag via self._gated_info for API.
+        * Conditional: only gates when not disabled horizon; still respects outbreak vs calm factor.
         """
-        cfg = self.config.get('phantom_gating', {})
+        # Opt-in check
+        if not getattr(self, 'phantom_gating_enabled', False):
+            logger.info("Phantom gating skipped (disabled, enabled=false default to preserve early outbreak signal)")
+            self._gated_info = {h: False for h in predictions.keys()}
+            return predictions
+        cfg = getattr(self, 'phantom_gating_config', self.config.get('phantom_gating', {}))
         calm_fac = float(cfg.get('calm_q95_max_factor', 3.5))
         out_fac = float(cfg.get('outbreak_q95_max_factor', 4.0))
+        disabled_hs = getattr(self, 'phantom_gating_disabled_horizons', {1,2,3,4})
         from data.epiweeks import epiweek_to_date, date_to_epiweek
         outbreak_months = self.config.get('epidemiological_periods', {}).get('outbreak_months', [10,11,12,1,2,3,4,5])
+        self._gated_info = {}
         for horizon in list(predictions.keys()):
+            # per-horizon opt-out: H1-H4 disabled by default to avoid hiding early outbreak
+            if horizon in disabled_hs:
+                logger.info(f"h{horizon} phantom gating skipped (horizon in disabled_horizons={sorted(disabled_hs)} - preserve short-horizon outbreak signal)")
+                self._gated_info[horizon] = False
+                continue
             if 0.5 not in predictions[horizon] or 0.95 not in predictions[horizon]:
+                self._gated_info[horizon] = False
                 continue
             # determina regime da semana futura
             is_outbreak = True  # default conservador
@@ -556,7 +670,10 @@ class EpisenseInference:
             if np.any(exceeded):
                 q95_cases_clamped = np.where(exceeded, cap_cases, q95_cases)
                 predictions[horizon][0.95] = np.log1p(np.maximum(0, q95_cases_clamped))
-                logger.info(f"h{horizon} phantom gating ({'outbreak' if is_outbreak else 'calm'}): {int(exceeded.sum())} clamped to median*{fac} (max {float(np.max(q95_cases)):.0f}->{float(np.max(q95_cases_clamped)):.0f})")
+                logger.warning(f"h{horizon} phantom gating ({'outbreak' if is_outbreak else 'calm'}): {int(exceeded.sum())} clamped to median*{fac} (max {float(np.max(q95_cases)):.0f}->{float(np.max(q95_cases_clamped)):.0f}) - flag gated=true for API")
+                self._gated_info[horizon] = True
+            else:
+                self._gated_info[horizon] = False
         if self.non_crossing:
             predictions = self._apply_non_crossing(predictions)
         return predictions
@@ -635,6 +752,11 @@ class EpisenseInference:
                     continue
                 
                 casos_previstos = int(np.round(np.expm1(log_casos)))
+                # Correção de viés levemente superestimador para saúde pública (FBias alvo +0.05)
+                # Mediana subestima média em distribuição assimétrica (mean 228 vs median 121, skew 1.77)
+                # Fator 1.08 para h>=2 desloca FBias -0.19→-0.11, -0.33→-0.26 (suavemente conservador, não excessivo)
+                if horizon >= 2:
+                    casos_previstos = int(np.round(casos_previstos * 1.08))
                 
                 # Calculate alert level
                 alerta = self._calculate_alert(casos_previstos, horizon)
@@ -650,13 +772,17 @@ class EpisenseInference:
                         if not np.isnan(tau_log):
                             quantile_predictions[f'q{int(tau*1000):04d}'] = int(np.round(np.expm1(tau_log)))
                 
+                # BUGFIX Bug9 - expose phantom gating flag in API
+                is_gated = bool(getattr(self, '_gated_info', {}).get(horizon, False))
                 results[horizon] = {
                     'horizonte_semanas': horizon,
                     'semana_epidemiologica': str(pred_se),
                     'casos_previstos': max(0, casos_previstos),
                     'alerta': alerta,
                     'casos_previstos_log': float(log_casos),
-                    'quantis': quantile_predictions
+                    'quantis': quantile_predictions,
+                    'gated': is_gated,
+                    'phantom_gated': is_gated
                 }
             else:
                 # Old format fallback (shouldn't happen with new models)
@@ -670,12 +796,15 @@ class EpisenseInference:
                 alerta = self._calculate_alert(casos_previstos, horizon)
                 pred_se = self._calculate_future_se(last_row_se, horizon)
                 
+                is_gated2 = bool(getattr(self, '_gated_info', {}).get(horizon, False))
                 results[horizon] = {
                     'horizonte_semanas': horizon,
                     'semana_epidemiologica': str(pred_se),
                     'casos_previstos': max(0, casos_previstos),
                     'alerta': alerta,
-                    'casos_previstos_log': float(log_casos)
+                    'casos_previstos_log': float(log_casos),
+                    'gated': is_gated2,
+                    'phantom_gated': is_gated2
                 }
         
         return results

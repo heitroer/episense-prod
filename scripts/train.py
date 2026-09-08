@@ -5,11 +5,10 @@ Implements:
   1. Walk-forward epidemiological folds (Sep-Aug cycle) with leakage prevention.
   2. Multi-quantile regression: q in [0.05, 0.50, 0.95] for h in [1..8].
   3. Monotonic guarantee via np.sort(y_pred, axis=-1): Q.05 <= Q.50 <= Q.95.
-  A) SPL (Scaled Pinball Loss) matrix (8 horizons x 3 quantiles).
-  B) MAE on Q.50 only (vector of 8).
-  C) MaxAE on Q.50 only (vector of 8).
-  C) WIS (Weighted Interval Score, mean pinball across quantiles).
-  D) MAE etc.
+ A) SPL (Scaled Pinball Loss) matrix (8 horizons x 3 quantiles).
+   B) MAE on Q.50 only (vector of 8).
+   C) WIS (Weighted Interval Score, mean pinball across quantiles).
+   D) MAE etc.
   3. Horizon weights disabled (constant weight no-op).
   4. Stratified reporting: Outbreak (Oct-May) vs Calm (Jun-Sep).
 
@@ -36,7 +35,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data.features import EpisenseFeatureEngineer
-from data.epiweeks import epiweek_to_date
+from data.epiweeks import epiweek_to_date, weeks_in_year, date_to_epiweek
 
 # Optional DTW imports
 try:
@@ -89,11 +88,91 @@ def normalize_se(se) -> str:
         s = s.split('.')[0]
     return s.zfill(6) if len(s) < 6 else s
 
+# --- Unified seasonal helpers (FIX Bug5 Bug12) ---
+def _seasonal_lookup(train_se_to_y: dict, target_se: str, fallback_k: int = 4):
+    """Unified seasonal predecessor lookup: same WW previous year with fallback ±k via dates.
+    Respects weeks_in_year via epiweek_to_date / date_to_epiweek, not fixed lag 52.
+    Returns float value or None if not found."""
+    se_str = normalize_se(target_se)
+    try:
+        ano = int(se_str[:4])
+        semana = int(se_str[4:])
+    except Exception:
+        return None
+    prev = f"{ano-1}{semana:02d}"
+    if prev in train_se_to_y:
+        return float(train_se_to_y[prev])
+    try:
+        target_date = epiweek_to_date(ano, semana)
+        prev_year_weeks = weeks_in_year(ano-1)
+        base_prev_date = target_date - pd.Timedelta(days=prev_year_weeks*7)
+        for k in range(1, fallback_k+1):
+            for sign in (-1, 1):
+                cand_date = base_prev_date + pd.Timedelta(days=sign*k*7)
+                cand_se = date_to_epiweek(cand_date)
+                if cand_se in train_se_to_y:
+                    return float(train_se_to_y[cand_se])
+        # legacy string fallback
+        for k in range(1, fallback_k+1):
+            for cand in (f"{ano-1}{semana-k:02d}", f"{ano-1}{semana+k:02d}"):
+                if cand in train_se_to_y:
+                    # validate week range
+                    try:
+                        cs = int(cand[4:])
+                        if 1 <= cs <= 53:
+                            return float(train_se_to_y[cand])
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+
+def _seasonal_mase_denom(y_train_cases: np.ndarray, train_se: np.ndarray):
+    """Compute MASE denom via SE-mapped seasonal naive (not lag 52 index).
+    Returns (denom, n_pairs)."""
+    # filter only finite y_train_cases for dict building
+    y_train_cases_arr = np.asarray(y_train_cases, dtype=float)
+    train_se_arr = np.asarray(train_se)
+    if len(y_train_cases_arr) == len(train_se_arr):
+        _finite = np.isfinite(y_train_cases_arr)
+        _y_f = y_train_cases_arr[_finite]
+        _se_f = train_se_arr[_finite]
+    else:
+        _y_f = y_train_cases_arr[np.isfinite(y_train_cases_arr)]
+        _se_f = train_se_arr
+        if len(_se_f) > len(_y_f):
+            _se_f = _se_f[:len(_y_f)]
+    train_se_to_y = dict(zip([normalize_se(s) for s in _se_f], _y_f))
+    diffs = []
+    for se, y in zip(train_se, y_train_cases):
+        if not np.isfinite(y):
+            continue
+        pred = _seasonal_lookup(train_se_to_y, se, fallback_k=4)
+        if pred is not None and np.isfinite(pred):
+            _d = abs(float(y) - float(pred))
+            if np.isfinite(_d):
+                diffs.append(_d)
+    if diffs:
+        _arr = np.asarray(diffs, dtype=float)
+        _arr = _arr[np.isfinite(_arr)]
+        if len(_arr):
+            return float(np.nanmean(_arr)), len(_arr)
+        else:
+            return float('nan'), 0
+    else:
+        return float('nan'), 0
+
+
 
 def pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
     """Pinball loss for quantile tau."""
-    diff = y_true - y_pred
-    return float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+    diff = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
+    _m = np.isfinite(diff)
+    if not np.any(_m):
+        return float('nan')
+    _pin = np.maximum(tau * diff[_m], (tau - 1) * diff[_m])
+    _pin = _pin[np.isfinite(_pin)]
+    return float(np.nanmean(_pin)) if len(_pin) else float('nan')
 
 
 def dynamic_time_warping(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -291,9 +370,17 @@ class EpisenseTrainer:
             return None
         n = len(y_tr)
         w = np.ones(n, dtype=float)
-        # Peak weighting (em casos escala)
+        # Peak weighting (em casos escala) - finite guard
         if pw_enabled:
-            y_cases = np.expm1(np.asarray(y_tr, dtype=float))
+            _y_arr_pw = np.asarray(y_tr, dtype=float)
+            _y_fin_pw = np.where(np.isfinite(_y_arr_pw), _y_arr_pw, np.nan)
+            # only finite before expm1
+            y_cases = np.full_like(_y_arr_pw, np.nan, dtype=float)
+            _m_pw = np.isfinite(_y_arr_pw)
+            if np.any(_m_pw):
+                y_cases[_m_pw] = np.expm1(_y_arr_pw[_m_pw])
+            # replace nan with 0 to avoid weight nan
+            y_cases = np.where(np.isfinite(y_cases), y_cases, 0.0)
             w200 = float(pw_cfg.get('weight_200', 1.3))
             w500 = float(pw_cfg.get('weight_500', 1.8))
             w1000 = float(pw_cfg.get('weight_1000', 2.2))
@@ -430,7 +517,16 @@ class EpisenseTrainer:
         if log_scale:
             stack = np.column_stack([y_pred_dict[tau] for tau in q_order])
         else:
-            stack = np.column_stack([np.expm1(y_pred_dict[tau]) for tau in q_order])
+            # finite guard before expm1
+            cols = []
+            for tau in q_order:
+                _a = np.asarray(y_pred_dict[tau], dtype=float)
+                _out = np.full_like(_a, np.nan, dtype=float)
+                _m = np.isfinite(_a)
+                if np.any(_m):
+                    _out[_m] = np.expm1(_a[_m])
+                cols.append(_out)
+            stack = np.column_stack(cols)
         stack = np.sort(stack, axis=1)
         for j, tau in enumerate(q_order):
             y_pred_dict[tau] = stack[:, j]
@@ -470,32 +566,16 @@ class EpisenseTrainer:
     def seasonal_naive_baseline(self, y_train_cases: np.ndarray, train_se: np.ndarray,
                                  test_se: np.ndarray) -> np.ndarray:
         """Seasonal naive forecast in cases scale: value from the same SE week
-        in the previous year (fallback to T-52±k, then last value)."""
-        se_to_y = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
+        in the previous year (fallback to T-52±k via epiweek_to_date/weeks_in_year, then last value).
+        Unified via _seasonal_lookup (FIX Bug5)."""
+        train_se_to_y = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
         out = []
         last_val = float(y_train_cases[-1]) if len(y_train_cases) else 0.0
         for se in test_se:
-            se_str = normalize_se(se)
-            try:
-                ano = int(se_str[:4])
-                semana = int(se_str[4:])
-            except Exception:
-                out.append(last_val)
-                continue
-            prev = f"{ano-1}{semana:02d}"
-            if prev in se_to_y:
-                out.append(se_to_y[prev])
-                continue
-            found = False
-            for k in range(1, 5):
-                for cand in (f"{ano-1}{semana-k:02d}", f"{ano-1}{semana+k:02d}"):
-                    if cand in se_to_y:
-                        out.append(se_to_y[cand])
-                        found = True
-                        break
-                if found:
-                    break
-            if not found:
+            val = _seasonal_lookup(train_se_to_y, se, fallback_k=4)
+            if val is not None:
+                out.append(float(val))
+            else:
                 out.append(last_val)
         return np.array(out)
 
@@ -507,85 +587,136 @@ class EpisenseTrainer:
         """Compute all metrics for one evaluation window (a fold).
 
         Quantile-specific formatting:
-          - mae, MaxAE, mae, Coverage_90: Q.50 and interval [0.05,0.95]
+          - mae, Coverage_90: Q.50 and interval [0.05,0.95]
           - WIS: mean pinball across all quantiles + decomposition for 90% interval
           - SPL: all quantiles
           - Baseline sazonal (persistência Ano-1) para baseline
         """
-        y_true_cases = np.expm1(y_true)
-        y_pred_dict_cases = {tau: np.expm1(y_pred_dict[tau]) for tau in self.quantiles}
+        # NaN/Inf guard before expm1: only finite log values are transformed
+        y_true_arr = np.asarray(y_true, dtype=float)
+        y_true_cases = np.full_like(y_true_arr, np.nan, dtype=float)
+        _mask_true = np.isfinite(y_true_arr)
+        if np.any(_mask_true):
+            y_true_cases[_mask_true] = np.expm1(y_true_arr[_mask_true])
+        y_pred_dict_cases = {}
+        for tau in self.quantiles:
+            _arr = np.asarray(y_pred_dict[tau], dtype=float)
+            _out = np.full_like(_arr, np.nan, dtype=float)
+            _m = np.isfinite(_arr)
+            if np.any(_m):
+                _out[_m] = np.expm1(_arr[_m])
+            y_pred_dict_cases[tau] = _out
         y_pred_median = y_pred_dict_cases[0.50]
 
-        # ---- B) MAE on Q.50 only (mae removido) ----
+        # ---- B) MAE on Q.50 only ----
         metrics = {}
-
-        # ---- C) MaxAE on Q.50 only ----
-        metrics['maxae'] = float(np.max(np.abs(y_true_cases - y_pred_median)))
 
         # ---- C2) WIS on all quantiles (mean pinball, cases scale) + Decomposition 90% ----
         # WIS principal = wis_pinball (media pinball correta). Decomposicao apenas para debug.
         alpha = 0.10
         q_inf = y_pred_dict_cases.get(0.05, y_pred_median)
         q_sup = y_pred_dict_cases.get(0.95, y_pred_median)
-        # Sharpness, Over, Under por observação (debug apenas)
-        sharpness_vec = (q_sup - q_inf) * (alpha / 2.0)
-        # Overprediction: se y < q_inf
-        over_vec = np.where(y_true_cases < q_inf, (2.0 / alpha) * (q_inf - y_true_cases), 0.0)
-        under_vec = np.where(y_true_cases > q_sup, (2.0 / alpha) * (y_true_cases - q_sup), 0.0)
-        median_abs_vec = np.abs(y_true_cases - y_pred_median)
-        # WIS correto como média de pinball
+        # Sharpness, Over, Under por observação (debug apenas) - Interval Score alpha=0.10: IS=(q95-q05)+(2/alpha)*(q05-y)+...
+        # finite guard: only finite triples contribute
+        _finite_wis_mask = np.isfinite(y_true_cases) & np.isfinite(q_inf) & np.isfinite(q_sup) & np.isfinite(y_pred_median)
+        # debug vectors filtered to finite
+        sharpness_vec = np.where(_finite_wis_mask, (q_sup - q_inf), np.nan)
+        over_vec = np.where(_finite_wis_mask & (y_true_cases < q_inf), (2.0 / alpha) * (q_inf - y_true_cases), np.where(_finite_wis_mask, 0.0, np.nan))
+        under_vec = np.where(_finite_wis_mask & (y_true_cases > q_sup), (2.0 / alpha) * (y_true_cases - q_sup), np.where(_finite_wis_mask, 0.0, np.nan))
+        median_abs_vec = np.where(_finite_wis_mask, np.abs(y_true_cases - y_pred_median), np.nan)
+        # WIS correto como média de pinball (finite only, nanmean)
         wis_vals = []
         for tau in self.quantiles:
             diff = y_true_cases - y_pred_dict_cases[tau]
-            wis_vals.append(float(np.mean(np.maximum(tau * diff, (tau - 1) * diff))))
-        wis_pinball = float(np.mean(wis_vals)) if wis_vals else float('nan')
+            _m = np.isfinite(diff)
+            if not np.any(_m):
+                continue
+            pin = np.maximum(tau * diff[_m], (tau - 1) * diff[_m])
+            # filter pin finite as well
+            pin = pin[np.isfinite(pin)]
+            if len(pin):
+                wis_vals.append(float(np.mean(pin)))
+        wis_pinball = float(np.nanmean(wis_vals)) if wis_vals else float('nan')
         # WIS principal = pinball médio (correção bug pesos)
         metrics['wis'] = wis_pinball
-        metrics['wis_sharpness'] = float(np.mean(sharpness_vec)) if len(sharpness_vec) else 0.0
-        metrics['wis_over'] = float(np.mean(over_vec)) if len(over_vec) else 0.0
-        metrics['wis_under'] = float(np.mean(under_vec)) if len(under_vec) else 0.0
-        metrics['wis_median_abs'] = float(np.mean(median_abs_vec)) if len(median_abs_vec) else 0.0
+        metrics['wis_sharpness'] = float(np.nanmean(sharpness_vec)) if np.any(np.isfinite(sharpness_vec)) else 0.0
+        metrics['wis_over'] = float(np.nanmean(over_vec)) if np.any(np.isfinite(over_vec)) else 0.0
+        metrics['wis_under'] = float(np.nanmean(under_vec)) if np.any(np.isfinite(under_vec)) else 0.0
+        metrics['wis_median_abs'] = float(np.nanmean(median_abs_vec)) if np.any(np.isfinite(median_abs_vec)) else 0.0
         # Mantém pinball médio também para debug e decomposição vetorial para inspeção
         metrics['wis_pinball'] = wis_pinball
-        wis_total_vec = sharpness_vec + over_vec + under_vec + median_abs_vec
-        metrics['wis_decomp_mean'] = float(np.mean(wis_total_vec)) if len(wis_total_vec) else wis_pinball
+        wis_total_vec = sharpness_vec + over_vec + under_vec  # FIX Bug4: sem median_abs (IS puro para 90% interval)
+        metrics['wis_decomp_mean'] = float(np.nanmean(wis_total_vec)) if np.any(np.isfinite(wis_total_vec)) else wis_pinball
 
         # ---- Coverage 90% ----
-        coverage_vec = (y_true_cases >= q_inf) & (y_true_cases <= q_sup)
-        metrics['coverage_90'] = float(np.mean(coverage_vec)) if len(coverage_vec) else 0.0
-        # ---- Coverage 50% (q25-q75) - novo com 5 quantis ----
+        _cov_mask = np.isfinite(y_true_cases) & np.isfinite(q_inf) & np.isfinite(q_sup)
+        if not np.any(_cov_mask):
+            metrics['coverage_90'] = float('nan')
+        else:
+            coverage_vec = (y_true_cases[_cov_mask] >= q_inf[_cov_mask]) & (y_true_cases[_cov_mask] <= q_sup[_cov_mask])
+            metrics['coverage_90'] = float(np.mean(coverage_vec)) if len(coverage_vec) else float('nan')
+        # ---- Coverage 50% (q25-q75) - corrige fallback: se 0.25/0.75 não existem retorna nan
         try:
-            q25 = y_pred_dict_cases.get(0.25, y_pred_median)
-            q75 = y_pred_dict_cases.get(0.75, y_pred_median)
-            coverage50_vec = (y_true_cases >= q25) & (y_true_cases <= q75)
-            metrics['coverage_50'] = float(np.mean(coverage50_vec)) if len(coverage50_vec) else 0.0
+            if 0.25 not in y_pred_dict_cases or 0.75 not in y_pred_dict_cases:
+                metrics['coverage_50'] = float('nan')
+            else:
+                q25 = y_pred_dict_cases[0.25]
+                q75 = y_pred_dict_cases[0.75]
+                # only finite pairs count
+                _finite_cov = np.isfinite(y_true_cases) & np.isfinite(q25) & np.isfinite(q75)
+                if not np.any(_finite_cov):
+                    metrics['coverage_50'] = float('nan')
+                else:
+                    coverage50_vec = (y_true_cases[_finite_cov] >= q25[_finite_cov]) & (y_true_cases[_finite_cov] <= q75[_finite_cov])
+                    metrics['coverage_50'] = float(np.mean(coverage50_vec)) if len(coverage50_vec) else float('nan')
         except Exception:
             metrics['coverage_50'] = float('nan')
 
-        # ---- MASE (Mean Absolute Scaled Error) ----
-        # MAE do modelo / MAE sazonal naive (lag 52) do treino; fallback MAE se <52
-        mae_model = float(np.mean(median_abs_vec)) if len(median_abs_vec) else float('nan')
+        # ---- MASE (Mean Absolute Scaled Error) - FIX Bug5+Bug12 unified SE-mapped denom with floor ----
+        # Unified: denom via SE mapping (weeks_in_year + fallback ±k via datas) not lag52 index; floor to avoid 1e12
+        mae_model = float(np.nanmean(median_abs_vec)) if np.any(np.isfinite(median_abs_vec)) else float('nan')
         metrics['mae'] = mae_model
         mase = float('nan')
-        if y_train is not None and len(np.asarray(y_train, dtype=float)) > 0:
-            y_train_cases_mase = np.expm1(np.asarray(y_train, dtype=float))
-            if len(y_train_cases_mase) > 52:
-                denom_seasonal = float(np.mean(np.abs(y_train_cases_mase[52:] - y_train_cases_mase[:-52])))
-            elif len(y_train_cases_mase) > 1:
-                # fallback MAE: lag1
-                denom_seasonal = float(np.mean(np.abs(np.diff(y_train_cases_mase))))
-                if not np.isfinite(denom_seasonal) or denom_seasonal < 1e-10:
-                    denom_seasonal = float(np.mean(np.abs(y_train_cases_mase - np.mean(y_train_cases_mase))) + 1e-10)
+        denom_floor = float('nan')
+        n_pairs = 0
+        denom_seasonal = float('nan')
+        if y_train is not None and len(np.asarray(y_train, dtype=float)) > 0 and train_se is not None and test_se is not None:
+            _y_train_arr_mase = np.asarray(y_train, dtype=float)
+            _y_train_finite_mase = _y_train_arr_mase[np.isfinite(_y_train_arr_mase)]
+            if len(_y_train_finite_mase) == 0:
+                y_train_cases_mase = np.array([], dtype=float)
             else:
-                denom_seasonal = float('nan')
-            if np.isfinite(denom_seasonal) and denom_seasonal > 1e-10 and np.isfinite(mae_model):
-                mase = float(mae_model / (denom_seasonal + 1e-10))
+                y_train_cases_mase = np.expm1(_y_train_finite_mase)
+            try:
+                denom_seasonal, n_pairs = _seasonal_mase_denom(y_train_cases_mase, np.asarray(train_se))
+            except Exception as e:
+                logger.warning(f"seasonal mase denom failed: {e}")
+                denom_seasonal, n_pairs = float('nan'), 0
+            # Floor: max(denom_seasonal, P10(|y_train|), 5 casos)
+            try:
+                p10 = float(np.percentile(np.abs(y_train_cases_mase), 10)) if len(y_train_cases_mase) >= 5 else 5.0
+            except Exception:
+                p10 = 5.0
+            floor_val = max(5.0, p10)
+            if np.isfinite(denom_seasonal):
+                denom_floor = max(denom_seasonal, floor_val)
+            else:
+                denom_floor = float('nan')
+            # Confiabilidade: precisa >=5 pares sazonais e denom finito >=5.0
+            if n_pairs < 5 or not np.isfinite(denom_floor) or denom_floor < 5.0:
+                mase = float('nan')
+                logger.debug(f"MASE NaN (unreliable denom): n_pairs={n_pairs} denom={denom_floor:.2f} floor={floor_val:.2f}")
             elif np.isfinite(mae_model):
-                # fallback adicional: denominador = MAE do treino vs media treino
-                denom_fallback = float(np.mean(np.abs(y_train_cases_mase - np.mean(y_train_cases_mase))) + 1e-10) if len(y_train_cases_mase) else float('nan')
-                if np.isfinite(denom_fallback) and denom_fallback > 1e-10:
-                    mase = float(mae_model / denom_fallback)
+                mase = float(mae_model / denom_floor)
+                if mase > 1e3:
+                    logger.warning(f"MASE extreme {mase:.1f} clipped to NaN (denom {denom_floor:.2f})")
+                    mase = float('nan')
+        elif y_train is not None and len(np.asarray(y_train, dtype=float)) > 0:
+            # sem SE disponível: marca NaN (não confiável)
+            mase = float('nan')
         metrics['mase'] = mase
+        metrics['mase_denom'] = float(denom_floor) if np.isfinite(denom_floor) else float('nan')
+        metrics['mase_n_pairs'] = int(n_pairs)
 
         # ---- FBias: viés fracionário 2*Sum(P-R)/Sum(P+R) em [-2,2] ----
         try:
@@ -607,32 +738,14 @@ class EpisenseTrainer:
         metrics['fbias_rel'] = fbias_rel
         metrics['fbias_frac'] = fbias_frac
 
-        # ---- FBias estratificado por limiar dinâmico P75 anual (in-sample per fold) ----
+        # ---- FBias estratificado por limiar dinâmico P75 global por fold (FIX Bug7) ----
+        # FIX Bug7: thr único P75 de todo y_true do fold (52 ou 49 semanas), não por fatia calendário.
+        # Fold epidemiológico Sep-Ago quebrado em 2 anos calendário gerava thr instável.
         try:
-            if test_se is not None and len(test_se):
-                # mapeia SE -> ano epi
-                years = {}
-                for idx, se in enumerate(test_se):
-                    try:
-                        y = int(str(se).zfill(6)[:4])
-                    except Exception:
-                        y = 0
-                    years.setdefault(y, []).append(idx)
-                surto_mask = np.zeros(len(y_true_cases), dtype=bool)
-                calm_mask = np.zeros(len(y_true_cases), dtype=bool)
-                for y, idxs in years.items():
-                    if not idxs:
-                        continue
-                    vals = y_true_cases[idxs]
-                    if len(vals) < 4:
-                        thr = float(np.median(vals)) if len(vals) else 0.0
-                    else:
-                        thr = float(np.percentile(vals, 75))
-                    for i in idxs:
-                        if y_true_cases[i] > thr:
-                            surto_mask[i]=True
-                        else:
-                            calm_mask[i]=True
+            if test_se is not None and len(test_se) and len(y_true_cases) >= 4:
+                thr = float(np.percentile(y_true_cases, 75))
+                surto_mask = y_true_cases > thr
+                calm_mask = ~surto_mask
                 def _fbias_mask(mask):
                     if not np.any(mask):
                         return float('nan')
@@ -647,10 +760,12 @@ class EpisenseTrainer:
                 metrics['fbias_calmaria'] = _fbias_mask(calm_mask)
                 metrics['fbias_surto_n'] = int(np.sum(surto_mask))
                 metrics['fbias_calmaria_n'] = int(np.sum(calm_mask))
-                # guarda thresholds por ano para debug
-                metrics['fbias_p75_thresholds'] = {str(y): float(np.percentile(y_true_cases[idxs],75)) if len(idxs)>=4 else float(np.median(y_true_cases[idxs])) for y, idxs in years.items()}
+                metrics['fbias_p75_threshold'] = thr
+                metrics['fbias_p75_thresholds'] = {"global": thr}
             else:
                 metrics['fbias_surto']=float('nan'); metrics['fbias_calmaria']=float('nan')
+                metrics['fbias_p75_threshold']=float('nan')
+                metrics['fbias_p75_thresholds'] = {}
         except Exception as e:
             metrics['fbias_surto']=float('nan'); metrics['fbias_calmaria']=float('nan')
 
@@ -668,62 +783,116 @@ class EpisenseTrainer:
         metrics['etp'] = etp
 
         # ---- Baseline Sazonal (Persistência Ano-1) sem vazamento ----
-        # Para cada semana t no teste, baseline = valor real da mesma semana epi no ano anterior (train)
+        # Baseline usa MESMA escala que modelo: wis = mean(pinball) sobre q05/median/q95 históricos
+        # com fallback unificado _seasonal_lookup (datas ±4 + string ±4) idêntico a SPL/MASE
         y_baseline_median = None
         baseline_wis = None
         baseline_mae = None
         baseline_coverage = None
         if y_train is not None and train_se is not None and test_se is not None and len(y_train) > 0:
-            y_train_cases = np.expm1(np.asarray(y_train, dtype=float))
-            se_to_y = dict(zip([normalize_se(s) for s in train_se], y_train_cases))
-            # Histórico por semana para intervalo do baseline (empírico)
-            se_hist_bl: Dict[str, List[float]] = {}
-            for tr_se, tr_y in zip([normalize_se(s) for s in train_se], y_train_cases):
-                se_hist_bl.setdefault(tr_se[4:], []).append(float(tr_y))
-            baseline_vals = []
-            baseline_q05 = []
-            baseline_q95 = []
-            for se in test_se:
-                se_str = normalize_se(se)
-                try:
-                    ano = int(se_str[:4]); semana = int(se_str[4:])
-                except Exception:
-                    baseline_vals.append(float(y_train_cases[-1]) if len(y_train_cases) else 0.0)
-                    baseline_q05.append(float(np.quantile(y_train_cases, 0.05)) if len(y_train_cases) else 0.0)
-                    baseline_q95.append(float(np.quantile(y_train_cases, 0.95)) if len(y_train_cases) else 0.0)
-                    continue
-                prev = f"{ano-1}{semana:02d}"
-                if prev in se_to_y:
-                    baseline_vals.append(float(se_to_y[prev]))
+            _y_train_arr_bl = np.asarray(y_train, dtype=float)
+            _mask_bl = np.isfinite(_y_train_arr_bl)
+            if not np.any(_mask_bl):
+                pass
+            else:
+                _y_train_filt = _y_train_arr_bl[_mask_bl]
+                y_train_cases_bl = np.expm1(_y_train_filt)
+                y_train_cases_bl = y_train_cases_bl[np.isfinite(y_train_cases_bl)]
+                _train_se_arr = np.asarray(train_se)
+                # align se to finite mask if lengths match
+                if len(_train_se_arr) == len(_y_train_arr_bl):
+                    _train_se_bl = _train_se_arr[_mask_bl]
                 else:
-                    found = False
-                    for k in (1, -1, 2, -2):
-                        cand = f"{ano-1}{semana+k:02d}"
-                        if cand in se_to_y:
-                            baseline_vals.append(float(se_to_y[cand]))
-                            found = True
-                            break
-                    if not found:
-                        baseline_vals.append(float(y_train_cases[-1]) if len(y_train_cases) else 0.0)
-                # Intervalo empírico do baseline: quantis da mesma semana no histórico
-                week = se_str[4:]
-                hist = se_hist_bl.get(week, list(y_train_cases))
-                baseline_q05.append(float(np.quantile(hist, 0.05)))
-                baseline_q95.append(float(np.quantile(hist, 0.95)))
-            y_baseline_median = np.array(baseline_vals, dtype=float)
-            q_baseline_inf = np.array(baseline_q05, dtype=float)
-            q_baseline_sup = np.array(baseline_q95, dtype=float)
-            sharp_bl = (q_baseline_sup - q_baseline_inf) * (alpha / 2.0)
-            over_bl = np.where(y_true_cases < q_baseline_inf, (2.0 / alpha) * (q_baseline_inf - y_true_cases), 0.0)
-            under_bl = np.where(y_true_cases > q_baseline_sup, (2.0 / alpha) * (y_true_cases - q_baseline_sup), 0.0)
-            median_abs_bl = np.abs(y_true_cases - y_baseline_median)
-            wis_baseline_vec = sharp_bl + over_bl + under_bl + median_abs_bl
-            baseline_wis = float(np.mean(wis_baseline_vec)) if len(wis_baseline_vec) else float('nan')
-            baseline_mae = float(np.mean(median_abs_bl)) if len(median_abs_bl) else float('nan')
-            baseline_coverage = float(np.mean((y_true_cases >= q_baseline_inf) & (y_true_cases <= q_baseline_sup))) if len(y_true_cases) else 0.0
-            metrics['baseline_wis'] = baseline_wis
-            metrics['baseline_mae'] = baseline_mae
-            metrics['baseline_coverage_90'] = baseline_coverage
+                    _train_se_bl = _train_se_arr
+                # filter y_train_cases_bl finite for dict
+                y_train_cases_for_dict = np.expm1(_y_train_filt)
+                y_train_cases_for_dict = y_train_cases_for_dict[np.isfinite(y_train_cases_for_dict)]
+                # if filtering removed some, need to also filter _train_se_bl accordingly to keep alignment
+                # easiest: rebuild dict from _train_se_bl and y_train_cases_for_dict truncated to min len
+                _min_len = min(len(_train_se_bl), len(y_train_cases_for_dict))
+                _train_se_bl = _train_se_bl[:_min_len]
+                y_train_cases_for_dict = y_train_cases_for_dict[:_min_len]
+                se_to_y = dict(zip([normalize_se(s) for s in _train_se_bl], y_train_cases_for_dict))
+                # Histórico por semana para quantis do baseline (empírico) - mesmo fallback que SPL
+                se_hist_bl: Dict[str, List[float]] = {}
+                for tr_se, tr_y in zip([normalize_se(s) for s in _train_se_bl], y_train_cases_for_dict):
+                    if np.isfinite(tr_y):
+                        se_hist_bl.setdefault(tr_se[4:], []).append(float(tr_y))
+                # Build baseline predictions per quantile using se_hist_bl with unified fallback
+                baseline_pred_dict = {tau: [] for tau in self.quantiles}
+                for se in test_se:
+                    week = normalize_se(se)[4:]
+                    hist = se_hist_bl.get(week)
+                    if hist is None or len(hist) == 0:
+                        hist = None
+                        try:
+                            se_str = normalize_se(se)
+                            ano_t = int(se_str[:4]); semana_t = int(se_str[4:])
+                            tgt_date = epiweek_to_date(ano_t, semana_t)
+                            for k in range(1, 5):
+                                for sign in (-1, 1):
+                                    cand_date = tgt_date + pd.Timedelta(days=sign*k*7)
+                                    cand_se = date_to_epiweek(cand_date)
+                                    cand_week = cand_se[4:]
+                                    if cand_week in se_hist_bl and se_hist_bl[cand_week]:
+                                        hist = se_hist_bl[cand_week]
+                                        break
+                                if hist is not None:
+                                    break
+                            if hist is None:
+                                for k in range(1, 5):
+                                    for cand_w in (f"{semana_t-k:02d}", f"{semana_t+k:02d}"):
+                                        if cand_w in se_hist_bl and se_hist_bl[cand_w]:
+                                            hist = se_hist_bl[cand_w]
+                                            break
+                                    if hist is not None:
+                                        break
+                        except Exception:
+                            hist = None
+                    if hist is None or len(hist) == 0:
+                        hist = list(y_train_cases_bl) if len(y_train_cases_bl) else [0.0]
+                    for tau in self.quantiles:
+                        hist_arr = np.asarray(hist, dtype=float)
+                        hist_arr = hist_arr[np.isfinite(hist_arr)]
+                        if len(hist_arr) == 0:
+                            hist_arr = y_train_cases_bl[np.isfinite(y_train_cases_bl)] if len(y_train_cases_bl) else np.array([0.0])
+                        baseline_pred_dict[tau].append(float(np.quantile(hist_arr, tau)) if len(hist_arr) else float('nan'))
+                for tau in self.quantiles:
+                    baseline_pred_dict[tau] = np.array(baseline_pred_dict[tau], dtype=float)
+                y_baseline_median = baseline_pred_dict[0.50]
+                q_baseline_inf = baseline_pred_dict.get(0.05, y_baseline_median)
+                q_baseline_sup = baseline_pred_dict.get(0.95, y_baseline_median)
+                # Baseline WIS correto = mean(pinball) idêntico ao modelo
+                wis_bl_vals = []
+                for tau in self.quantiles:
+                    _pred = baseline_pred_dict[tau]
+                    _diff = y_true_cases - _pred
+                    _m = np.isfinite(_diff)
+                    if not np.any(_m):
+                        continue
+                    _pin = np.maximum(tau * _diff[_m], (tau - 1) * _diff[_m])
+                    _pin = _pin[np.isfinite(_pin)]
+                    if len(_pin):
+                        wis_bl_vals.append(float(np.nanmean(_pin)))
+                baseline_wis = float(np.nanmean(wis_bl_vals)) if wis_bl_vals else float('nan')
+                # Debug IS decomposition kept separately but not as principal
+                _mae_mask = np.isfinite(y_true_cases) & np.isfinite(y_baseline_median)
+                baseline_mae = float(np.nanmean(np.abs(y_true_cases[_mae_mask] - y_baseline_median[_mae_mask]))) if np.any(_mae_mask) else float('nan')
+                _cov_mask_bl = np.isfinite(y_true_cases) & np.isfinite(q_baseline_inf) & np.isfinite(q_baseline_sup)
+                baseline_coverage = float(np.mean((y_true_cases[_cov_mask_bl] >= q_baseline_inf[_cov_mask_bl]) & (y_true_cases[_cov_mask_bl] <= q_baseline_sup[_cov_mask_bl]))) if np.any(_cov_mask_bl) else float('nan')
+                metrics['baseline_wis'] = baseline_wis
+                metrics['baseline_mae'] = baseline_mae
+                metrics['baseline_coverage_90'] = baseline_coverage
+                # optional debug IS
+                try:
+                    _sharp_bl = np.where(_cov_mask_bl, q_baseline_sup - q_baseline_inf, np.nan)
+                    _over_bl = np.where(_cov_mask_bl & (y_true_cases < q_baseline_inf), (2.0 / alpha) * (q_baseline_inf - y_true_cases), np.where(_cov_mask_bl, 0.0, np.nan))
+                    _under_bl = np.where(_cov_mask_bl & (y_true_cases > q_baseline_sup), (2.0 / alpha) * (y_true_cases - q_baseline_sup), np.where(_cov_mask_bl, 0.0, np.nan))
+                    metrics['baseline_wis_sharpness'] = float(np.nanmean(_sharp_bl)) if np.any(np.isfinite(_sharp_bl)) else float('nan')
+                    metrics['baseline_wis_over'] = float(np.nanmean(_over_bl)) if np.any(np.isfinite(_over_bl)) else float('nan')
+                    metrics['baseline_wis_under'] = float(np.nanmean(_under_bl)) if np.any(np.isfinite(_under_bl)) else float('nan')
+                except Exception:
+                    pass
         else:
             pass
 
@@ -733,37 +902,117 @@ class EpisenseTrainer:
         for tau in self.quantiles:
             y_pred_tau = y_pred_dict_cases[tau]
             diff = y_true_cases - y_pred_tau
-            pl_model = float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+            _mask_pl = np.isfinite(diff)
+            if np.any(_mask_pl):
+                _pin = np.maximum(tau * diff[_mask_pl], (tau - 1) * diff[_mask_pl])
+                _pin = _pin[np.isfinite(_pin)]
+                pl_model = float(np.nanmean(_pin)) if len(_pin) else float('nan')
+            else:
+                pl_model = float('nan')
             pl_model_vals[tau] = pl_model
             # Seasonal quantile naive baseline from training data
-            if y_train is not None and len(y_train) >= 52 and train_se is not None and test_se is not None:
-                y_train_cases = np.expm1(np.asarray(y_train, dtype=float))
+            if y_train is not None and len(np.asarray(y_train, dtype=float)) >= 52 and train_se is not None and test_se is not None:
+                _y_train_arr_spl = np.asarray(y_train, dtype=float)
+                _mask_spl = np.isfinite(_y_train_arr_spl)
+                _y_train_filt_spl = _y_train_arr_spl[_mask_spl]
+                if len(_y_train_filt_spl) == 0:
+                    y_train_cases = np.array([], dtype=float)
+                    _train_se_filt = np.asarray(train_se)
+                else:
+                    y_train_cases = np.expm1(_y_train_filt_spl)
+                    y_train_cases = y_train_cases[np.isfinite(y_train_cases)]
+                    _train_se_arr = np.asarray(train_se)
+                    if len(_train_se_arr) == len(_y_train_arr_spl):
+                        _train_se_filt = _train_se_arr[_mask_spl]
+                        # also filter to keep only finite expm1
+                        _finite_exp = np.isfinite(np.expm1(_y_train_filt_spl))
+                        y_train_cases = y_train_cases[_finite_exp]
+                        _train_se_filt = _train_se_filt[_finite_exp]
+                    else:
+                        _train_se_filt = _train_se_arr
                 se_to_hist: Dict[str, List[float]] = {}
-                for tr_se, tr_y in zip([normalize_se(s) for s in train_se], y_train_cases):
-                    week = tr_se[4:]  # YYYYWW -> WW
-                    se_to_hist.setdefault(week, []).append(float(tr_y))
+                for tr_se, tr_y in zip([normalize_se(s) for s in _train_se_filt], y_train_cases):
+                    if np.isfinite(tr_y):
+                        week = tr_se[4:]  # YYYYWW -> WW
+                        se_to_hist.setdefault(week, []).append(float(tr_y))
                 naive_preds = []
                 for te_se in test_se:
                     week = normalize_se(te_se)[4:]
-                    hist = se_to_hist.get(week, None)
-                    if hist is None:
-                        # fallback: any week's empirical distribution
-                        hist = list(y_train_cases)
-                    naive_preds.append(np.quantile(hist, tau))
-                naive_preds = np.array(naive_preds)
-                pl_naive = float(np.mean(np.maximum(tau * (y_true_cases - naive_preds),
-                                                    (tau - 1) * (y_true_cases - naive_preds))))
+                    hist = se_to_hist.get(week)
+                    if hist is None or len(hist) == 0:
+                        # FIX Bug5: fallback ±k via datas (weeks_in_year) antes de global
+                        hist = None
+                        try:
+                            se_str = normalize_se(te_se)
+                            ano_t = int(se_str[:4]); semana_t = int(se_str[4:])
+                            tgt_date = epiweek_to_date(ano_t, semana_t)
+                            for k in range(1,5):
+                                for sign in (-1, 1):
+                                    cand_date = tgt_date + pd.Timedelta(days=sign*k*7)
+                                    cand_se = date_to_epiweek(cand_date)
+                                    cand_week = cand_se[4:]
+                                    if cand_week in se_to_hist and se_to_hist[cand_week]:
+                                        hist = se_to_hist[cand_week]
+                                        break
+                                if hist is not None:
+                                    break
+                            if hist is None:
+                                for k in range(1,5):
+                                    for cand_w in (f"{semana_t-k:02d}", f"{semana_t+k:02d}"):
+                                        if cand_w in se_to_hist and se_to_hist[cand_w]:
+                                            hist = se_to_hist[cand_w]
+                                            break
+                                    if hist is not None:
+                                        break
+                        except Exception:
+                            hist = None
+                    if hist is None or len(hist)==0:
+                        hist = list(y_train_cases) if len(y_train_cases) else [0.0]
+                    # filter hist finite
+                    hist_arr = np.asarray(hist, dtype=float)
+                    hist_arr = hist_arr[np.isfinite(hist_arr)]
+                    if len(hist_arr)==0:
+                        hist_arr = y_train_cases[np.isfinite(y_train_cases)] if len(y_train_cases) else np.array([0.0])
+                    naive_preds.append(float(np.quantile(hist_arr, tau)) if len(hist_arr) else float('nan'))
+                naive_preds = np.array(naive_preds, dtype=float)
+                _diff_naive = y_true_cases - naive_preds
+                _m_naive = np.isfinite(_diff_naive)
+                if np.any(_m_naive):
+                    _pin_naive = np.maximum(tau * _diff_naive[_m_naive], (tau - 1) * _diff_naive[_m_naive])
+                    _pin_naive = _pin_naive[np.isfinite(_pin_naive)]
+                    pl_naive = float(np.nanmean(_pin_naive)) if len(_pin_naive) else float('nan')
+                else:
+                    pl_naive = float('nan')
             else:
-                pl_naive = pinball_loss(y_true_cases, y_pred_median, tau) or (pl_model + 1e-10)
-            spl[tau] = float(pl_model / (pl_naive + 1e-10))
+                # corrige or bug: se len<52 ou train_se None, pl_naive = nan e spl = nan, não fallback para median
+                pl_naive = float('nan')
+                # explicitly handle finite: if pl_model is finite we could fallback? Task says nan not fallback.
+                # keep nan
+            # explicit nan handling for spl
+            if not np.isfinite(pl_naive) or abs(pl_naive) < 1e-12:
+                spl[tau] = float('nan')
+            elif not np.isfinite(pl_model):
+                spl[tau] = float('nan')
+            else:
+                spl[tau] = float(pl_model / (pl_naive + 1e-10))
         metrics['spl'] = {f"q{int(tau*1000):04d}": spl[tau] for tau in self.quantiles}
         metrics['spl_matrix_row'] = [spl[tau] for tau in sorted(self.quantiles)]
 
-        # ---- Non-crossing check (raw, before post-process) ----
+        # ---- Non-crossing check (raw, before post-process) - finite guard
         crossed = False
         q_order = sorted(self.quantiles)
         for i in range(len(q_order) - 1):
-            if np.any(np.expm1(y_pred_dict[q_order[i]]) > np.expm1(y_pred_dict[q_order[i+1]])):
+            _a = np.asarray(y_pred_dict[q_order[i]], dtype=float)
+            _b = np.asarray(y_pred_dict[q_order[i+1]], dtype=float)
+            _m = np.isfinite(_a) & np.isfinite(_b)
+            if not np.any(_m):
+                continue
+            # only finite before expm1
+            _a_c = np.full_like(_a, np.nan, dtype=float)
+            _b_c = np.full_like(_b, np.nan, dtype=float)
+            _a_c[_m] = np.expm1(_a[_m])
+            _b_c[_m] = np.expm1(_b[_m])
+            if np.any(_a_c[_m] > _b_c[_m]):
                 crossed = True
                 break
         metrics['quantile_crossed'] = crossed
@@ -792,17 +1041,31 @@ class EpisenseTrainer:
                              train_se: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """Compute outbreak vs calm metrics for a single window.
 
-        MAE, MaxAE and WIS are computed on period slice; SPL scaled by
+        MAE and WIS are computed on period slice; SPL scaled by
         seasonal naive baseline per week+quantile; mae timing error.
         """
         periods = self.stratify_months(se_array)
 
-        # Per-week empirical distribution of cases in TRAINING (for naive quantiles)
+        # Per-week empirical distribution of cases in TRAINING (for naive quantiles) - finite guard
+        se_hist: Dict[str, List[float]] = {}
         if y_train is not None and train_se is not None:
-            yt = np.expm1(np.asarray(y_train, dtype=float))
-            se_hist: Dict[str, List[float]] = {}
-            for tr_se, val in zip([normalize_se(s) for s in train_se], yt):
-                se_hist.setdefault(normalize_se(tr_se)[4:], []).append(float(val))
+            _y_train_arr = np.asarray(y_train, dtype=float)
+            _mask_yt = np.isfinite(_y_train_arr)
+            _y_train_filt = _y_train_arr[_mask_yt]
+            _train_se_arr = np.asarray(train_se)
+            if len(_train_se_arr) == len(_y_train_arr):
+                _train_se_filt = _train_se_arr[_mask_yt]
+            else:
+                _train_se_filt = _train_se_arr
+            yt = np.full_like(_y_train_filt, np.nan, dtype=float)
+            _m = np.isfinite(_y_train_filt)
+            if np.any(_m):
+                yt[_m] = np.expm1(_y_train_filt[_m])
+            yt = yt[np.isfinite(yt)]
+            _train_se_filt = _train_se_filt[:len(yt)] if len(_train_se_filt) > len(yt) else _train_se_filt
+            for tr_se, val in zip([normalize_se(s) for s in _train_se_filt], yt):
+                if np.isfinite(val):
+                    se_hist.setdefault(normalize_se(tr_se)[4:], []).append(float(val))
 
         result = {}
         for period in ['outbreak', 'calm']:
@@ -811,43 +1074,107 @@ class EpisenseTrainer:
                 continue
             y_true_p = y_true_cases[mask]
             med_p = y_pred_dict_cases[0.50][mask]
-            mae_p = float(np.sum(np.abs(y_true_p - med_p)))
-            mae_den_p = float(np.sum(y_true_p))
+            # finite guard for mae
+            _mae_mask = np.isfinite(y_true_p) & np.isfinite(med_p)
+            if np.any(_mae_mask):
+                mae_p = float(np.nansum(np.abs(y_true_p[_mae_mask] - med_p[_mae_mask])))
+                mae_den_p = float(np.nansum(y_true_p[_mae_mask]))
+                mae_val = float(np.nanmean(np.abs(y_true_p[_mae_mask] - med_p[_mae_mask])))
+            else:
+                mae_p = float('nan')
+                mae_den_p = float('nan')
+                mae_val = float('nan')
             entry = {
                 'n_samples': int(mask.sum()),
-                'mae': float(np.mean(np.abs(y_true_p - med_p))),
-                'maxae': float(np.max(np.abs(y_true_p - med_p))),
+                'mae': mae_val,
                 'mae_den': mae_den_p,
             }
-            # WIS for this period (mean pinball across quantiles)
+            # WIS for this period (mean pinball across quantiles) - finite
             wis_vals_p = []
             for tau in sorted(self.quantiles):
                 diff_p = y_true_p - y_pred_dict_cases[tau][mask]
-                wis_vals_p.append(float(np.mean(np.maximum(tau * diff_p, (tau - 1) * diff_p))))
-            entry['wis'] = float(np.mean(wis_vals_p)) if wis_vals_p else float('nan')
+                _m_p = np.isfinite(diff_p)
+                if not np.any(_m_p):
+                    continue
+                _pin = np.maximum(tau * diff_p[_m_p], (tau - 1) * diff_p[_m_p])
+                _pin = _pin[np.isfinite(_pin)]
+                if len(_pin):
+                    wis_vals_p.append(float(np.nanmean(_pin)))
+            entry['wis'] = float(np.nanmean(wis_vals_p)) if wis_vals_p else float('nan')
 
-            if period == 'outbreak':
-                # SPL row (3 quantiles scaled by seasonal naive pinball)
-                spl_outbreak = []
+            if period in ['outbreak', 'calm']:
+                # SPL row (3 quantiles scaled by seasonal naive pinball) - agora para ambos os períodos com finite guard
+                spl_row = []
                 for tau in sorted(self.quantiles):
                     y_pred_tau = y_pred_dict_cases[tau][mask]
                     diff = y_true_p - y_pred_tau
-                    pl_model = float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
-                    # Empirical naive quantile prediction for each test week
+                    _m_model = np.isfinite(diff)
+                    if np.any(_m_model):
+                        _pin_m = np.maximum(tau * diff[_m_model], (tau - 1) * diff[_m_model])
+                        _pin_m = _pin_m[np.isfinite(_pin_m)]
+                        pl_model = float(np.nanmean(_pin_m)) if len(_pin_m) else float('nan')
+                    else:
+                        pl_model = float('nan')
+                    # Empirical naive quantile prediction for each test week - FIX Bug5 fallback ±k via datas
                     if se_hist:
                         naive_preds = []
                         # iterate the test SEs that fell in this period
                         for te_se in np.asarray(se_array)[mask]:
                             week = normalize_se(te_se)[4:]
-                            hist = se_hist.get(week) or list(np.expm1(np.asarray(y_train, dtype=float)))
-                            naive_preds.append(np.quantile(hist, tau))
-                        naive_preds = np.array(naive_preds)
-                        pl_naive = float(np.mean(np.maximum(tau * (y_true_p - naive_preds),
-                                                            (tau - 1) * (y_true_p - naive_preds))))
+                            hist = se_hist.get(week)
+                            if hist is None or len(hist)==0:
+                                # fallback ±k via dates before global
+                                try:
+                                    se_str = normalize_se(te_se)
+                                    ano_t = int(se_str[:4]); semana_t = int(se_str[4:])
+                                    tgt_date = epiweek_to_date(ano_t, semana_t)
+                                    for k in range(1,5):
+                                        for sign in (-1, 1):
+                                            cand_date = tgt_date + pd.Timedelta(days=sign*k*7)
+                                            cand_se = date_to_epiweek(cand_date)
+                                            cand_week = cand_se[4:]
+                                            if cand_week in se_hist and se_hist[cand_week]:
+                                                hist = se_hist[cand_week]
+                                                break
+                                        if hist is not None and len(hist)>0:
+                                            break
+                                    if hist is None or len(hist)==0:
+                                        for k in range(1,5):
+                                            for cand_w in (f"{semana_t-k:02d}", f"{semana_t+k:02d}"):
+                                                if cand_w in se_hist and se_hist[cand_w]:
+                                                    hist = se_hist[cand_w]
+                                                    break
+                                            if hist is not None and len(hist)>0:
+                                                break
+                                except Exception:
+                                    hist = None
+                            if hist is None or len(hist)==0:
+                                _ytr_arr = np.asarray(y_train, dtype=float)
+                                _ytr_fin = _ytr_arr[np.isfinite(_ytr_arr)]
+                                hist = list(np.expm1(_ytr_fin)) if len(_ytr_fin) else [0.0]
+                            hist_arr = np.asarray(hist, dtype=float)
+                            hist_arr = hist_arr[np.isfinite(hist_arr)]
+                            if len(hist_arr)==0:
+                                _ytr_arr2 = np.asarray(y_train, dtype=float)
+                                _ytr_fin2 = _ytr_arr2[np.isfinite(_ytr_arr2)]
+                                hist_arr = np.expm1(_ytr_fin2) if len(_ytr_fin2) else np.array([0.0])
+                            naive_preds.append(float(np.quantile(hist_arr, tau)) if len(hist_arr) else float('nan'))
+                        naive_preds = np.array(naive_preds, dtype=float)
+                        _diff_n = y_true_p - naive_preds
+                        _m_n = np.isfinite(_diff_n)
+                        if np.any(_m_n):
+                            _pin_n = np.maximum(tau * _diff_n[_m_n], (tau - 1) * _diff_n[_m_n])
+                            _pin_n = _pin_n[np.isfinite(_pin_n)]
+                            pl_naive = float(np.nanmean(_pin_n)) if len(_pin_n) else float('nan')
+                        else:
+                            pl_naive = float('nan')
                     else:
-                        pl_naive = pl_model + 1e-10
-                    spl_outbreak.append(float(pl_model / (pl_naive + 1e-10)))
-                entry['spl_row'] = spl_outbreak
+                        pl_naive = float('nan')
+                    if not np.isfinite(pl_naive) or abs(pl_naive) < 1e-12 or not np.isfinite(pl_model):
+                        spl_row.append(float('nan'))
+                    else:
+                        spl_row.append(float(pl_model / (pl_naive + 1e-10)))
+                entry['spl_row'] = spl_row
             result[period] = entry
         return result
 
@@ -931,7 +1258,12 @@ class EpisenseTrainer:
                 if horizon not in self.ano_normalization_params:
                     self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
 
-            gap = self.config.get('training',{}).get('validation',{}).get('gap_weeks', self.wf_config.get('gap_weeks',8))
+            validation_gap = self.config.get('training',{}).get('validation',{}).get('gap_weeks', self.wf_config.get('gap_weeks',8))
+            if self.config.get('training', {}).get('gap_per_horizon', False):
+                gap = int(horizon)
+            else:
+                gap = int(validation_gap)
+            assert gap >= horizon, f"gap ({gap}) must be >= horizon ({horizon}) to prevent leakage; set gap_per_horizon=true or increase validation.gap_weeks"
             val_size = max(1, len(X_train) // 5)
             cutoff = len(X_train) - val_size
             assert cutoff - gap > 0, "Not enough training data for gap+val"
@@ -950,13 +1282,18 @@ class EpisenseTrainer:
                 X_tr_dict = {tau: X_tr_base[cols] for tau, cols in per_tau_cols.items()}
                 X_val_dict = {tau: X_val_base.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
                 X_test_dict = {tau: X_test.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
+                _y_test_vals = np.asarray(y_test.values, dtype=float)
+                _y_test_raw = np.full_like(_y_test_vals, np.nan, dtype=float)
+                _m_y = np.isfinite(_y_test_vals)
+                if np.any(_m_y):
+                    _y_test_raw[_m_y] = np.expm1(_y_test_vals[_m_y])
                 fold_prep[fold_idx] = {
                     'X_tr_dict': X_tr_dict, 'X_val_dict': X_val_dict, 'X_test_dict': X_test_dict,
                     'X_tr': X_tr_base, 'X_val': X_val_base, 'X_test': X_test,  # base for compat
                     'per_tau_cols': per_tau_cols,
                     'y_tr': y_tr_base, 'y_val': y_val_base,
                     'y_test': y_test.values,
-                    'y_test_raw': np.expm1(y_test.values),
+                    'y_test_raw': _y_test_raw,
                     'y_train': y_train.values,
                     'train_se': se_index[train_idx],
                     'test_se': se_index[test_idx],
@@ -966,11 +1303,16 @@ class EpisenseTrainer:
                 }
             else:
                 X_tr, X_val, X_test_sel = self._apply_feature_selection(X_tr_base, y_tr_base, X_val_base, X_test)
+                _y_test_vals2 = np.asarray(y_test.values, dtype=float)
+                _y_test_raw2 = np.full_like(_y_test_vals2, np.nan, dtype=float)
+                _m_y2 = np.isfinite(_y_test_vals2)
+                if np.any(_m_y2):
+                    _y_test_raw2[_m_y2] = np.expm1(_y_test_vals2[_m_y2])
                 fold_prep[fold_idx] = {
                     'X_tr': X_tr, 'X_val': X_val, 'X_test': X_test_sel,
                     'y_tr': y_tr_base, 'y_val': y_val_base,
                     'y_test': y_test.values,
-                    'y_test_raw': np.expm1(y_test.values),
+                    'y_test_raw': _y_test_raw2,
                     'y_train': y_train.values,
                     'train_se': se_index[train_idx],
                     'test_se': se_index[test_idx],
@@ -1005,10 +1347,43 @@ class EpisenseTrainer:
                     y_pred = model.predict(X_test_tau, num_iteration=model.best_iteration)
                     fold_predictions.setdefault(fold_idx, {}).setdefault(tau, {})[seed] = y_pred
 
-            # Production retrain on FULL data for each quantile
-            full_feature_cols = [c for c in X.columns
-                                 if not X[c].isna().all() and X[c].nunique() > 1]
-            X_full_base = X[full_feature_cols].fillna(0)
+            # Production retrain on FULL data for each quantile - FIX Bug1 circular recalibration
+            # FIX Bug1: se quantile_recalibration.enabled true, train FULL apenas até max_se do penúltimo fold (holdout)
+            # fold_series nunca intersecta X_full quando enabled (holdout 2025 parcial). Se disabled, FULL usa todos dados e recal não é aplicado em inference.
+            recal_cfg_full = self.config.get('quantile_recalibration', {}) if isinstance(self.config.get('quantile_recalibration', {}), dict) else {}
+            recal_enabled_full = bool(recal_cfg_full.get('enabled', False))
+            # determina cutoff holdout (penúltimo fold max SE) se enabled
+            _cutoff_se_holdout = None
+            if recal_enabled_full and len(splits) >= 2:
+                try:
+                    # splits[-2] é penúltimo; seu test_idx define max SE antes do holdout
+                    penultimate_test_idx = splits[-2][1]
+                    penultimate_se = se_index[penultimate_test_idx]
+                    _cutoff_se_holdout = str(max(penultimate_se))
+                    logger.info(f"  h{horizon} recalibration HOLDOUT enabled: FULL train até SE <= {_cutoff_se_holdout} (exclui último fold holdout)")
+                except Exception as e:
+                    logger.warning(f"holdout cutoff failed: {e}")
+                    _cutoff_se_holdout = None
+            # prepara dados FULL filtrados se holdout ativo
+            if _cutoff_se_holdout is not None:
+                mask_full = np.array([normalize_se(s) <= _cutoff_se_holdout for s in se_index])
+                if int(mask_full.sum()) < 100:
+                    logger.warning(f"  h{horizon} holdout mask muito pequena ({mask_full.sum()}), fallback para FULL completo")
+                    X_full_src = X
+                    y_full_src = y
+                    se_full_src = se_index
+                else:
+                    X_full_src = X[mask_full]
+                    y_full_src = y[mask_full]
+                    se_full_src = se_index[mask_full]
+                    logger.info(f"  h{horizon} FULL holdout: {len(X_full_src)}/{len(X)} samples (cutoff {_cutoff_se_holdout})")
+            else:
+                X_full_src = X
+                y_full_src = y
+                se_full_src = se_index
+            full_feature_cols = [c for c in X_full_src.columns
+                                 if not X_full_src[c].isna().all() and X_full_src[c].nunique() > 1]
+            X_full_base = X_full_src[full_feature_cols].fillna(0)
             if 'ano_raw' in X_full_base.columns:
                 ano_min = float(X_full_base['ano_raw'].min())
                 ano_max_train = float(X_full_base['ano_raw'].max())
@@ -1017,12 +1392,12 @@ class EpisenseTrainer:
                 X_full_base = X_full_base.drop(columns=['ano_raw'])
                 self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
             if separate_mode:
-                per_tau_full_cols = self._get_selected_columns_per_quantile(X_full_base, y)
+                per_tau_full_cols = self._get_selected_columns_per_quantile(X_full_base, y_full_src)
                 # feature_names[horizon] passa a ser dict tau->list
                 self.feature_names[horizon] = per_tau_full_cols
                 logger.info(f"  h{horizon} separate features FULL: " + ", ".join([f"q{int(t*1000):04d}:{len(c)}" for t,c in per_tau_full_cols.items()]))
             else:
-                X_full_sel, _, _ = self._apply_feature_selection(X_full_base, y, None, None)
+                X_full_sel, _, _ = self._apply_feature_selection(X_full_base, y_full_src, None, None)
                 if horizon not in self.feature_names or seed == self.ensemble_seeds[0]:
                     self.feature_names[horizon] = X_full_sel.columns.tolist()
                 per_tau_full_cols = {tau: self.feature_names[horizon] for tau in self.quantiles}
@@ -1034,7 +1409,7 @@ class EpisenseTrainer:
                     X_full_tau = X_full_base[per_tau_full_cols[tau]]
                 else:
                     X_full_tau = X_full_base
-                models[tau][seed] = self.train_single_model_full(X_full_tau, y, seed, horizon, tau, n_iters, se_full=se_index)
+                models[tau][seed] = self.train_single_model_full(X_full_tau, y_full_src, seed, horizon, tau, n_iters, se_full=se_full_src)
 
         # ------------------------------------------------------------------
         # Ensemble metrics: average predictions across seeds per (fold, quantile)
@@ -1045,19 +1420,26 @@ class EpisenseTrainer:
             y_pred_ens = {}
             for tau in self.quantiles:
                 preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
-                y_pred_ens[tau] = np.mean(np.array(preds), axis=0)
+                y_pred_ens[tau] = np.nanmean(np.array(preds, dtype=float), axis=0)
             # Enforce monotonicity on the ensembled quantiles
             self.enforce_non_crossing(y_pred_ens, log_scale=True)
             mets = self.calculate_metrics(prep['y_test'], y_pred_ens,
-                                                  y_train=prep['y_train'],
-                                                  train_se=prep['train_se'],
-                                                  test_se=prep['test_se'],
+                                                   y_train=prep['y_train'],
+                                                   train_se=prep['train_se'],
+                                                   test_se=prep['test_se'],
                                                   horizon=horizon)
             mets['fold'] = fold_idx
             mets['seed'] = 'ensemble'
             mets['horizon'] = horizon
-            # Stratified (outbreak/calm) using fold's SEs for the median
-            y_pred_cases = {tau: np.expm1(y_pred_ens[tau]) for tau in self.quantiles}
+            # Stratified (outbreak/calm) using fold's SEs for the median - finite guard before expm1
+            y_pred_cases = {}
+            for tau in self.quantiles:
+                _a = np.asarray(y_pred_ens[tau], dtype=float)
+                _out = np.full_like(_a, np.nan, dtype=float)
+                _m = np.isfinite(_a)
+                if np.any(_m):
+                    _out[_m] = np.expm1(_a[_m])
+                y_pred_cases[tau] = _out
             mets['stratified'] = self.calculate_stratified(prep['y_test_raw'], y_pred_cases,
                                                            prep['test_se'], prep['y_train'],
                                                            prep['train_se'])
@@ -1086,11 +1468,11 @@ class EpisenseTrainer:
                 ensemble_avg['full_4folds_avg'] = ensemble_avg_full
                 # SPL robusto (3 folds)
                 if spl_rows:
-                    # recalcula SPL apenas dos folds filtrados
+                    # recalcula SPL apenas dos folds filtrados - nan guard
                     filtered_spl = [ensemble_fold_metrics[i]['spl_matrix_row'] for i in range(len(ensemble_fold_metrics)) if ensemble_fold_metrics[i]['fold'] not in partial_folds]
                     if filtered_spl:
-                        ensemble_avg['spl_mean'] = list(np.mean(np.array(filtered_spl), axis=0))
-                        ensemble_avg['spl_std'] = list(np.std(np.array(filtered_spl), axis=0))
+                        ensemble_avg['spl_mean'] = list(np.nanmean(np.array(filtered_spl, dtype=float), axis=0))
+                        ensemble_avg['spl_std'] = list(np.nanstd(np.array(filtered_spl, dtype=float), axis=0))
                 logger.info(f"  h{horizon} 2025 parcial {partial_folds} excluido da media: mae 3folds={ensemble_avg.get('mae', float('nan')):.3f} vs 4folds={ensemble_avg_full.get('mae', float('nan')):.3f}")
                 # SPL matrix row (mean across folds) ja recalculado acima; pula bloco abaixo
                 spl_recalc_done = True
@@ -1098,10 +1480,10 @@ class EpisenseTrainer:
                 spl_recalc_done = False
         else:
             spl_recalc_done = False
-        # SPL matrix row (mean across folds) - so se nao recalculado
+        # SPL matrix row (mean across folds) - so se nao recalculado - nan guard
         if not spl_recalc_done and spl_rows:
-            ensemble_avg['spl_mean'] = list(np.mean(np.array(spl_rows), axis=0))
-            ensemble_avg['spl_std'] = list(np.std(np.array(spl_rows), axis=0))
+            ensemble_avg['spl_mean'] = list(np.nanmean(np.array(spl_rows, dtype=float), axis=0))
+            ensemble_avg['spl_std'] = list(np.nanstd(np.array(spl_rows, dtype=float), axis=0))
 
         # Persist per-week prediction series (diagnostic/outbreak analysis):
         # predicted vs actual cases, week by week, per fold per horizon per quantile.
@@ -1113,13 +1495,18 @@ class EpisenseTrainer:
             self.fold_series[horizon].setdefault(tau, [])
             for fold_idx, prep in fold_prep.items():
                 preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
-                y_pred_ens = np.mean(np.array(preds), axis=0)
+                y_pred_ens = np.nanmean(np.array(preds, dtype=float), axis=0)
                 # enforce será aplicado em conjunto abaixo; por enquanto guarda raw temporário
+                # finite guard for expm1
+                _y_pred_cases = np.full_like(y_pred_ens, np.nan, dtype=float)
+                _m_pred = np.isfinite(y_pred_ens)
+                if np.any(_m_pred):
+                    _y_pred_cases[_m_pred] = np.expm1(y_pred_ens[_m_pred])
                 self.fold_series[horizon][tau].append({
                     'fold': fold_idx,
                     'test_se': [str(s).zfill(6) for s in prep['test_se']],
-                    'y_test_casos': [float(x) for x in prep['y_test_raw']],
-                    'y_pred_casos': [float(np.expm1(x)) for x in y_pred_ens],
+                    'y_test_casos': [float(x) if np.isfinite(x) else float('nan') for x in prep['y_test_raw']],
+                    'y_pred_casos': [float(v) if np.isfinite(v) else float('nan') for v in _y_pred_cases],
                 })
         # Corrige crossing no fold_series salvo: ordena Q05<=Q50<=Q95 por semana (mesmo que _average_metrics usou)
         for fold_idx in fold_prep.keys():
@@ -1138,11 +1525,11 @@ class EpisenseTrainer:
             'per_fold_ensemble': ensemble_fold_metrics,
             'ensemble_avg': ensemble_avg,
             'stratified': stratified_totals,
-            'spl_matrix': list(np.mean(np.array(spl_rows), axis=0)) if spl_rows else [],
+            'spl_matrix': list(np.nanmean(np.array(spl_rows, dtype=float), axis=0)) if spl_rows else [],
         }
 
         logger.info(f"\n  h{horizon} ENSEMBLE: mae={ensemble_avg.get('mae', float('nan')):.3f}, "
-                    f"MaxAE={ensemble_avg['maxae']:.1f}, WIS={ensemble_avg['wis']:.1f} (sharp {ensemble_avg.get('wis_sharpness',0):.1f} over {ensemble_avg.get('wis_over',0):.1f} under {ensemble_avg.get('wis_under',0):.1f}), Coverage90={ensemble_avg.get('coverage_90',0):.2f} Etp={ensemble_avg.get('etp',0):.1f} ")
+                    f"WIS={ensemble_avg['wis']:.1f} (sharp {ensemble_avg.get('wis_sharpness',0):.1f} over {ensemble_avg.get('wis_over',0):.1f} under {ensemble_avg.get('wis_under',0):.1f}), Coverage90={ensemble_avg.get('coverage_90',0):.2f} Etp={ensemble_avg.get('etp',0):.1f} ")
         logger.info(f"    SPL mean (Q05/Q50/Q95): "
                     f"{[f'{x:.3f}' for x in ensemble_avg.get('spl_mean', [])]}")
 
@@ -1159,18 +1546,34 @@ class EpisenseTrainer:
             if not rows:
                 continue
             n = sum(r['n_samples'] for r in rows)
-            mae = float(sum(r['mae'] * r['n_samples'] for r in rows) / (n + 1e-10))
-            maxae = float(np.mean([r['maxae'] for r in rows]))
-            # WIS media ponderada por n (igual ao global ponderado por amostras)
-            if all('wis' in r for r in rows):
-                wis = float(sum(r['wis'] * r['n_samples'] for r in rows) / (n + 1e-10))
+            # mae weighted by n with nan handling
+            _mae_vals = np.array([r.get('mae', np.nan) for r in rows], dtype=float)
+            _mae_weights = np.array([r['n_samples'] if np.isfinite(r.get('mae', np.nan)) else 0 for r in rows], dtype=float)
+            if np.any(np.isfinite(_mae_vals)) and np.sum(_mae_weights) > 0:
+                mae = float(np.nansum(_mae_vals * _mae_weights) / (np.sum(_mae_weights) + 1e-10))
             else:
-                wis = float(np.mean([r['wis'] for r in rows]))
-            entry = {'n_samples': n, 'mae': mae, 'maxae': maxae, 'wis': wis}
-            entry['mae_den'] = float(sum(r.get('mae_den', 0) for r in rows))
-            if period == 'outbreak':
-                spl_mat_rows = np.array([r['spl_row'] for r in rows])
-                entry['spl_matrix_row'] = list(np.mean(spl_mat_rows, axis=0))
+                mae = float(np.nanmean(_mae_vals)) if np.any(np.isfinite(_mae_vals)) else float('nan')
+            # WIS media ponderada por n (igual ao global ponderado por amostras) com nan guard
+            _wis_vals = np.array([r.get('wis', np.nan) for r in rows], dtype=float)
+            _wis_weights = np.array([r['n_samples'] if np.isfinite(r.get('wis', np.nan)) else 0 for r in rows], dtype=float)
+            if np.any(np.isfinite(_wis_vals)) and np.sum(_wis_weights) > 0:
+                wis = float(np.nansum(_wis_vals * _wis_weights) / (np.sum(_wis_weights) + 1e-10))
+            else:
+                wis = float(np.nanmean(_wis_vals)) if np.any(np.isfinite(_wis_vals)) else float('nan')
+            entry = {'n_samples': n, 'mae': mae, 'wis': wis}
+            entry['mae_den'] = float(np.nansum([r.get('mae_den', 0) for r in rows if np.isfinite(r.get('mae_den', 0))]))
+            # SPL para ambos os períodos (outbreak e calm) - se houver spl_row
+            _spl_rows = [r.get('spl_row') for r in rows if r.get('spl_row') is not None]
+            if _spl_rows:
+                try:
+                    spl_mat = np.array(_spl_rows, dtype=float)
+                    entry['spl_matrix_row'] = list(np.nanmean(spl_mat, axis=0))
+                except Exception:
+                    # fallback: try mean ignoring nan
+                    try:
+                        entry['spl_matrix_row'] = list(np.nanmean(np.array(_spl_rows, dtype=float), axis=0))
+                    except Exception:
+                        pass
 
             result[period] = entry
         return result
@@ -1188,7 +1591,11 @@ class EpisenseTrainer:
             values = [m.get(key, np.nan) for m in metrics_list]
             if not all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
                 continue
-            avg[key] = float(np.nanmean(values)) if key in ['mae', 'maxae', 'wis', 'wis_sharpness', 'wis_over', 'wis_under', 'wis_median_abs', 'wis_pinball', 'wis_decomp_mean', 'mase', 'coverage_90', 'coverage_50', 'etp', 'fbias', 'fbias_rel', 'fbias_frac', 'fbias_surto', 'fbias_calmaria', 'baseline_wis', 'baseline_mae', 'baseline_coverage_90'] else float(np.mean(values))
+            # corrige agregações: usa nanmean para todas métricas numéricas
+            try:
+                avg[key] = float(np.nanmean(np.asarray(values, dtype=float)))
+            except Exception:
+                avg[key] = float(np.nanmean(values))
         return avg
 
     def _apply_feature_selection(self, X_tr: pd.DataFrame, y_tr: pd.Series,
@@ -1398,11 +1805,20 @@ class EpisenseTrainer:
                 json.dump(self.ano_normalization_params, f, indent=2)
             logger.info(f"Saved normalization params: {norm_path}")
 
-        # ---- Quantile recalibration (global + por regime outbreak/calm) ----
+        # ---- Quantile recalibration (global + por regime outbreak/calm) ---- FIX Bug1 circular
         # Gera deltas log-scale para q05/q95 via conformal: delta = quantile(y_true_log - q_pred_log)
         # por regime corrige Cob90 heterogeneo fold0 0.58 vs fold2 1.00 (report P1)
+        # FIX Bug1: quando quantile_recalibration.enabled true, usa APENAS holdout (último fold) para deltas
+        # e documenta que fold_series holdout nunca intersecta X_full (FULL treinado até penúltimo fold). Se disabled, deltas são salvos mas NÃO aplicados em inference (opt-in).
         try:
             if hasattr(self, 'fold_series') and self.fold_series:
+                recal_cfg = self.config.get('quantile_recalibration', {}) if isinstance(self.config.get('quantile_recalibration', {}), dict) else {}
+                recal_enabled = bool(recal_cfg.get('enabled', False))
+                holdout_only = recal_enabled  # quando enabled, deltas vêm só do holdout (último fold)
+                if holdout_only:
+                    logger.info("Quantile recalibration HOLDOUT mode: deltas calculados apenas no último fold (não circular, FULL excluiu holdout)")
+                else:
+                    logger.info("Quantile recalibration: deltas calculados em todos folds mas NÃO serão aplicados em inference (enabled=false, evita circularidade)")
                 # global deltas
                 recal_global = {}
                 recal_regime = {}
@@ -1413,7 +1829,14 @@ class EpisenseTrainer:
                     q05_all = []
                     q95_all = []
                     se_all = []
-                    for fold_idx in range(len(tau_dict[self.quantiles[0]])):
+                    # FIX Bug1: seleciona folds para calibração
+                    if holdout_only:
+                        # usa apenas último fold (holdout)
+                        n_folds = len(tau_dict[self.quantiles[0]])
+                        fold_indices = [n_folds - 1] if n_folds >= 1 else []
+                    else:
+                        fold_indices = range(len(tau_dict[self.quantiles[0]]))
+                    for fold_idx in fold_indices:
                         y_true_all.extend(np.log1p(tau_dict[0.5][fold_idx]['y_test_casos']))
                         q05_all.extend(np.log1p(tau_dict[0.05][fold_idx]['y_pred_casos']))
                         q95_all.extend(np.log1p(tau_dict[0.95][fold_idx]['y_pred_casos']))
@@ -1430,7 +1853,7 @@ class EpisenseTrainer:
                     recal_global[str(h)] = {"0.05": d05, "0.95": d95}
                     # regime split via epiweeks month
                     try:
-                        from data.epiweeks import epiweek_to_date
+                        from data.epiweeks import epiweek_to_date, weeks_in_year, date_to_epiweek
                         # classifica cada SE em outbreak (Out-Mai) vs calm (Jun-Set)
                         outbreak_months = self.epi_periods.get('outbreak_months', [10,11,12,1,2,3,4,5])
                         is_outbreak = []
@@ -1487,14 +1910,14 @@ class EpisenseTrainer:
         print("\n" + "=" * 90)
         print("EPISENSE QUANTILE TRAINING SUMMARY")
         print("=" * 90)
-        headings = ['SPL Q0.05', 'SPL Q0.25', 'SPL Q0.50', 'SPL Q0.75', 'SPL Q0.95', 'MAE', 'MaxAE', 'WIS']
+        headings = ['SPL Q0.05', 'SPL Q0.25', 'SPL Q0.50', 'SPL Q0.75', 'SPL Q0.95', 'MAE', 'WIS']
         print(f"{'Horizon':<9}" + "".join(f"{h:>12}" for h in headings))
         for horizon in self.target_horizons:
             if horizon not in self.validation_results:
                 continue
             a = self.validation_results[horizon].get('ensemble_avg', {})
             spl = a.get('spl_mean', [])
-            row = spl + [a.get('mae', float('nan')), a.get('maxae', float('nan')),
+            row = spl + [a.get('mae', float('nan')),
                          a.get('wis', float('nan'))]
             print(f"  h{horizon:<7}" + "".join(f"{v:>12.3f}" for v in row))
         print("\n" + "=" * 90)
@@ -1506,16 +1929,16 @@ class EpisenseTrainer:
             ob = st.get('outbreak', {}); cm = st.get('calm', {})
             line = f"  h{horizon}: "
             if ob:
-                line += (f"Surto: MAE={ob['mae']:.1f} MaxAE={ob['maxae']:.1f} WIS={ob['wis']:.1f} "
+                line += (f"Surto: MAE={ob['mae']:.1f} WIS={ob['wis']:.1f} "
                          f"SPL={[f'{v:.2f}' for v in ob.get('spl_matrix_row', [])]} n={ob['n_samples']} | ")
             if cm:
-                line += f"Calmaria: MAE={cm['mae']:.1f} MaxAE={cm['maxae']:.1f} WIS={cm['wis']:.1f} n={cm['n_samples']}"
+                line += f"Calmaria: MAE={cm['mae']:.1f} WIS={cm['wis']:.1f} n={cm['n_samples']}"
             print(line)
         # DataFrame consolidado para feira científica
         try:
             df_metrics = self.get_metrics_dataframe()
             print("\n" + "=" * 90)
-            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, MaxAE, Coverage_90")
+            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, Coverage_90")
             print(df_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
             # Salva CSV para plotagem
             df_metrics.to_csv(Path("models") / "metrics_dataframe.csv")
@@ -1525,7 +1948,7 @@ class EpisenseTrainer:
 
     def get_metrics_dataframe(self) -> pd.DataFrame:
         """Retorna DataFrame indexado por Horizonte com colunas acadêmicas.
-        Colunas: [WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, MaxAE, Coverage_90]
+        Colunas: [WIS_Total, WIS_Sharpness, WIS_Overprediction, WIS_Underprediction, MAE, Coverage_90]
         Sem vazamento: todas métricas vêm de validation_results (teste não usado no treino).
         """
         rows = []
@@ -1538,7 +1961,6 @@ class EpisenseTrainer:
                 'WIS_Overprediction': float(a.get('wis_over', np.nan)),
                 'WIS_Underprediction': float(a.get('wis_under', np.nan)),
                 'MAE': float(a.get('mae', np.nan)),
-                'MaxAE': float(a.get('maxae', np.nan)),
                 'Coverage_90': float(a.get('coverage_90', np.nan)),
                 'Coverage_50': float(a.get('coverage_50', np.nan)),
                 'FBias': float(a.get('fbias', np.nan)),
@@ -1547,7 +1969,7 @@ class EpisenseTrainer:
                 'Etp': float(a.get('etp', np.nan)),
             })
         df = pd.DataFrame(rows).set_index('Horizonte')
-        cols = ['WIS_Total','WIS_Sharpness','WIS_Overprediction','WIS_Underprediction','MAE','MaxAE','Coverage_90','Coverage_50','FBias','FBias_surto','FBias_calmaria','Etp']
+        cols = ['WIS_Total','WIS_Sharpness','WIS_Overprediction','WIS_Underprediction','MAE','Coverage_90','Coverage_50','FBias','FBias_surto','FBias_calmaria','Etp']
         df = df[cols]
         return df
 

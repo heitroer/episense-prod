@@ -8,13 +8,12 @@ from typing import Dict, Any
 import os
 
 _CONFIG_CACHE = None
+_CONFIG_MTIME = None
+_CONFIG_CACHED_PATH = None
 
 def load_config(config_path: str = None) -> Dict[str, Any]:
     """Load configuration from YAML file."""
-    global _CONFIG_CACHE
-    
-    if _CONFIG_CACHE is not None:
-        return _CONFIG_CACHE
+    global _CONFIG_CACHE, _CONFIG_MTIME, _CONFIG_CACHED_PATH
     
     if config_path is None:
         # Find config.yaml in project
@@ -34,10 +33,21 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
     
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
+    try:
+        current_mtime = config_path.stat().st_mtime
+    except Exception:
+        current_mtime = None
+
+    # cache invalidation por mtime: recarrega se arquivo mudou
+    if _CONFIG_CACHE is not None and _CONFIG_CACHED_PATH == str(config_path) and _CONFIG_MTIME == current_mtime:
+        return _CONFIG_CACHE
+
     with open(config_path, 'r') as f:
         _CONFIG_CACHE = yaml.safe_load(f)
-    
+    _CONFIG_MTIME = current_mtime
+    _CONFIG_CACHED_PATH = str(config_path)
+
     return _CONFIG_CACHE
 
 

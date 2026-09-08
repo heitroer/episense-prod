@@ -9,8 +9,8 @@ services:
     env_file:
       - .env
     restart: always
-    mem_limit: 1g
-    cpus: "1.0"
+    mem_limit: 2g
+    cpus: "1.0" # oversubscription: api + dashboard cpus=2.0 may exceed host cores; intentional for burst, relies on host scheduler
     logging:
       driver: json-file
       options:

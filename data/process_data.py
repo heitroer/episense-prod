@@ -182,7 +182,7 @@ class EpisenseDataProcessor:
         df = df.copy()
         
         # NOTA: treino usa casos PURO (confirmados) sem substituicao por nowcast.
-        # O nowcast (casos_est) so e usado na API nas ultimas 12 semanas (ver api/main.py).
+        # O nowcast (casos_est) so e usado na API/Dashboard nas ultimas 16 semanas (NOWCAST_WINDOW, ver api/main.py).
         # Log cases (target variable) - casos puro
         df['log_casos'] = np.log1p(df['casos'])
         
