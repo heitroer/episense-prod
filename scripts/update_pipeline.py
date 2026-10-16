@@ -82,16 +82,21 @@ def main():
     if changed:
         # FIX (review Bug 2): the md5 state is written ONLY AFTER a successful
         # retrain; on failure the old state remains so the next tick retries.
-        ok = run("models/train.py", "update_retrain.log")
+        ok = run("scripts/train.py", "update_retrain.log")
         if ok:
             state.write_text(digest)
-            # Restart the API so it loads the freshly retrained models
-            # (data freshness is handled by the mtime TTL in api/main.py).
+            # Restart the API so it loads the freshly retrained models.
+            # Os modelos so sao carregados no startup do uvicorn (dados sao
+            # relidos por mtime sem restart). Deploy atual = docker compose,
+            # então reinicia o container da API (nome fixo no compose).
+            # Usado antes: /Users/heitor/.hermes/.../episense-api-watchdog.sh
+            # (apontava para Episense-Teste e uvicorn bare na porta 8001).
             rc = subprocess.run(
-                ["/Users/heitor/.hermes/scripts/episense-api-watchdog.sh", "restart"],
+                ["docker", "restart", "episense-prod-api"],
                 capture_output=True, text=True)
             if rc.returncode != 0:
-                print(f"AVISO: restart da API falhou (exit {rc.returncode}) - veja logs/api.log")
+                print(f"AVISO: restart da API falhou (exit {rc.returncode}): {rc.stderr.strip()}")
+                print("Fallback manual: docker restart episense-prod-api")
         print(f"base atualizada (ultima SE {last_se(base)}) -> retreino {'OK' if ok else 'FALHOU'}")
         sys.exit(0 if ok else 1)
 
