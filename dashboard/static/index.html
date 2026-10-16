@@ -160,7 +160,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
           </tr>
         </thead>
         <tbody id="metrics-body">
-          <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:22px;font:500 13px &quot;IBM Plex Mono&quot;,monospace">Carregando métricas</td></tr>
+          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:22px;font:500 13px &quot;IBM Plex Mono&quot;,monospace">Carregando métricas</td></tr>
         </tbody>
       </table>
     </div>
@@ -198,9 +198,9 @@ function renderMetrics(){
   const thead=document.getElementById('metrics-head-row');
   if(thead){
     if(metricsAdvanced){
-      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>RMSE</span><small>casos</small></th><th><span>MAPE</span><small>% (y&gt;0)</small></th><th><span>Bias</span><small>− = subestima</small></th><th><span>CRPS</span><small>casos</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>WIS 50%</span><small>q25–q75</small></th><th><span>WIS 90%</span><small>q05–q95</small></th><th><span>Width 50%</span><small>largura IC</small></th><th><span>Width 90%</span><small>largura IC</small></th><th><span>Cobertura 50%</span><small>acerto IC 50%</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
+      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>RMSE</span><small>casos</small></th><th><span>Bias</span><small>− = subestima</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>WIS 50%</span><small>q25–q75</small></th><th><span>WIS 90%</span><small>q05–q95</small></th><th><span>Width 50%</span><small>largura IC</small></th><th><span>Width 90%</span><small>largura IC</small></th><th><span>Cobertura 50%</span><small>acerto IC 50%</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
     } else {
-      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>MAPE</span><small>% (y&gt;0)</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
+      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
     }
   }
   const body=document.getElementById('metrics-body'); if(!body) return;
@@ -211,9 +211,9 @@ function renderMetrics(){
     const tr=document.createElement('tr');
     if(metricsAdvanced){
       let b=d?.bias; let bTxt=(b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1);
-      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.rmse,1)+'</td><td>'+formatNum(d?.mape,1)+'%</td><td>'+bTxt+'</td><td>'+formatNum(d?.crps,1)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td>'+formatNum(d?.wis_50,1)+'</td><td>'+formatNum(d?.wis_90,1)+'</td><td>'+formatNum(d?.width_50,0)+'</td><td>'+formatNum(d?.width_90,0)+'</td><td class="v-cov50">'+pct(d?.coverage_50)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
+      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.rmse,1)+'</td><td>'+bTxt+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td>'+formatNum(d?.wis_50,1)+'</td><td>'+formatNum(d?.wis_90,1)+'</td><td>'+formatNum(d?.width_50,0)+'</td><td>'+formatNum(d?.width_90,0)+'</td><td class="v-cov50">'+pct(d?.coverage_50)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
     } else {
-      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.mape,1)+'%</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
+      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
     }
     body.appendChild(tr);
   }

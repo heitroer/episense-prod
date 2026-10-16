@@ -7,8 +7,9 @@ Escopo idêntico ao validação final: folds 2022-2025 (SE >= 202236; fold legad
 ensemble_avg primário = média dos folds completos (52 semanas, 2022-2024);
 full_4folds_avg = referência com os 4 folds.
 
-Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, quantile_crossed, fbias.
-Métricas: mae, rmse, mape, bias, crps, wis_total, wis_50, wis_90,
+Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
+quantile_crossed, fbias.
+Métricas: mae, rmse, bias, wis_total, wis_50, wis_90,
 width_50, width_90, coverage_50, coverage_90 (+ baseline_wis/baseline_mae/
 baseline_coverage_90 como referência sazonal).
 
@@ -245,14 +246,14 @@ def main():
             return v if isinstance(v, (int, float)) else float('nan')
         df_rows.append({
             'Horizonte': int(h), 'MAE': _g('mae'), 'RMSE': _g('rmse'),
-            'MAPE': _g('mape'), 'Bias': _g('bias'), 'CRPS': _g('crps'),
+            'Bias': _g('bias'),
             'WIS_total': _g('wis_total'), 'WIS_50': _g('wis_50'),
             'WIS_90': _g('wis_90'), 'Width_50': _g('width_50'),
             'Width_90': _g('width_90'), 'Coverage_50': _g('coverage_50'),
             'Coverage_90': _g('coverage_90'),
         })
-        print(f"  h{h}: mae={_g('mae'):.2f} rmse={_g('rmse'):.2f} mape={_g('mape'):.1f}% "
-              f"bias={_g('bias'):+.2f} crps={_g('crps'):.2f} wis_total={_g('wis_total'):.2f} "
+        print(f"  h{h}: mae={_g('mae'):.2f} rmse={_g('rmse'):.2f} "
+              f"bias={_g('bias'):+.2f} wis_total={_g('wis_total'):.2f} "
               f"(50 {_g('wis_50'):.2f} / 90 {_g('wis_90'):.2f}) "
               f"cov50={_g('coverage_50'):.2f} cov90={_g('coverage_90'):.2f} "
               f"w50={_g('width_50'):.1f} w90={_g('width_90'):.1f}")

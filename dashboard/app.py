@@ -1030,9 +1030,9 @@ def api_metrics():
         avg = val_res[h].get("ensemble_avg", {})
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
-        # conjunto canônico exposto (spec 2026-10) + referência do baseline
+        # conjunto canônico exposto (spec 2026-10, sem MAPE/CRPS) + referência do baseline
         # (MaxAE/dados legados removidos)
-        adv_keys = ["mae", "rmse", "mape", "bias", "crps", "wis_total",
+        adv_keys = ["mae", "rmse", "bias", "wis_total",
                     "wis_50", "wis_90", "width_50", "width_90",
                     "coverage_50", "coverage_90",
                     "baseline_wis", "baseline_mae", "baseline_coverage_90"]

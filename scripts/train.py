@@ -574,9 +574,9 @@ class EpisenseTrainer:
         y_pred_median = y_pred_dict_cases[0.50]
 
         # ---- Conjunto canônico (models/metrics.py, fonte única) ----
-        # mae, rmse, mape, bias, crps, wis_total, wis_50, wis_90,
+        # mae, rmse, bias, wis_total, wis_50, wis_90,
         # width_50, width_90, coverage_50, coverage_90.
-        # Removidos na spec 2026-10: MASE (e agregados), ETP, SPL,
+        # Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
         # quantile_crossed e fbias (todas as variantes/estratificações P75).
         from models.metrics import compute_all_metrics
         metrics = {}
@@ -1062,11 +1062,10 @@ class EpisenseTrainer:
         }
 
         logger.info(f"\n  h{horizon} ENSEMBLE: mae={ensemble_avg.get('mae', float('nan')):.2f}, "
-                    f"rmse={ensemble_avg.get('rmse', float('nan')):.2f}, mape={ensemble_avg.get('mape', float('nan')):.1f}%, "
+                    f"rmse={ensemble_avg.get('rmse', float('nan')):.2f}, "
                     f"bias={ensemble_avg.get('bias', float('nan')):+.2f}, "
                     f"WIS_total={ensemble_avg.get('wis_total', float('nan')):.2f} "
                     f"(50: {ensemble_avg.get('wis_50', float('nan')):.2f} | 90: {ensemble_avg.get('wis_90', float('nan')):.2f}), "
-                    f"CRPS={ensemble_avg.get('crps', float('nan')):.2f}, "
                     f"Cov50={ensemble_avg.get('coverage_50', 0):.2f} Cov90={ensemble_avg.get('coverage_90', 0):.2f}, "
                     f"Width50={ensemble_avg.get('width_50', 0):.1f} Width90={ensemble_avg.get('width_90', 0):.1f}")
 
@@ -1435,9 +1434,9 @@ class EpisenseTrainer:
         print("\n" + "=" * 90)
         print("EPISENSE QUANTILE TRAINING SUMMARY")
         print("=" * 90)
-        headings = ['MAE', 'RMSE', 'MAPE%', 'Bias', 'CRPS', 'WIS_total', 'WIS_50', 'WIS_90', 'Width50', 'Width90', 'Cov50%', 'Cov90%']
+        headings = ['MAE', 'RMSE', 'Bias', 'WIS_total', 'WIS_50', 'WIS_90', 'Width50', 'Width90', 'Cov50%', 'Cov90%']
         print(f"{'Horizon':<9}" + "".join(f"{h:>12}" for h in headings))
-        keys = ['mae', 'rmse', 'mape', 'bias', 'crps', 'wis_total', 'wis_50', 'wis_90', 'width_50', 'width_90', 'coverage_50', 'coverage_90']
+        keys = ['mae', 'rmse', 'bias', 'wis_total', 'wis_50', 'wis_90', 'width_50', 'width_90', 'coverage_50', 'coverage_90']
         for horizon in self.target_horizons:
             if horizon not in self.validation_results:
                 continue
@@ -1462,7 +1461,7 @@ class EpisenseTrainer:
         try:
             df_metrics = self.get_metrics_dataframe()
             print("\n" + "=" * 90)
-            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: MAE, RMSE, MAPE, Bias, CRPS, WIS_total, WIS_50, WIS_90, Width_50, Width_90, Coverage_50, Coverage_90")
+            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: MAE, RMSE, Bias, WIS_total, WIS_50, WIS_90, Width_50, Width_90, Coverage_50, Coverage_90")
             print(df_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
             # Salva CSV para plotagem
             df_metrics.to_csv(Path("models") / "metrics_dataframe.csv")
@@ -1472,13 +1471,13 @@ class EpisenseTrainer:
 
     def get_metrics_dataframe(self) -> pd.DataFrame:
         """Retorna DataFrame indexado por Horizonte com o conjunto canônico.
-        Colunas: [MAE, RMSE, MAPE, Bias, CRPS, WIS_total, WIS_50, WIS_90,
+        Colunas: [MAE, RMSE, Bias, WIS_total, WIS_50, WIS_90,
                   Width_50, Width_90, Coverage_50, Coverage_90]
         Sem vazamento: todas métricas vêm de validation_results (teste não usado no treino).
         """
         keys = {
-            'MAE': 'mae', 'RMSE': 'rmse', 'MAPE': 'mape', 'Bias': 'bias',
-            'CRPS': 'crps', 'WIS_total': 'wis_total', 'WIS_50': 'wis_50',
+            'MAE': 'mae', 'RMSE': 'rmse', 'Bias': 'bias',
+            'WIS_total': 'wis_total', 'WIS_50': 'wis_50',
             'WIS_90': 'wis_90', 'Width_50': 'width_50', 'Width_90': 'width_90',
             'Coverage_50': 'coverage_50', 'Coverage_90': 'coverage_90',
         }

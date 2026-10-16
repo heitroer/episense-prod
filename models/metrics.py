@@ -8,8 +8,6 @@ Convenções (tudo em escala de CASOS, pós-expm1):
 - Predição pontual = quantil 0.50 (mediana).
 - mae        = média |y − p| (mediana)
 - rmse       = sqrt( média (y − p)² )
-- mape       = média( |y − p| / y ) × 100, SOMENTE semanas com y > 0
-               (NaN quando o recorte não tem semana com y > 0)
 - bias       = média( p − y )  [>0 superestima, <0 subestima]
 - pinball(τ) = max( τ·(y−q), (τ−1)·(y−q) ), com diff = y − q
 - wis_total  = pinball médio sobre os 5 quantis {05,25,50,75,95}
@@ -19,8 +17,8 @@ Convenções (tudo em escala de CASOS, pós-expm1):
 - width_50 / width_90 = largura média dos intervalos [q25,q75] / [q05,q95]
 - coverage_50 / coverage_90 = fração de semanas reais dentro do intervalo
                (nominais 50% / 90%)
-- crps       = 2 × wis_total — aproximação de CRPS pelo grid de quantis
-               (uniforme em α; exata no limite do grid denso, cf. Bracher et al.)
+Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
+quantile_crossed e fbias.
 Todas as métricas usam máscara finita e retornam NaN quando não computáveis.
 """
 
@@ -93,12 +91,6 @@ def compute_all_metrics(y_true_cases: np.ndarray,
         out['bias'] = float(np.mean(median[m_fin] - y[m_fin]))
     else:
         out['mae'] = out['rmse'] = out['bias'] = float('nan')
-    # MAPE: apenas semanas com y > 0 (evita divisão por zero)
-    _mp = np.isfinite(y) & (y > 0) & np.isfinite(median)
-    if np.any(_mp):
-        out['mape'] = float(np.mean(np.abs((y[_mp] - median[_mp]) / y[_mp])) * 100.0)
-    else:
-        out['mape'] = float('nan')
 
     # ---- Familia probabilística (pinball) ----
     pins = {tau: np.asarray(pred_cases[tau], dtype=float)
@@ -134,8 +126,4 @@ def compute_all_metrics(y_true_cases: np.ndarray,
                           if q25 is not None and q75 is not None else float('nan'))
     out['coverage_90'] = (coverage_interval(y, q05, q95)
                           if q05 is not None and q95 is not None else float('nan'))
-
-    # ---- CRPS (aproximação por grid de quantis) ----
-    out['crps'] = (2.0 * out['wis_total']
-                   if np.isfinite(out['wis_total']) else float('nan'))
     return out
