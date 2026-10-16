@@ -259,16 +259,18 @@ def _archive_forecast(origin_se: str):
             if hh not in preds:
                 continue
             fut_se = add_epiweeks(origin_se, hh)
-            q05=q50=q95=None
+            q05=q25=q50=q75=q95=None
             for tau, arr in preds[hh].items():
                 if len(arr)==0:
                     continue
                 val = float(arr[-1])
                 casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
                 if abs(tau-0.05)<0.01: q05=casos
+                elif abs(tau-0.25)<0.01: q25=casos
                 elif abs(tau-0.50)<0.01: q50=casos
+                elif abs(tau-0.75)<0.01: q75=casos
                 elif abs(tau-0.95)<0.01: q95=casos
-            forecast.append({"h": hh, "target_se": str(fut_se), "q05": q05, "q50": q50, "q95": q95})
+            forecast.append({"h": hh, "target_se": str(fut_se), "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95})
         entry = {"origin_se": origin_se, "origin_date": se_to_date(origin_se), "generated_at": datetime.now().isoformat(), "forecast": forecast, "base_max_at_gen": _get_base_max_se()}
         data.append(entry)
         # keep sorted and limit to last 200
@@ -281,6 +283,85 @@ def _archive_forecast(origin_se: str):
     except Exception as e:
         logger.warning(f"_archive_forecast {origin_se} failed: {e}")
         import traceback; traceback.print_exc()
+
+def _backfill_archive_quantiles():
+    """Completa q25/q75 ausentes nas entradas antigas do forecast_archive.
+
+    Entradas antigas gravavam apenas q05/q50/q95 — o intervalo de 50% ficava
+    sem banda para as semanas pós-validação (histórico de previsões arquivadas).
+    NÃO altera valores já persistidos: recalcula a previsão para o MESMO
+    origin_se com os modelos atuais e preenche somente os quantis faltantes,
+    marcando a entrada com quantiles_backfilled_at. Idempotente: roda no
+    startup do dashboard e pode ser reexecutado sem efeito quando completo.
+    """
+    try:
+        if not FORECAST_ARCHIVE.exists():
+            return
+        try:
+            data = json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, list) or not data:
+            return
+
+        inf = get_inference()
+        if inf is None:
+            return
+        feat_full = _get_feat_full()
+
+        def _needs_backfill(entry):
+            fc = entry.get("forecast", [])
+            return any((f.get("q25") is None or f.get("q75") is None) for f in fc)
+
+        pending = [str(e.get("origin_se")).zfill(6) for e in data if _needs_backfill(e)]
+        if not pending:
+            return
+        logger.info(f"backfill q25/q75: {len(pending)} entradas incompletas no archive")
+
+        for origin_se in pending:
+            try:
+                reloaded = json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+                if not isinstance(reloaded, list):
+                    return
+                entry = next((e for e in reloaded if str(e.get("origin_se")).zfill(6) == origin_se), None)
+                if entry is None or not _needs_backfill(entry):
+                    continue
+                df_full = _get_df_full()
+                df_full = df_full[df_full["SE"].astype(str).str.zfill(6) <= origin_se].copy().sort_values("SE")
+                if len(df_full) == 0:
+                    continue
+                if feat_full is not None and "SE" in feat_full.columns:
+                    mask = feat_full["SE"].astype(str).str.zfill(6) <= origin_se
+                    df_feat = feat_full[mask].copy()
+                else:
+                    df_feat = inf.prepare_inference_features(df_full)
+                preds = inf.predict(df_feat)
+                for f in entry.get("forecast", []):
+                    try:
+                        hh = int(f.get("h", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if hh not in preds:
+                        continue
+                    for tau, arr in preds[hh].items():
+                        if len(arr) == 0:
+                            continue
+                        val = float(arr[-1])
+                        casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
+                        if abs(tau-0.25) < 0.01 and f.get("q25") is None:
+                            f["q25"] = casos
+                        elif abs(tau-0.75) < 0.01 and f.get("q75") is None:
+                            f["q75"] = casos
+                entry["quantiles_backfilled_at"] = datetime.now().isoformat()
+                archive_tmp = FORECAST_ARCHIVE.with_suffix(".json.tmp")
+                archive_tmp.write_text(json.dumps(reloaded, indent=2, ensure_ascii=False), encoding="utf-8")
+                archive_tmp.replace(FORECAST_ARCHIVE)
+                logger.info(f"backfill q25/q75 concluído para origin {origin_se}")
+            except Exception as e:
+                logger.warning(f"backfill q25/q75 {origin_se} falhou: {e}")
+        logger.info("backfill q25/q75 finalizado")
+    except Exception as e:
+        logger.warning(f"backfill archive: {e}")
 
 def _fetch_fresh_raw():
     """Fetch latest InfoDengue + OpenMeteo directly from external APIs and update raw CSVs.
@@ -874,6 +955,12 @@ async def dashboard_startup():
             logger.info("Dashboard scheduler iniciado: seg 06:07 + daily 06:12")
         except Exception as e:
             logger.warning(f"Dashboard scheduler não iniciado: {e}")
+    # Backfill q25/q75 nas entradas antigas do forecast_archive (so gravavam
+    # q05/q50/q95 — intervalo de 50% sem banda no histórico de previsões).
+    try:
+        threading.Thread(target=_backfill_archive_quantiles, daemon=True).start()
+    except Exception as e:
+        logger.warning(f"backfill q25/q75 não agendado: {e}")
 
 @app.on_event("shutdown")
 async def dashboard_shutdown():
