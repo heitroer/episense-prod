@@ -625,7 +625,35 @@ if(el.latest) el.latest.addEventListener('click',async()=>{const last=state.hist
     });
   }
 })();
-(async function init(){hButtons();buildYearPills();await loadMetrics();await loadHistory()})();
+// ------------------------------------------------------------------
+// AUTO-ATUALIZAÇÃO automatico: detecta nova semana epidemiologica InfoDengue
+// /api/status expoem base_max (ultima SE processada) e forecast_archive
+// (n de origens arquivadas). Quando qualquer um muda (nova semana publicada,
+// revisao InfoDengue ou forecast novo arquivado), limpa os caches do browser
+// e recarrega historico + previsao sem interacao do usuario.
+// Poll leve a cada 2 min + refresh imediato ao voltar para a aba.
+// ------------------------------------------------------------------
+let lastKnownStatus = null;
+const REFRESH_INTERVAL_MS = 120000;
+async function refreshTick(initial){
+  if(document.hidden && !initial) return;
+  let s;
+  try{ s = await json('/api/status'); }catch(e){ return; } // rede instavel: tenta no proximo tick
+  const k = String(s.base_max||'')+'|'+String(s.forecast_archive ?? '');
+  if(lastKnownStatus === null){ lastKnownStatus = k; return; }
+  if(k === lastKnownStatus) return;
+  lastKnownStatus = k;
+  const prevLast = (state.history && state.history.length) ? String(state.history[state.history.length-1].SE) : null;
+  const wasLatest = prevLast && String(state.originSE) === prevLast;
+  // Nova semana detectada: invalida caches e recarrega
+  state.cache.clear();
+  state.forecastCache.clear();
+  if(wasLatest){ state.originSE = null; } // usuario estava no 'Hoje': reancora na nova ultima semana
+  try{ await loadHistory(); }catch(e){}
+}
+setInterval(()=>{ refreshTick(false); }, REFRESH_INTERVAL_MS);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) refreshTick(false); });
+(async function init(){hButtons();buildYearPills();await loadMetrics();await loadHistory();await refreshTick(true)})();
 </script>
 </body>
 </html>
