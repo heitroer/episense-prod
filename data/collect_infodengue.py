@@ -27,13 +27,44 @@ DISEASE = config['project']['disease']  # dengue
 
 API_URL = f"https://info.dengue.mat.br/api/alertcity?geocode={GEOCODE}&disease={DISEASE}&format=csv&ew_format=SE"
 
+# Janela de revisao InfoDengue: o nowcast de uma SE continua sendo revisado por
+# ~16 semanas (config nowcast_window_weeks). Sem o intervalo ew/ey, a API
+# /alertcity retorna apenas ~3 semanas recentes com nowcast NAO consolidado —
+# as semanas antigas ficavam congeladas no historico local com valores parciais
+# (ex.: SE 202631 casos=8) enquanto o site InfoDengue exibia o consolidado
+# revisado (casos=28). Com ew_start/ey_start/ew_end/ey_end a API devolve a
+# serie CONSOLIDADA revisada (paridade com o site Italia-site).
+# 126 dias ~ 18 semanas > janela de nowcast de 16 semanas.
+REVISION_WINDOW_DAYS = 126
+
+
+def build_range_url(base_url: str, days: int = REVISION_WINDOW_DAYS) -> str:
+    """Adiciona ew_start/ey_start/ew_end/ey_end cobrindo os últimos `days` dias.
+
+    A API oficial (/services/api) monta assim:
+      /api/alertcity/?geocode=...&disease=...&format=...&ew_start=<w>&ey_start=<y>&ew_end=<w>&ey_end=<y>
+    Anos de 53 semanas e viradas sao tratados via calendario brasileiro
+    (data/epiweeks) — nunca int(SE)+n.
+    """
+    from datetime import date, timedelta
+    from data.epiweeks import date_to_epiweek
+    today = date.today()
+    se_end = str(date_to_epiweek(today)).zfill(6)
+    se_start = str(date_to_epiweek(today - timedelta(days=days))).zfill(6)
+    return (
+        f"{base_url}"
+        f"&ew_start={int(se_start[4:])}&ey_start={int(se_start[:4])}"
+        f"&ew_end={int(se_end[4:])}&ey_end={int(se_end[:4])}"
+    )
+
 
 def collect_infodengue_data() -> pd.DataFrame:
-    """Collect dengue data from InfoDengue API."""
-    logger.info(f"Fetching data from InfoDengue API: {API_URL}")
+    """Collect dengue data from InfoDengue API (janela de revisao CONSOLIDADA)."""
+    url = build_range_url(API_URL)
+    logger.info(f"Fetching data from InfoDengue API (range revisado): {url}")
     
     try:
-        response = requests.get(API_URL, timeout=60)
+        response = requests.get(url, timeout=60)
         response.raise_for_status()
         
         # Parse CSV

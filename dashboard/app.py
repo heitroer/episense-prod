@@ -372,14 +372,18 @@ def _fetch_fresh_raw():
 
 
 def _fetch_infodengue_live() -> pd.DataFrame:
-    """Live fetch: InfoDengue /alertcity retorna apenas as últimas ~3 semanas.
-    Para histórico completo (S18+ correto), carrega o full history local
-    (infodengue_cg_full.csv) e mescla as fresh rows por SE em memória.
-    Assim o dashboard sempre mostra dados ATUALIZADOS na abertura do site,
-    sem depender de arquivo estático desatualizado, mas com histórico completo.
+    """Live fetch: com range ew/ey a InfoDengue devolve a série consolidada
+    revisada (~18 semanas). O full history local (infodengue_cg_full.csv)
+    fornece o histórico anterior; as fresh rows sobrescrevem SEs recentes com
+    as revisões. Assim o dashboard sempre mostra dados ATUALIZADOS e 100%
+    paridade com o site InfoDengue na abertura do site.
     """
     import requests
-    url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
+    from data.collect_infodengue import build_range_url
+    # Range ew/ey: série consolidada revisada (~18 semanas), paridade com site
+    url = build_range_url(
+        f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
+    )
     # 1) carrega full history do disco (persistido por _fetch_fresh_raw)
     full_path = ROOT / "data/raw/infodengue/infodengue_cg_full.csv"
     df_full = None

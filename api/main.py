@@ -76,12 +76,18 @@ from data.live_utils import NOWCAST_WINDOW, apply_nowcast, anchor_guard_filter
 
 
 def _fetch_infodengue() -> pd.DataFrame:
-    """Fetch dengue data: InfoDengue API retorna apenas ~3 semanas recentes.
-    Para histórico completo (S18+ correto), carrega full history local
-    (infodengue_cg_full.csv) e mescla fresh em memória. Sempre atualizado
-    a cada request (TTL 60s), não estático.
+    """Fetch dengue data: com range ew/ey a API InfoDengue retorna a série
+    consolidada revisada (~18 semanas de revisão), vindo do full history local
+    (infodengue_cg_full.csv) + revisões fresh por SE — paridade com o site.
+    Sempre atualizado a cada request (TTL 60s), não estático.
     """
-    url = f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
+    # Range ew/ey (janela de revisao consolidada ~18 semanas): sem ele a API
+    # retorna ~3 semanas com nowcast nao consolidado e as revisoes do InfoDengue
+    # (~16 semanas) nunca alcançavam o historico — superficie difere do site.
+    from data.collect_infodengue import build_range_url
+    url = build_range_url(
+        f"{INFODENGUE_URL}?geocode={GEOCODE}&disease=dengue&format=json&ew_format=SE"
+    )
     # full history local
     full_path = Path("data/raw/infodengue/infodengue_cg_full.csv")
     df_full = None
