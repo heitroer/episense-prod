@@ -1030,8 +1030,12 @@ def api_metrics():
         avg = val_res[h].get("ensemble_avg", {})
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
-        # advanced keys exposed for toggle (maxae removido)
-        adv_keys = ["mae","wis","coverage_90","coverage_50","wis_sharpness","mase","wis_over","wis_under","baseline_wis","etp","fbias","fbias_rel","fbias_frac","fbias_surto","fbias_calmaria"]
+        # conjunto canônico exposto (spec 2026-10) + referência do baseline
+        # (MaxAE/dados legados removidos)
+        adv_keys = ["mae", "rmse", "mape", "bias", "crps", "wis_total",
+                    "wis_50", "wis_90", "width_50", "width_90",
+                    "coverage_50", "coverage_90",
+                    "baseline_wis", "baseline_mae", "baseline_coverage_90"]
         def pick(src):
             return {k: src.get(k) for k in adv_keys} if src else None
         out[h] = {

@@ -52,6 +52,7 @@ data/processed/
 # Models (large files - use DVC or model registry)
 models/*.pkl
 models/*.json
+models/*.bak
 
 # Docker
 .docker/
