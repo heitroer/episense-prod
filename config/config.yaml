@@ -174,16 +174,17 @@ training:
       0.25: 0.005
       0.5: 0.005
       0.75: 0.005
-      0.95: 0.005
+      0.95: 0.035
     max_features_per_quantile:
       0.05: 80
       0.25: 80
       0.5: 120
       0.75: 80
-      0.95: 80
+      0.95: 10
   temporal_weighting:
     enabled: true
-    half_life_years: 6.58
+    half_life_years: 3.5
+    half_life_years_long: 10.0  # 6.0->10 h5-8 preserva 2019 para h8 ETP, mas q95 sem peak_weight compensa
   peak_weighting:
     enabled: true
     weight_200: 1.3
@@ -211,14 +212,14 @@ training:
       bagging_freq: 3
     0.5: {}
     0.95:
-      num_leaves: 31
-      max_depth: 6
-      min_child_samples: 30
-      learning_rate: 0.025
-      reg_alpha: 0.8
-      reg_lambda: 1.5
-      min_gain_to_split: 0.02
-      feature_fraction: 0.75
+      num_leaves: 10
+      max_depth: 4
+      min_child_samples: 60
+      learning_rate: 0.02
+      reg_alpha: 2.0
+      reg_lambda: 5.0
+      min_gain_to_split: 0.05
+      feature_fraction: 0.60
       bagging_fraction: 0.75
       bagging_freq: 3
     0.25:
@@ -257,10 +258,14 @@ quantiles:
 non_crossing:
   enabled: true
   method: post_process
+quantile_recalibration:
+  enabled: true  # Opção A fase 3: holdout último fold (2025) para calibrar q95 por regime, corrige superestimação 24-25
+  method: holdout
 phantom_gating:
   enabled: true
-  calm_q95_max_factor: 3.5
-  outbreak_q95_max_factor: 4.0
+  calm_q95_max_factor: 1.5  # 1.8->1.5 corta 2000 vs 700 (calm cap 1.5× mediana) aceita h1 +2% para h8 ETP 10→4
+  outbreak_q95_max_factor: 2.0  # 2.5->2.0
+  disabled_horizons: []
 # horizon_weights disabled: pesos iguais por horizonte evita overfit
 horizon_weights:
   enabled: false
