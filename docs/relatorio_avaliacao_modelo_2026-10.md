@@ -212,6 +212,50 @@ calibração de h4 foi ambígua e ficou de fora — ver decisão abaixo).
 - **P8 — recalibração holdout fraca: resolvido** (legacy off; conformal 4 folds).
 - **P9 — cov50 h7–h8: leve melhora, segue aberto** (0.43/0.42 vs nominal 0.50).
 
+### Investigação: q0.95 sobre-estimado em todos os folds/horizontes (17/10)
+
+Diagnóstico (validação walk-forward + log de treino + artefato conformal):
+
+| h·fold | q95 mediana | q95−y (p50/p90) | y>q95 | q95/med_prev (y<20) |
+|---|---|---|---|---|
+| h1 f0 | 1304 | +1123/+1286 | 0,0% | **29,7×** |
+| h1 f2 | 533 | +441/+509 | 0,0% | — |
+| h1 f3 | 217 | +181/+252 | 0,0% | 6,6× |
+| h8 f2 | 232 | +134/+256 | 0,0% | — |
+
+Causas identificadas, em ordem de peso:
+
+1. **Cauda sub-condicionada (estrutural)** — a seleção do q95 usava
+   `threshold_per_quantile: 0.035` + `max_features: 10` (vs 80 nos outros quantis):
+   sobreviviam só 22–25 de 672 features e o modelo de cauda não conseguia
+   condicionar a largura ao regime — herdava a largura do pool completo
+   (y de 2 a 1132 no histórico).
+2. **Escala multiplicativa (log1p)** — spread em log vira `q95 ≈ med×exp(1,64σ)`;
+   em nível alto o mesmo σ produz +1000 no surto e não “+30”.
+3. **Pinball 19:1 + picos raros** — errar por baixo custa 19× a sobre-cobertura;
+   com ~4 temporadas de picos, o ótimo é seguro caro.
+4. **Cap do conformal** — h1·mid d95 = −1,000 (bateu no teto ±1,0), h4·mid
+   −0,722: o pool vota “q95 está ~2,7× acima” e o cap limita a correção.
+
+**Experimento A (cap do conformal, rejeitado):** grid `max_abs_delta`
+1,0→1,3→1,5 com avaliações expanding idênticas (h1/h2/h3/h5):
+
+| cap | h1 cov90 / w90 / WIS / y>q95 | h2 cov90 | h3 cov90 | h5 cov90 |
+|---|---|---|---|---|
+| 1,0 | 0,88 / 521 / 16,0 / 4,3% | 0,92 | 0,90 | 0,88 |
+| 1,3 | 0,86 / 512 / 15,9 / 5,8% | 0,91 | 0,90 | 0,88 |
+| 1,5 | 0,87 / 511 / 15,9 / 5,8% | 0,91 | 0,90 | 0,89 |
+
+Gains de largura triviais (−2%), cov90 cai em h1/h2 e fold1 h1 (y>q95 15%)
+não muda — os deltas expanding raramente excedem 1,0; o cap não é a amarração.
+**Rejeitado; cap mantido em 1,0.**
+
+**Experimento B (Fase 2, aplicado):** seleção da cauda relaxada —
+`threshold_per_quantile 0.95: 0.01` e `max_features_per_quantile 0.95: 40`.
+Seleção pós-mudança: **51–55 features** (antes 22–25), smoke test íntegro
+(gate PASS) e **retreino completo em andamento** — resultados serão anexados
+após a validação expanding da nova cadeia.
+
 ### Limitações conhecidas deixadas abertas (documentadas)
 
 1. fold0 (surto 2023) em h4–h8: subestimação do pico e timing 6–8 SEM cedo, não
