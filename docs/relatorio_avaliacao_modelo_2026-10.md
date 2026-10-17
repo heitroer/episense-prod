@@ -93,4 +93,56 @@ Pico: ±1–2 sem em h1/h2; h4 até 6 sem; h8 até 8 sem (fold3 pico previsto em
 4. **Gate de implantação por fold** no retreino (worst-fold MAE vs baseline).
 5. Ajuste de amostragem/potência de loss para enfatizar semanas de alta magnitude.
 
+---
+
+# Adendo técnico (out/2026) — correções implementadas
+
+Detalhes dos experimentos podem ser vistos no GitHub (commits a partir de `15934e7`).
+
+## O que foi implementado
+
+| # | Fraqueza (P) | Mudança | Arquivo | Desenho |
+|---|---|---|---|---|
+| 1 |P8, P2, P9| **CQR delta-only** (`quantile_conformal`) por horizonte × regime-base, calibrada nos 4 folds com pesos temporais (meia-vida 2,5 a) e deltas limitados a ±1.0 log | `models/calibration.py` (novo) | Aplicado em **h1–h3** (evidência abaixo); validação **expanding** (fold calibrado só com folds anteriores) |
+| 2 |P2, P4| **Regime-base por intensidade observável** (casos da semana-base: high ≥100 / mid 20–100 / low <20) — decidível em produção | `models/calibration.py::make_regime_hook` | Substitui o regime por mês-do-alvo, que misturava temporadas de amplitudes distintas |
+| 3 |P1, P3, P4| **`always_keep` de features de regime** na seleção (16 features: YTD-ratio, YoY, growth-ratio, momentum, slopes/accel, anomalies clim., vs-EWMA proxy de R) | `scripts/train.py` + config | Sobrevivem ao corte 380→120 por ganho |
+| 4 |P7| **Deployment gate por fold**: reprova retreino se pior fold completo (≥52 sem) tiver MAE > 1,35× baseline sazonal | `scripts/train.py` (`deployment_gate.json`) + `scripts/update_pipeline.py` | Falha ⇒ backup `_backup_stable` restaurado, sem md5 novo e sem restart da API |
+| 5 |P8| Recalibração holdout legacy **desativada** (`quantile_recalibration.enabled: false`) — era calibrada só no fold 2025 (ano fraco) | `config/config.yaml` | Substituída pela CQR |
+
+## Experimentos que definiram o desenho (sobre validação walk-forward existente)
+
+Avaliações **antes** do retreino (modelo atual, sem `always_keep`):
+
+| Esquema | Resultado |
+|---|---|
+| LOO por mês-do-alvo (v2 inicial) | pior que raw em folds extremos: fold0 h8 mae 187→219, cov90 0.75→0.44 — **rejeitado** |
+| Expanding + median shift | transferência do shift cruza temporadas de amplitudes 10×: h4 fold1 mae 76→94 **rejeitado** para a mediana |
+| **Delta-only + expanding + regime-base por intensidade** | **aprovado**: h1 cov90 0.82→0.88, cov50 0.45→0.53, bias −24.4→−20.8, WIS estável; fold-level: fold1 0.77→0.87, fold3 0.80→0.92; h4–h8 intactos |
+
+Decisões de projeto registradas:
+
+- **Median shift global desativado** (`apply_median_shift: false`): o pool cruza
+  temporadas de amplitudes 10× e o shift da mediana transfere mal (o peso temporal
+  domina com os dados recentes, mas a próxima temporada pode ter outra amplitude).
+  A correção de viés fica por conta das features de regime (item 3) no retreino.
+- **Deltas fora de h4–h8** (`apply_horizons: [1,2,3]`): em horizontes longos os erros
+  de cobertura são contraditórios ENTRE temporadas (fold2 bandas 2–4× reais vs fold3
+  bandas apertadas) — o conformal com pool cruzado degrada WIS. O problema P9
+  (cov50 h7–h8 ~0.40) fica para o modelo recombinado + futura calibração
+  condicional por horizonte com mais temporadas.
+- Nota honesta: **fold0 fica sem calibração** na avaliação expanding (era o
+  histórico disponível até então). Em produção o artefato carrega os 4 folds.
+
+## Métricas canônicas
+
+Mantidas: `mae, rmse, bias, wis_total, wis_50, wis_90, width_50, width_90,
+coverage_50, coverage_90` (+ `baseline_wis/mae/coverage_90`). Nos folds
+calibrados, as métricas canônicas passam a refletir o estado FINAL da cadeia
+(modelo + calibração conformal), com `raw_uncalibrated` preservado por fold e
+`calibration` documentando esquema/parâmetros.
+
+## Resultados pós-retreino
+
+(A ser preenchido após o retreino full com as mudanças acima.)
+
 — Gerado em out/2026 a partir das artefatos de validação do projeto.

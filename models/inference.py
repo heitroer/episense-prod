@@ -60,6 +60,23 @@ class EpisenseInference:
         self._load_metadata()
         self._load_normalization_params()
         self._load_quantile_recalibration()
+        # ---- Calibração conformal v2 (CQR + median shift) — substitui recal legacy ----
+        self.quantile_conformal_config = self.config.get('quantile_conformal', {}) if isinstance(self.config.get('quantile_conformal', {}), dict) else {}
+        self.quantile_conformal_enabled = bool(self.quantile_conformal_config.get('enabled', False)) and not self.quantile_recalibration_enabled
+        self.conformal = {}
+        self.conformal_outbreak_months = list((self.config.get('epidemiological_periods', {}) or {}).get('outbreak_months', [10, 11, 12, 1, 2, 3, 4, 5]))
+        if self.quantile_conformal_enabled:
+            try:
+                from models.calibration import load_json as _load_conformal
+                self.conformal = _load_conformal(self.model_dir / "quantile_conformal.json")
+                if self.conformal:
+                    n_h = len([k for k in self.conformal if str(k).isdigit()])
+                    logger.info(f"Conformal calibration carregada: {n_h} horizontes "
+                                f"(half-life {self.quantile_conformal_config.get('half_life_years')}a)")
+                else:
+                    logger.warning("quantile_conformal.enabled=true mas arquivo ausente/invalído — sem aplicação")
+            except Exception as e:
+                logger.warning(f"Conformal calibration não carregada ({e}) — sem aplicação")
     
     def _load_models(self):
         """Load all ensemble models."""
@@ -476,6 +493,23 @@ class EpisenseInference:
                 predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
             elif has_recal:
                 logger.info("Quantile recalibration files present but skipped (enabled=false, default) to avoid circular leakage")
+            # Calibração conformal v3 (CQR delta-only): substitui o recal legacy.
+            # Predições em log1p; regime por intensidade da semana-base (última
+            # observada); horizontes apply_horizons (default h1-h3) antes do gating.
+            if getattr(self, 'quantile_conformal_enabled', False) and getattr(self, 'conformal', None):
+                try:
+                    try:
+                        _last_se_conf = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in getattr(df_last, 'columns', []) and len(df_last) > 0 else None
+                    except Exception:
+                        _last_se_conf = None
+                    try:
+                        _casos_conf = float(df['casos'].iloc[-1]) if 'casos' in getattr(df, 'columns', []) and len(df) > 0 else None
+                    except Exception:
+                        _casos_conf = None
+                    predictions = self._apply_conformal(predictions, last_se=_last_se_conf,
+                                                        casos_base=_casos_conf)
+                except Exception as e:
+                    logger.warning(f"conformal apply falhou: {e}")
             # BUGFIX Bug9 - phantom gating opt-in per horizon, disabled by default
             # Gating clamps q95 to median*3.5 in calm (Jun-Set) which hides early outbreak; now:
             # * disabled by default (phantom_gating.enabled=false) - matches _load default
@@ -511,6 +545,72 @@ class EpisenseInference:
                 logger.warning(f"clamp q05 negativo falhou: {e}")
         
             return predictions
+
+    def _apply_conformal(self, predictions: Dict[int, Dict[float, 'np.ndarray']], last_se: str = None,
+                         casos_base: float = None) -> Dict[int, Dict[float, 'np.ndarray']]:
+        """CQR delta-only (v3), por horizonte x REGIME-BASE (intensidade da base).
+
+        Regime definido pelos CASOS DA SEMANA-BASE (última observada) — decidível
+        em produção. Aplica somente horizontes em apply_horizons (default [1,2,3]).
+        Predições do EpisenseInference são log1p; reordena colunas (non-crossing).
+        """
+        if not last_se:
+            logger.warning("conformal: last_se desconhecido — sem aplicação")
+            return predictions
+        from models.calibration import entry_for_key
+        th = self.quantile_conformal_config.get('regime_thresholds') or {}
+        high = float(th.get('high', 100.0))
+        mid = float(th.get('mid', 20.0))
+        try:
+            c = float(casos_base)
+        except Exception:
+            c = None
+        if c is None or not np.isfinite(c):
+            regime_key = 'global'
+        else:
+            regime_key = 'high' if c >= high else ('mid' if c >= mid else 'low')
+        apply_hs = self.quantile_conformal_config.get('apply_horizons', [1, 2, 3])
+        try:
+            apply_hs = set(int(x) for x in apply_hs)
+        except Exception:
+            apply_hs = {1, 2, 3}
+        logger.info(f"conformal: base {last_se} casos={c if c is not None else 'desconhecido'} "
+                    f"-> regime '{regime_key}' | horizontes {sorted(apply_hs)}")
+        out = {}
+        for horizon, tau_preds in predictions.items():
+            taus_sorted = sorted(tau_preds.keys())
+            if int(horizon) not in apply_hs or len(taus_sorted) < 2:
+                out[horizon] = tau_preds
+                continue
+            try:
+                entry = entry_for_key(self.conformal, int(horizon), regime_key)
+            except Exception:
+                entry = self.conformal.get(str(int(horizon)), {}).get('global', {})
+            arrs = None
+            if taus_sorted:
+                arrs = np.vstack([np.asarray(tau_preds[t], dtype=float) for t in taus_sorted])
+            if entry and arrs is not None and arrs.size > 0:
+                try:
+                    shift = float(entry.get('median_shift', 0.0) or 0.0)
+                except Exception:
+                    shift = 0.0
+                if np.isfinite(shift) and shift != 0.0:
+                    arrs = arrs + shift   # median_shift está 0 no desenho v3 (delta-only)
+                for i, t in enumerate(taus_sorted):
+                    if abs(float(t) - 0.5) > 1e-9:
+                        delta = (entry.get('deltas') or {}).get(f'{float(t):.2f}')
+                        try:
+                            delta = float(delta) if delta is not None else None
+                        except Exception:
+                            delta = None
+                        if delta is not None and np.isfinite(delta):
+                            arrs[i] = arrs[i] + delta
+                # non-crossing por semana (ordenação entre τ em cada coluna)
+                arrs = np.sort(arrs, axis=0)
+                out[horizon] = {t: arrs[i] for i, t in enumerate(taus_sorted)}
+            else:
+                out[horizon] = tau_preds
+        return out
 
     def _apply_quantile_recalibration(self, predictions: Dict[int, Dict[float, np.ndarray]], last_se: str = None) -> Dict[int, Dict[float, np.ndarray]]:
         """Apply split conformal recalibration to q0.05 and q0.95.

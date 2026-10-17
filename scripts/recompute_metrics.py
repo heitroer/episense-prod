@@ -29,6 +29,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.metrics import compute_all_metrics, QUANTILES, PAIR_50, PAIR_90, pinball_mean  # noqa: E402
+from models.calibration import compute_conformal  # noqa: E402
 from data.epiweeks import epiweek_to_date, date_to_epiweek  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +156,15 @@ def main():
         cfg = yaml.safe_load(_f)
     start_year = int(cfg.get('training', {}).get('start_year', 2014))
     min_se = f"{start_year}01"
+    qc_cfg = cfg.get('quantile_conformal', {}) if isinstance(cfg.get('quantile_conformal', {}), dict) else {}
+    QC_ENABLED = bool(qc_cfg.get('enabled', False))
+    QC = {'half_life_years': float(qc_cfg.get('half_life_years', 2.5)),
+          'max_delta': float(qc_cfg.get('max_abs_delta', 1.0)),
+          'max_shift': float(qc_cfg.get('max_abs_median_shift', 0.8))}
+    try:
+        QC['apply_horizons'] = set(int(x) for x in qc_cfg.get('apply_horizons', [1, 2, 3]))
+    except Exception:
+        QC['apply_horizons'] = {1, 2, 3}
     base = pd.read_csv(BASE, usecols=["SE", "casos"], dtype={"SE": str})
     base["SE"] = base["SE"].str.replace(".0", "", regex=False)
 
@@ -185,6 +195,35 @@ def main():
                         truth[str(se).zfill(6)] = float(true_v) if np.isfinite(float(true_v)) else float('nan')
 
         per_fold = []
+        # Calibração conformal EXPANDING v3 (honesto p/ implantação sequencial):
+        # fold f é calibrado SÓ com os folds ANTERIORES (o artefato de produção usa
+        # os folds disponíveis até então); fold0 fica sem calibração (história nula).
+        # Deltas conformal delta-only por regime-base (intensidade da semana-base).
+        fold_conformal = {}
+        if QC_ENABLED:
+            try:
+                from models.calibration import compute_conformal, make_regime_hook, entry_for_key, apply_deltas_log
+                casos_by_se = {str(se).zfill(6): float(v) for se, v in zip(base['SE'], base['casos'])
+                               if np.isfinite(float(v))}
+                regime_hook = make_regime_hook(casos_by_se, qc_cfg.get('regime_thresholds') or None)
+                fold_ids = sorted(int(str(b['fold'])) for blocks in hd.values() for b in blocks)
+                for fid0 in sorted(set(fold_ids)):
+                    pool = {h_int: {str(tau): [blocks[j] for j in range(len(blocks))
+                                               if int(blocks[j]['fold']) < fid0]
+                                    for tau, blocks in bd.items()}
+                            for h_int, bd in ({int(h): hd}).items()}
+                    has_pool = any(blocks for bd in pool.values() for blocks in bd.values())
+                    if has_pool:
+                        try:
+                            fold_conformal[str(fid0)] = compute_conformal(
+                                pool, regime_hook,
+                                half_life_years=QC['half_life_years'],
+                                max_delta=QC['max_delta'],
+                                use_median_shift=False)
+                        except Exception as e:
+                            print(f"AVISO: conformal expanding fold {fid0} falhou ({e})")
+            except Exception as e:
+                print(f"AVISO: conformal expanding indisponível ({e})")
         for fid in sorted(fold_map.keys()):
             fm = fold_map[fid]
             truth = fm.pop("_truth", {})
@@ -202,7 +241,48 @@ def main():
                     s_vals = sorted(vals)
                     for i, t in enumerate(QUANTILES):
                         preds[t][w] = s_vals[i]
-            m = compute_all_metrics(y_true, preds)
+            m_raw = compute_all_metrics(y_true, preds)
+            # ---- Aplica calibração conformal EXPANDING (delta-only, log1p) ----
+            # Regime de cada semana-alvo: intensidade da semana-BASE (alvo − h),
+            # mesma regra da produção (make_regime_hook).
+            conf_all = fold_conformal.get(str(fid), {})
+            conf_all = conf_all if int(h) in QC['apply_horizons'] else {}
+            preds_cal = {}
+            for t in QUANTILES:
+                logs = np.log1p(np.clip(preds[t], 0.0, None))
+                if conf_all:
+                    for i, se in enumerate(ses):
+                        try:
+                            entry = entry_for_key(conf_all, int(h), regime_hook(int(h), str(se)))
+                        except Exception:
+                            entry = {}
+                        if not entry:
+                            continue
+                        sh = float(entry.get('median_shift', 0.0) or 0.0)
+                        if np.isfinite(sh):
+                            logs[i] += sh
+                        if abs(t - 0.5) > 1e-9:
+                            try:
+                                d = float((entry.get('deltas') or {}).get(f'{t:.2f}'))
+                            except Exception:
+                                d = 0.0
+                            if np.isfinite(d):
+                                logs[i] += d
+                preds_cal[t] = np.clip(np.expm1(logs), 0.0, None)
+            # non-crossing pós-calibração (por semana)
+            for w in range(len(ses)):
+                vals = [preds_cal[t][w] for t in QUANTILES if np.isfinite(preds_cal[t][w])]
+                if len(vals) == len(QUANTILES) and np.any(np.diff(vals, axis=0) < 0):
+                    s_vals = sorted(vals)
+                    for i, t in enumerate(QUANTILES):
+                        preds_cal[t][w] = s_vals[i]
+            m = compute_all_metrics(y_true, preds_cal) if QC_ENABLED else dict(m_raw)
+            m['raw_uncalibrated'] = {k: m_raw.get(k) for k in
+                                     ('mae', 'rmse', 'bias', 'wis_total', 'wis_50', 'wis_90',
+                                      'width_50', 'width_90', 'coverage_50', 'coverage_90')}
+            m['calibration'] = {'applied': bool(conf_all), 'scheme': 'expanding_cqr_delta_only',
+                                'half_life_years': QC['half_life_years'],
+                                'apply_horizons': sorted(QC['apply_horizons'])}
             # baseline do pool anterior ao teste (gap de 8 semanas)
             start = ses[0]
             pool_end = se_shift(start, -FOLD_GAP_WEEKS)
@@ -252,7 +332,7 @@ def main():
             'Width_90': _g('width_90'), 'Coverage_50': _g('coverage_50'),
             'Coverage_90': _g('coverage_90'),
         })
-        print(f"  h{h}: mae={_g('mae'):.2f} rmse={_g('rmse'):.2f} "
+        print(f"  h{h}{' [CQR-EXP]' if QC_ENABLED else ''}: mae={_g('mae'):.2f} rmse={_g('rmse'):.2f} "
               f"bias={_g('bias'):+.2f} wis_total={_g('wis_total'):.2f} "
               f"(50 {_g('wis_50'):.2f} / 90 {_g('wis_90'):.2f}) "
               f"cov50={_g('coverage_50'):.2f} cov90={_g('coverage_90'):.2f} "

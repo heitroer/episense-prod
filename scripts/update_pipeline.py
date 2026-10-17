@@ -12,7 +12,9 @@ The API (api/main.py) reloads the processed CSV by mtime on the next request,
 so predictions always use the freshest data without a server restart.
 """
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -82,23 +84,88 @@ def main():
     if changed:
         # FIX (review Bug 2): the md5 state is written ONLY AFTER a successful
         # retrain; on failure the old state remains so the next tick retries.
+        # Deployment gate (P7): backup dos artefatos estáveis antes do retreino;
+        # se train falhar OU o gate reprovar (pior fold > budget vs baseline),
+        # rollback dos modelos e NENHUMA promoção (sem md5 novo, sem restart).
+        models_dir = ROOT / "models"
+        backup = models_dir / "_backup_stable"
+        backup_files = []
+        try:
+            if backup.exists():
+                shutil.rmtree(backup)
+            backup.mkdir(parents=True, exist_ok=True)
+            keep_names = ("feature_list.json", "normalization_params.json",
+                          "quantile_conformal.json", "deployment_gate.json",
+                          "metrics_dataframe.csv", "validation_results.json",
+                          "validation_predictions.json")
+            for f in list(models_dir.glob("*.pkl")) + [models_dir / n for n in keep_names]:
+                if f.exists():
+                    shutil.copy2(f, backup / f.name)
+                    backup_files.append(f.name)
+            print(f"backup pre-retreino: {len(backup_files)} artefatos em models/_backup_stable")
+        except Exception as e:
+            print(f"AVISO: backup pre-retreino falhou ({e}) - rollback indisponível")
+
+        def _restore_backup():
+            if not backup_files:
+                return False
+            for f in backup.glob("*"):
+                shutil.copy2(f, models_dir / f.name)
+            return True
+
         ok = run("scripts/train.py", "update_retrain.log")
-        if ok:
-            state.write_text(digest)
-            # Restart the API so it loads the freshly retrained models.
-            # Os modelos so sao carregados no startup do uvicorn (dados sao
-            # relidos por mtime sem restart). Deploy atual = docker compose,
-            # então reinicia o container da API (nome fixo no compose).
-            # Usado antes: /Users/heitor/.hermes/.../episense-api-watchdog.sh
-            # (apontava para Episense-Teste e uvicorn bare na porta 8001).
-            rc = subprocess.run(
-                ["docker", "restart", "episense-prod-api"],
-                capture_output=True, text=True)
-            if rc.returncode != 0:
-                print(f"AVISO: restart da API falhou (exit {rc.returncode}): {rc.stderr.strip()}")
-                print("Fallback manual: docker restart episense-prod-api")
-        print(f"base atualizada (ultima SE {last_se(base)}) -> retreino {'OK' if ok else 'FALHOU'}")
-        sys.exit(0 if ok else 1)
+        if not ok:
+            if _restore_backup():
+                print("train FALHOU -> rollback aplicado (artefatos estáveis restaurados)")
+            print(f"base atualizada (ultima SE {last_se(base)}) -> retreino FALHOU")
+            sys.exit(1)
+
+        gate = {}
+        try:
+            gp = models_dir / "deployment_gate.json"
+            gate = json.loads(gp.read_text(encoding="utf-8")) if gp.exists() else {}
+        except Exception:
+            gate = {}
+        if not isinstance(gate, dict):
+            gate = {}
+        gate_active = bool(gate.get('enabled', False))
+        gate_pass = bool(gate.get('pass', True))
+
+        if gate_active and not gate_pass:
+            thr = gate.get('threshold')
+            print("GATE DE IMPLANTAÇÃO REPROVOU o retreino (pior fold > budget vs baseline):")
+            for h, row in (gate.get('per_horizon') or {}).items():
+                print(f"  h{h}: worst_fold_ratio={row.get('worst_fold_ratio')} (threshold {thr}) folds={row.get('folds')}")
+            if _restore_backup():
+                print(f"ROLLBACK aplicado: {len(backup_files)} artefatos restaurados de models/_backup_stable")
+            else:
+                print("AVISO: sem backup disponível - rollback impossível; VERIFICAR modelos em produção")
+            print("Modelos antigos permanecem em produção; próxima SE com dados novos tentará novamente."
+                  " Para promover manualmente: docker restart episense-prod-api (após revisar o gate).")
+            sys.exit(1)
+
+        # Métricas de validação com calibração conformal LOO (honesto): regenera
+        # validation_results.json + metrics_dataframe.csv a partir das previsões novas
+        # ANTES de promover (o dashboard exibe o estado final dos modelos + calibração).
+        if not run("scripts/recompute_metrics.py", "update_recompute.log"):
+            print("AVISO: recompute das métricas falhou - exibindo métricas do train (sem calibração LOO)")
+
+        state.write_text(digest)
+        # Restart the API so it loads the freshly retrained models.
+        # Os modelos so sao carregados no startup do uvicorn (dados sao
+        # relidos por mtime sem restart). Deploy atual = docker compose,
+        # então reinicia o container da API (nome fixo no compose).
+        # Usado antes: /Users/heitor/.hermes/.../episense-api-watchdog.sh
+        # (apontava para Episense-Teste e uvicorn bare na porta 8001).
+        rc = subprocess.run(
+            ["docker", "restart", "episense-prod-api"],
+            capture_output=True, text=True)
+        if rc.returncode != 0:
+            print(f"AVISO: restart da API falhou (exit {rc.returncode}): {rc.stderr.strip()}")
+            print("Fallback manual: docker restart episense-prod-api")
+        print(f"base atualizada (ultima SE {last_se(base)}) -> retreino OK"
+              + (" (gate aprovado)" if gate_active else ""))
+        sys.exit(0)
 
     print(f"base inalterada (ultima SE {last_se(base)}) - sem retreino")
 

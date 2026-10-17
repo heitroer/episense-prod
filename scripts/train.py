@@ -24,6 +24,7 @@ import numpy as np
 import lightgbm as lgb
 from pathlib import Path
 import json
+import os
 import logging
 import joblib
 import yaml
@@ -1187,6 +1188,10 @@ class EpisenseTrainer:
         except Exception as e:
             logger.warning(f"Feature selection failed ({e}); using all features")
             selected_cols = X_tr.columns.tolist()
+        # always_keep: features de regime garantidas (seleção por ganho pode descartá-las)
+        _keep_cols = self._always_keep_cols(X_tr)
+        if _keep_cols:
+            selected_cols = list(dict.fromkeys(list(_keep_cols) + list(selected_cols)))
         logger.info(f"    Feature selection: {len(selected_cols)}/{X_tr.shape[1]} features kept")
         X_tr = X_tr[selected_cols]
         if X_val is not None:
@@ -1194,6 +1199,21 @@ class EpisenseTrainer:
         if X_test is not None:
             X_test = X_test.reindex(columns=selected_cols, fill_value=0)
         return X_tr, X_val, X_test
+
+    def _always_keep_cols(self, X: 'pd.DataFrame') -> List[str]:
+        """Features de regime forçadas na seleção (training.feature_selection.always_keep).
+
+        A seleção por ganho pode descartar sinais de regime (YTD-ratio, YoY, slopes,
+        anomalias de climatologia) no corte 380->120 — exatamente os sinais que o
+        relatório out/2026 apontou como faltantes para picos/mudança de regime (P1/P3/P4).
+        Filtrado por existência em runtime: nomes ausentes no df_featured são ignorados.
+        """
+        train_cfg = self.config.get('training', {}) if isinstance(self.config.get('training', {}), dict) else {}
+        fs = train_cfg.get('feature_selection', {}) if isinstance(train_cfg.get('feature_selection', {}), dict) else {}
+        keep = [str(c) for c in (fs.get('always_keep') or []) if str(c) in X.columns]
+        if keep:
+            logger.info(f"    always_keep: garantidas {len(keep)} features de regime")
+        return keep
 
     def _get_selected_columns_per_quantile(self, X_tr: pd.DataFrame, y_tr: pd.Series) -> Dict[float, List[str]]:
         """380 features INDEPENDENTES por quantil (separate_quantile_features).
@@ -1216,6 +1236,7 @@ class EpisenseTrainer:
         quick_params.pop('num_iteration', None)
         quick_params['objective'] = 'quantile'
         per_tau_cols: Dict[float, List[str]] = {}
+        keep_all = self._always_keep_cols(X_tr)
         for tau in self.quantiles:
             try:
                 mf = int(mfq.get(str(tau), mfq.get(float(tau), max_features_default)) if isinstance(mfq, dict) and mfq else max_features_default)
@@ -1233,6 +1254,9 @@ class EpisenseTrainer:
                 cols.extend(remaining)
             if not cols:
                 cols = X_tr.columns.tolist()[:mf]
+            # always_keep primeiro (entro do teto mf: substitui os de menor ganho na cauda)
+            if keep_all:
+                cols = list(dict.fromkeys(list(keep_all) + list(cols)))
             per_tau_cols[tau] = cols[:mf]
             logger.info(f"    Separate q{int(tau*1000):04d}: {len(cols)}/{X_tr.shape[1]} feats (top gain {imp.max():.1f} thr {thr} mf {mf})")
         return per_tau_cols
@@ -1243,6 +1267,8 @@ class EpisenseTrainer:
     def train_all_horizons(self, df: pd.DataFrame) -> Dict:
         logger.info("Starting training for all horizons...")
         df_featured = self.prepare_data(df)
+        # referência para a calibração conformal (casos por SE) em save_artifacts
+        self._df_featured = df_featured
         horizons = self.target_horizons
         # FASE1 paralelização: se habilitado, treina horizontes em paralelo
         par_cfg = self.config.get('training', {}).get('parallel_horizons', {})
@@ -1283,8 +1309,9 @@ class EpisenseTrainer:
         return self.validation_results
 
     def save_artifacts(self):
-        models_dir = Path("models")
-        models_dir.mkdir(exist_ok=True)
+        # EPISENSE_MODELS_DIR: override de destino para smoke tests (não sobrescreve produção)
+        models_dir = Path(os.environ.get('EPISENSE_MODELS_DIR', "models"))
+        models_dir.mkdir(parents=True, exist_ok=True)
 
         # Save per-quantile ensemble models: lgbm_h{horizon}_seed{seed}_q{tau}.pkl
         for horizon, tau_models in self.models.items():
@@ -1329,96 +1356,95 @@ class EpisenseTrainer:
                 json.dump(self.ano_normalization_params, f, indent=2)
             logger.info(f"Saved normalization params: {norm_path}")
 
-        # ---- Quantile recalibration (global + por regime outbreak/calm) ---- FIX Bug1 circular
-        # Gera deltas log-scale para q05/q95 via conformal: delta = quantile(y_true_log - q_pred_log)
-        # por regime corrige Cob90 heterogeneo fold0 0.58 vs fold2 1.00 (report P1)
-        # FIX Bug1: quando quantile_recalibration.enabled true, usa APENAS holdout (último fold) para deltas
-        # e documenta que fold_series holdout nunca intersecta X_full (FULL treinado até penúltimo fold). Se disabled, deltas são salvos mas NÃO aplicados em inference (opt-in).
+        # ---- Calibração conformal v3 (CQR delta-only) + deployment gate ----
+        # Substitui a recalibração holdout-único (fraqueza P8). Deltas conformal por
+        # horizonte (h1-h3 por padrão) x REGIME-BASE (intensidade da semana-base),
+        # calibrados em TODOS os folds walk-forward com pesos temporais exponenciais.
+        # Median shift desabilitado (instável entre temporadas — ver models/calibration.py).
+        # Deployment gate (P7): pior fold completo (>=52 semanas) vs baseline sazonal.
         try:
-            if hasattr(self, 'fold_series') and self.fold_series:
-                recal_cfg = self.config.get('quantile_recalibration', {}) if isinstance(self.config.get('quantile_recalibration', {}), dict) else {}
-                recal_enabled = bool(recal_cfg.get('enabled', False))
-                holdout_only = recal_enabled  # quando enabled, deltas vêm só do holdout (último fold)
-                if holdout_only:
-                    logger.info("Quantile recalibration HOLDOUT mode: deltas calculados apenas no último fold (não circular, FULL excluiu holdout)")
-                else:
-                    logger.info("Quantile recalibration: deltas calculados em todos folds mas NÃO serão aplicados em inference (enabled=false, evita circularidade)")
-                # global deltas
-                recal_global = {}
-                recal_regime = {}
-                for h, tau_dict in self.fold_series.items():
-                    # tau_dict: {tau: [fold_dict,...]}
-                    # concat y_true_log e y_pred_log por fold
-                    y_true_all = []
-                    q05_all = []
-                    q95_all = []
-                    se_all = []
-                    # FIX Bug1: seleciona folds para calibração
-                    if holdout_only:
-                        # usa apenas último fold (holdout)
-                        n_folds = len(tau_dict[self.quantiles[0]])
-                        fold_indices = [n_folds - 1] if n_folds >= 1 else []
-                    else:
-                        fold_indices = range(len(tau_dict[self.quantiles[0]]))
-                    for fold_idx in fold_indices:
-                        y_true_all.extend(np.log1p(tau_dict[0.5][fold_idx]['y_test_casos']))
-                        q05_all.extend(np.log1p(tau_dict[0.05][fold_idx]['y_pred_casos']))
-                        q95_all.extend(np.log1p(tau_dict[0.95][fold_idx]['y_pred_casos']))
-                        se_all.extend(tau_dict[0.5][fold_idx]['test_se'])
-                    y_true_all = np.array(y_true_all)
-                    q05_all = np.array(q05_all)
-                    q95_all = np.array(q95_all)
-                    se_all = np.array(se_all)
-                    # global deltas (log scale)
-                    r05 = y_true_all - q05_all
-                    r95 = y_true_all - q95_all
-                    d05 = float(np.quantile(r05, 0.05))
-                    d95 = float(np.quantile(r95, 0.95))
-                    recal_global[str(h)] = {"0.05": d05, "0.95": d95}
-                    # regime split via epiweeks month
-                    try:
-                        from data.epiweeks import epiweek_to_date, weeks_in_year, date_to_epiweek
-                        # classifica cada SE em outbreak (Out-Mai) vs calm (Jun-Set)
-                        outbreak_months = self.epi_periods.get('outbreak_months', [10,11,12,1,2,3,4,5])
-                        is_outbreak = []
-                        for se in se_all:
-                            se_str = str(se).zfill(6)
-                            try:
-                                y = int(se_str[:4]); w = int(se_str[4:])
-                                m = epiweek_to_date(y, w).month
-                                is_outbreak.append(m in outbreak_months)
-                            except Exception:
-                                is_outbreak.append(True)
-                        is_outbreak = np.array(is_outbreak)
-                        is_calm = ~is_outbreak
-                        def _delta(mask, r):
-                            if mask.sum() < 10:
-                                return float(np.quantile(r, 0.05 if r is r05 else 0.95))
-                            return float(np.quantile(r[mask], 0.05 if r is r05 else 0.95))
-                        # para nao confundir, calcula separado
-                        d05_out = float(np.quantile(r05[is_outbreak], 0.05)) if is_outbreak.sum()>5 else d05
-                        d95_out = float(np.quantile(r95[is_outbreak], 0.95)) if is_outbreak.sum()>5 else d95
-                        d05_calm = float(np.quantile(r05[is_calm], 0.05)) if is_calm.sum()>5 else d05
-                        d95_calm = float(np.quantile(r95[is_calm], 0.95)) if is_calm.sum()>5 else d95
-                        recal_regime[str(h)] = {
-                            "outbreak": {"0.05": d05_out, "0.95": d95_out},
-                            "calm": {"0.05": d05_calm, "0.95": d95_calm},
-                            "global": {"0.05": d05, "0.95": d95}
-                        }
-                    except Exception as e:
-                        logger.warning(f"h{h} regime recalibration failed: {e}")
-                        recal_regime[str(h)] = {"outbreak": recal_global[str(h)], "calm": recal_global[str(h)], "global": recal_global[str(h)]}
-                # salva global (compat com inference atual)
-                recal_path = models_dir / "quantile_recalibration.json"
-                with open(recal_path, 'w') as f:
-                    json.dump(recal_global, f, indent=2)
-                logger.info(f"Saved quantile recalibration (global): {recal_path}")
-                recal_regime_path = models_dir / "quantile_recalibration_regime.json"
-                with open(recal_regime_path, 'w') as f:
-                    json.dump(recal_regime, f, indent=2)
-                logger.info(f"Saved quantile recalibration (regime): {recal_regime_path}")
+            qc_cfg = self.config.get('quantile_conformal', {}) if isinstance(self.config.get('quantile_conformal', {}), dict) else {}
+            if hasattr(self, 'fold_series') and self.fold_series and bool(qc_cfg.get('enabled', False)):
+                from models.calibration import compute_conformal, make_regime_hook, save_json as _save_conformal
+                casos_by_se = {}
+                df_ref = getattr(self, '_df_featured', None)
+                if df_ref is not None and 'SE' in df_ref.columns and 'casos' in df_ref.columns:
+                    _d = df_ref[['SE', 'casos']].copy()
+                    _d['SE'] = _d['SE'].astype(str).str.zfill(6).str.replace('.0', '', regex=False)
+                    for _se, _v in zip(_d['SE'], _d['casos']):
+                        try:
+                            _fv = float(_v)
+                        except Exception:
+                            continue
+                        if np.isfinite(_fv):
+                            casos_by_se[_se] = _fv
+                regime_hook = make_regime_hook(casos_by_se, qc_cfg.get('regime_thresholds') or None)
+                production = compute_conformal(self.fold_series, regime_hook,
+                                               half_life_years=float(qc_cfg.get('half_life_years', 2.5)),
+                                               max_delta=float(qc_cfg.get('max_abs_delta', 1.0)),
+                                               use_median_shift=bool(qc_cfg.get('apply_median_shift', False)),
+                                               max_shift=float(qc_cfg.get('max_abs_median_shift', 0.8)))
+                _save_conformal(models_dir / "quantile_conformal.json", production, None)
+                n_h = len([k for k in production if str(k).isdigit()])
+                KC = [k for k in production if str(k).isdigit()]
+                _keys = sorted(production.get(KC[0], {}).keys()) if KC else []
+                logger.info(f"Conformal calibration (CQR delta-only) salva: {n_h} horizontes, regimes {_keys}")
         except Exception as e:
-            logger.warning(f"Quantile recalibration generation failed: {e}")
+            logger.warning(f"Conformal calibration generation failed: {e}")
+
+        # Deployment gate: compara MAE de cada fold completo contra o baseline
+        # sazonal no MESMO horizonte; reprova se o pior fold exceder o budget.
+        try:
+            from datetime import datetime as _dt
+            gate_cfg = self.config.get('deployment_gate', {}) if isinstance(self.config.get('deployment_gate', {}), dict) else {}
+            gate_enabled = bool(gate_cfg.get('enabled', False))
+            gate = {'enabled': gate_enabled, 'pass': True,
+                    'threshold': float(gate_cfg.get('max_baseline_ratio', 1.35)),
+                    'per_horizon': {}, 'generated_at': _dt.utcnow().isoformat()}
+            if gate_enabled and getattr(self, 'validation_results', None):
+                # n_weeks por fold a partir do fold_series (per_fold_ensemble não carrega n_weeks)
+                fold_nweeks = {}
+                if hasattr(self, 'fold_series') and self.fold_series:
+                    for h_fs, td_fs in self.fold_series.items():
+                        try:
+                            t_keys = [t for t in td_fs.keys()]
+                            for blk in td_fs.get(0.5, td_fs.get(t_keys[0], [])):
+                                fold_nweeks[(int(h_fs), str(blk.get('fold')))] = len(blk.get('test_se') or [])
+                        except Exception:
+                            continue
+                for h, res in self.validation_results.items():
+                    try:
+                        rows = [m for m in (res.get('per_fold_ensemble') or [])
+                                if fold_nweeks.get((int(h), str(m.get('fold'))), int(m.get('n_weeks', 0) or 0)) >= 52]
+                        ratios = {}
+                        worst = 0.0
+                        for m in rows:
+                            mae = m.get('mae')
+                            bmae = m.get('baseline_mae')
+                            if mae is None or bmae is None:
+                                continue
+                            if not (np.isfinite(mae) and np.isfinite(bmae) and bmae > 0):
+                                continue
+                            fold_id = str(m.get('fold', '?'))
+                            ratio = float(mae) / float(bmae)
+                            ratios[fold_id] = round(ratio, 3)
+                            worst = max(worst, ratio)
+                        if ratios:
+                            gate['per_horizon'][str(h)] = {'worst_fold_ratio': round(worst, 3),
+                                                           'folds': ratios}
+                            if worst > gate['threshold']:
+                                gate['pass'] = False
+                    except Exception as e:
+                        logger.warning(f"deployment gate h{h}: cálculo falhou ({e})")
+            gate_path = models_dir / "deployment_gate.json"
+            with open(gate_path, 'w') as f:
+                json.dump(gate, f, indent=2)
+            if gate.get('pass', True):
+                logger.info("Deployment gate: PASS (todos os folds completos dentro do budget vs baseline)")
+            else:
+                logger.warning(f"Deployment gate: FAIL (pior fold > {gate['threshold']}x baseline) — update_pipeline fará rollback")
+        except Exception as e:
+            logger.warning(f"Deployment gate generation failed: {e}")
 
         # Save per-week prediction series (outbreak/weekly analysis)
         if getattr(self, 'fold_series', None):
@@ -1514,6 +1540,16 @@ def load_processed_data(config: Dict) -> pd.DataFrame:
 def main():
     logger.info("Starting Episense quantile training...")
     config = load_config()
+    # Modo smoke (EPISENSE_QUICK=1): 1 horizonte + 1 seed, para validar o pipeline
+    # rapidamente JUNTO com EPISENSE_MODELS_DIR (não sobrescreve artefatos de produção).
+    if os.environ.get('EPISENSE_QUICK'):
+        config.setdefault('targets', {})['horizons'] = [1]
+        config['targets']['target_cols'] = ['target_h1']
+        ens_cfg = config.setdefault('model', {}).setdefault('ensemble', {})
+        ens_cfg['seeds'] = [42]
+        ens_cfg['n_seeds'] = 1
+        config.setdefault('training', {})['parallel_horizons'] = {'enabled': False}
+        logger.info("EPISENSE_QUICK=1: modo smoke (h=[1], seeds=[42], sequencial)")
     df = load_processed_data(config)
     if df.empty:
         logger.error("No data available")

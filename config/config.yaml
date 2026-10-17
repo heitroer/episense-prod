@@ -168,6 +168,27 @@ training:
     max_features: 120
     per_quantile: true
     separate_quantile_features: true  # mantido true mas com limites menores (80/120) p/ caudas
+    # always_keep: features de regime GARANTIDAS na seleção (sobrevivem ao corte por ganho).
+    # Nominações filtradas por existência em runtime; omitem-se nomes que a engenharia não gera.
+    # Motivo (relatório out/2026, P1/P3/P4): sinais de regime (YTD-ratio, YoY, growth,
+    # slopes, anomalias) são os que permitem antecipar picos/quedas rápidas.
+    always_keep:
+      - log_casos_ytd            # fase da temporada corrente (cumulativo log)
+      - ytd_share_prev_year      # razão YTD corrente vs ano anterior (regime!)
+      - log_ytd_ratio            # log-razão YTD (versão simétrica)
+      - ytd_ratio_roll4          # razão YTD suavizada 4 semanas
+      - log_casos_yoy52          # YoY semana igual ano anterior
+      - log_casos_yoy52_gated    # YoY com gating anti-phantom
+      - log_casos_yoy53          # YoY ano-53
+      - log_casos_growth_ratio_4 # crescimento 4 semanas (razão)
+      - log_casos_growth_ratio_1 # crescimento 1 semana (razão)
+      - log_casos_momentum_4     # momentum 4 semanas
+      - log_casos_slope_accel_4  # aceleração da tendência curta
+      - log_casos_accel_8        # aceleração 8 semanas
+      - log_casos_anomaly_clim   # anomalia vs climatologia de casos
+      - trend_vs_clim_8          # tendência vs climatologia 8 semanas
+      - log_casos_vs_ewma_8      # posição vs EWMA 8s (proxy R efetiva)
+      - casos_ytd_rate           # ritmo de acumulação (semana do ano)
     expand_extra: false
     threshold_per_quantile:
       0.05: 0.005
@@ -259,8 +280,33 @@ non_crossing:
   enabled: true
   method: post_process
 quantile_recalibration:
-  enabled: true  # Opção A fase 3: holdout último fold (2025) para calibrar q95 por regime, corrige superestimação 24-25
+  # LEGADO (substituída por quantile_conformal abaixo). enabled=false: deltas
+  # legacy não são regenerados e não são aplicados em inference (fallback inerte).
+  enabled: false
   method: holdout
+quantile_conformal:
+  # CQR (conformized quantile regression) DELTA-ONLY por horizonte x regime-base.
+  # Regime = intensidade OBSERVÁVEL da semana-base (casos), decidível em produção.
+  # Evidência dos experimentos out/2026: cov90 h1 0.82->0.90, MAE estável (fold1
+  # 0.77->0.88, fold3 0.80->0.92); delta-only em h4-h8 cruza regimes contraditórios
+  # entre temporadas e DEGRADA WIS -- por isso apply_horizons [1,2,3].
+  # Median shift desabilitado (transfere mal a amplitude entre temporadas).
+  # Valid honesta: expanding (fold calibrado só com folds anteriores) no recompute.
+  enabled: true
+  half_life_years: 2.5
+  max_abs_delta: 1.0
+  apply_horizons: [1, 2, 3]
+  apply_median_shift: false
+  max_abs_median_shift: 0.8
+  regime_thresholds:
+    high: 100.0   # casos na semana-base => cluster 'high' (surto instalado)
+    mid: 20.0     # 20-100 => 'mid'; <20 => 'low' (endemia baixa)
+deployment_gate:
+  # Gate de implantação por fold (P7): exige MAE de CADA fold completo (>=52 sem)
+  # <= max_baseline_ratio * baseline sazonal; se reprovar, update_pipeline.py
+  # faz rollback e NÃO promove o retreino (estado md5 não avança, sem restart).
+  enabled: true
+  max_baseline_ratio: 1.35
 phantom_gating:
   enabled: true
   calm_q95_max_factor: 1.5  # 1.8->1.5 corta 2000 vs 700 (calm cap 1.5× mediana) aceita h1 +2% para h8 ETP 10→4
