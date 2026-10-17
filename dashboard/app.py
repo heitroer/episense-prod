@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
+import fcntl
 import pandas as pd
 import numpy as np
 import json
@@ -593,13 +594,17 @@ def _fetch_infodengue_live() -> pd.DataFrame:
     if full_path.exists():
         try:
             tmp = pd.read_csv(full_path, dtype={"SE": str})
-            keep_full = [c for c in ['SE','casos','casos_est'] if c in tmp.columns]
+            keep_full = [c for c in ['SE','casos','casos_est','Rt','p_rt1'] if c in tmp.columns]
             tmp = tmp[keep_full].copy()
             tmp['SE'] = tmp['SE'].astype(str).str.replace(".0","", regex=False).str.zfill(6)
             if 'casos' in tmp.columns:
                 tmp['casos'] = pd.to_numeric(tmp['casos'], errors='coerce').fillna(0).astype(int)
             if 'casos_est' in tmp.columns:
                 tmp['casos_est'] = pd.to_numeric(tmp['casos_est'], errors='coerce').fillna(0)
+            if 'Rt' in tmp.columns:
+                tmp['Rt'] = pd.to_numeric(tmp['Rt'], errors='coerce')
+            if 'p_rt1' in tmp.columns:
+                tmp['p_rt1'] = pd.to_numeric(tmp['p_rt1'], errors='coerce')
             tmp = tmp.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
             df_full = tmp
             logger.info(f"[dashboard live] full history loaded: {len(df_full)} rows {df_full['SE'].min()}-{df_full['SE'].max()}")
@@ -621,13 +626,17 @@ def _fetch_infodengue_live() -> pd.DataFrame:
                 df['semana'] = df['SE'].str[4:].astype(int)
                 return df.sort_values('SE').reset_index(drop=True)
             return df_fresh
-        keep = [c for c in ['SE','casos','casos_est'] if c in df_fresh.columns]
+        keep = [c for c in ['SE','casos','casos_est','Rt','p_rt1'] if c in df_fresh.columns]
         df_fresh = df_fresh[keep].copy()
         df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
         if 'casos' in df_fresh.columns:
             df_fresh['casos'] = pd.to_numeric(df_fresh['casos'], errors='coerce').fillna(0).astype(int)
         if 'casos_est' in df_fresh.columns:
             df_fresh['casos_est'] = pd.to_numeric(df_fresh['casos_est'], errors='coerce').fillna(0)
+        if 'Rt' in df_fresh.columns:
+            df_fresh['Rt'] = pd.to_numeric(df_fresh['Rt'], errors='coerce')
+        if 'p_rt1' in df_fresh.columns:
+            df_fresh['p_rt1'] = pd.to_numeric(df_fresh['p_rt1'], errors='coerce')
         # 3) merge: full + fresh (fresh sobrescreve SEs recentes com nowcast atualizado)
         if df_full is not None and not df_full.empty:
             df_full['SE'] = df_full['SE'].astype(str).str.zfill(6)
@@ -866,6 +875,22 @@ def _get_live_engineered():
     return engineered
 
 
+def _try_retrain_lock():
+    """Lock cross-processo/thread para auto-retreino (flock em models/.retrain_lock).
+
+    Impede dois retreinos simultâneos sobrescrevendo artefatos (ex.: thread do
+    uvicorn disparada por _ensure_fresh_data + exec manual no container).
+    Retorna o file handle que MANTÉM o lock (feche para liberar) ou None.
+    """
+    try:
+        models_dir = Path("models")
+        models_dir.mkdir(exist_ok=True)
+        fp = open(models_dir / ".retrain_lock", "w")
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fp
+    except OSError:
+        return None
+
 def _ensure_fresh_data():
     """On-demand refresh (no cron) — called at start of each API request / dashboard load.
     If raw infodengue has newer SE than processed base, rebuild base via processor.
@@ -961,29 +986,54 @@ def _ensure_fresh_data():
                                 if m > max_val_se:
                                     max_val_se = m
                 if new_max > max_val_se:
-                    logger.info(f"Auto-retreino disparado: new_max {new_max} > val_max {max_val_se} (sem cron)")
-                    def do_retrain():
-                        try:
-                            from scripts.train import EpisenseTrainer, load_config, load_processed_data
-                            cfg = load_config()
-                            df = load_processed_data(cfg)
-                            if df is None or df.empty:
-                                logger.warning("Auto-retreino: df vazio, abort")
-                                return
-                            trainer = EpisenseTrainer(cfg)
-                            trainer.train_all_horizons(df)
-                            _load_val_pred()
-                            _load_val_res()
-                            with _forecast_cache_lock:
-                                _forecast_cache.clear()
-                            global _inference
-                            _inference = None
-                            get_inference()
-                            logger.info("Auto-retreino concluído e caches invalidados")
-                        except Exception as e:
-                            logger.warning(f"Auto-retreino falhou: {e}")
-                            import traceback; traceback.print_exc()
-                    threading.Thread(target=do_retrain, daemon=True).start()
+                    # V6b: marcador persistido de última SE treinada — sem ele o
+                    # gatilho re-treina em todo refresh (new_max 202640 > val_max
+                    # 202635 permanece TRUE, pois a validação nunca alcança a SE
+                    # mais recente), virando loop de retreino a cada revisão.
+                    _last_trained = "0"
+                    try:
+                        _last_trained = Path("models/.retrain_last_se").read_text().strip() or "0"
+                    except OSError:
+                        pass
+                    if new_max <= _last_trained:
+                        logger.info(f"Auto-retreino ignorado: new_max {new_max} já treinado (marker {_last_trained})")
+                    else:
+                        _rl = _try_retrain_lock()
+                        if _rl is None:
+                            logger.info("Auto-retreino ignorado: outro retreino já em curso (lock models/.retrain_lock)")
+                        else:
+                            logger.info(f"Auto-retreino disparado: new_max {new_max} > val_max {max_val_se} e > marker {_last_trained} (sem cron)")
+                            def do_retrain():
+                                try:
+                                    from scripts.train import EpisenseTrainer, load_config, load_processed_data
+                                    cfg = load_config()
+                                    df = load_processed_data(cfg)
+                                    if df is None or df.empty:
+                                        logger.warning("Auto-retreino: df vazio, abort")
+                                        return
+                                    trainer = EpisenseTrainer(cfg)
+                                    trainer.train_all_horizons(df)
+                                    _load_val_pred()
+                                    _load_val_res()
+                                    with _forecast_cache_lock:
+                                        _forecast_cache.clear()
+                                    global _inference
+                                    _inference = None
+                                    get_inference()
+                                    try:
+                                        Path("models/.retrain_last_se").write_text(str(new_max))
+                                    except Exception as e2:
+                                        logger.warning(f"marker .retrain_last_se não gravado: {e2}")
+                                    logger.info("Auto-retreino concluído e caches invalidados")
+                                except Exception as e:
+                                    logger.warning(f"Auto-retreino falhou: {e}")
+                                    import traceback; traceback.print_exc()
+                                finally:
+                                    try:
+                                        _rl.close()
+                                    except Exception:
+                                        pass
+                            threading.Thread(target=do_retrain, daemon=True).start()
             except Exception as e:
                 logger.warning(f"checagem auto-retreino falhou: {e}")
         except Exception as e:

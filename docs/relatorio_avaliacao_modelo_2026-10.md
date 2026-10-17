@@ -310,3 +310,82 @@ gate 0.735) e cov90 h5 −3pp (0.85) — documentados como trade da largura.
   de cobertura nominal sem largura.
 
 — Gerado em out/2026 a partir das artefatos de validação do projeto.
+
+## Adendo 4 — Feature Rt (v6, out/2026)
+
+**Motivação.** Codeço, Villela & Coelho (2018), *Epidemics* 25:101–111: estimador
+de Rt efetivo para dengue com intervalo geracional dependente de temperatura —
+Rt detecta o início de transmissão crescente semanas antes do volume absoluto de
+casos, funcionando como sinal de FASE/CINÉTICA complementar aos lags de casos.
+O método é exatamente o implementado pela plataforma InfoDengue/AlertaDengue.
+
+**Dado.** O CSV bruto do InfoDengue já trazia `Rt` e `p_rt1` (prob. de Rt>1)
+para todo o histórico (823 SEMs, 201101–202640, 100% cobertura, sem furos).
+Não houve nova infraestrutura de captação — o coletor (`collect_infodengue.py`)
+guarda esses campos da API `alertcity`. Convenção de leakage: o valor de Rt da
+semana *s* é tratado como conhecido em *s* (idem `casos`/`log_casos`); derivadas
+usam shift/rolling do passado. Nota de revisão: valores históricos do arquivo são
+re-estimativas recentes (mesma categoria de ruído do nowcast de `casos`), e a
+cauda 202635–202640 estava congelada (0.751) no momento do treino — nas semanas
+de 0 casos a API hoje devolve Rt=0, que o cron reconciliará no próximo refresh.
+
+**Implementação.** `data/features.py::create_rt_features` (flag
+`features.expand_rt` em `config/config.yaml`): 10 features shift-safe
+(`rt_now`, `rt_lag1/2/3`, `rt_ma3`, `rt_slope_2/4`, `rt_gt1_share_4`,
+`p_rt1_now`, `p_rt1_lag1`) entrando no pool normal de seleção per-tau/per-
+horizonte (thr/mf inalterados; `Rt`/`p_rt1` brutos seguem excluídos como hoje).
+Caminho live: `api/main.py` e `dashboard/app.py` (`_fetch_infodengue*`) agora
+preservam `Rt`/`p_rt1` no merge fresh (API alertcity devolve ambos) + coerção
+numérica; o ffill pós-merge cobre eventuais NaNs.
+
+**Validação determinística.** Retreinos na mesma máquina com seeds fixos
+produzem métricas idênticas a ±0.0 (3 runs Rt e 2 runs v5 sobrepostos) — a
+comparação v5→Rt é limpa, sem ruído de treino nesta configuração.
+
+Resultado global (20 features) foi bimodal: ganhos h3 (MAE −6.7%), h8 (−8.9%),
+h4 (WIS −2.7%), h1 (WIS −0.4%, W90 −7%); regressões h2 (MAE **+12.3%**) e h5
+(MAE +8.2%/WIS +7.1%), neutro h6/h7. Padrão de deslocamento no top-k.
+
+**Técnica do ban por horizonte (v6 final).** Primeiro corte: banir rt_* dos
+horizontes perdedores após o ranking — insuficiente: a presença de rt_* NO POOL
+de candidatos re-aloca ganho no LightGBM e desloca o ranking dos sobreviventes
+(h2 trocou ~75 features). Correção (v6b): ban aplicado ANTES da estimativa de
+importância (`scripts/train.py::_get_selected_columns_per_quantile`, pool
+`X_imp = X_tr[sobreviventes ao ban]`) → horizontes banidos reproduzem o v5
+EXATAMENTE (h2/h5/h6/h7 = v5 ao quarto dígito).
+
+**Estado final (canônico expanding, ensemble média folds):**
+Rt ativo em h1/h3/h4/h8 (ban `banned_features_per_horizon` em h2/h5–h7);
+h2/h5/h6/h7 idênticos ao v5; ganhos líquidos: h3 MAE 65.35→60.94 (−6.7%) e
+WIS 21.25→20.38 (−4.1%); h8 MAE 102.10→93.01 (−8.9%, Bias −70→−59); h4 WIS
+−2.7%; h1 WIS −0.4% com W90 203→189 (−7%). Gate PASS (pior fold 0.914, h5).
+Containers `episense-api` + `episense-dashboard` rebuildados; inferência live
+confirmada nos dois logs (`expand_rt: 10 features Rt adicionadas`) e fan/história
+endpoints saudáveis.
+
+**Limitações/metas abertas:** fold0 h4–h8 (tweedie 1.7), fold1 h1 cov90, cov90
+h8 fold3 ~0.55 (igual ao v5 — Rt não resolve esse aspecto).
+
+**Auto-retreino in-container (corrigido e travado).** O fallback
+`do_retrain` do dashboard (disparado quando `new_max > val_max`) importava
+`scripts.train`, que não existia na imagem — falhava silenciosamente desde
+sempre. Correção (v6b1): `scripts/` montado read-only no serviço do dashboard
+(compose) + requirements do dashboard já tinham lightgbm/joblib. Guardas
+adicionais: flock cross-processo em `models/.retrain_lock` compartilhado
+host↔container (treinos manuais do host saem sem treinar se houver retreino em
+curso, e vice-versa) e marcador persistido `models/.retrain_last_se` — sem ele
+o gatilho (`new_max 202640 > val_max 202635`, sempre TRUE, pois os folds de
+validação nunca alcançam a SE mais recente) re-treinava em TODO ciclo de
+refresh (revisões de raw), virando loop de ~5 min cada. Recursos: dashboard
+`cpus 1.0→4.0`, `mem 1g→3g` (8 workers single-thread de horizontes; ciclo
+completo ~5 min no container vs ~1h em 1 CPU).
+
+**Determinismo entre ambientes.** Host (py3.9) e container (py3.11, mesmos
+pins lightgbm 4.5.0/pandas 2.2.2/numpy 1.26.4) produzem métricas IDÊNTICAS
+treinando o MESMO `episense_base.csv` — provado host final == container
+(retreino 13:41 vs 13:15, idênticos ao 4º dígito). O desvio ±5% observado no
+dia vs o snapshot da manhã decorre de REVISÕES DE DADO: o refresh de 13h
+reconstruiu a base com revisões OpenMeteo/InfoDengue das semanas finais
+(202636–202640) — resposta legítima do pipeline à atualização do dado, não
+ruído de treino. Estado canônico vigente = honesto com o dado mais recente
+(gate PASS, pior fold 0.873).

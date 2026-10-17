@@ -53,6 +53,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .metrics-table th span{font:700 14px "IBM Plex Mono",monospace;letter-spacing:.04em;color:var(--text)}
 .metrics-table td{padding:14px 16px;border-bottom:1px solid rgba(36,48,68,.5);vertical-align:middle}
 .metrics-table tbody tr:last-child td{border-bottom:none}
+.metrics-table tfoot td{border-top:2px solid var(--line);border-bottom:none;background:rgba(27,36,52,.5);padding:12px 16px;vertical-align:middle}
+.metrics-table tfoot .avg-label{font:700 12px "IBM Plex Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--text)}
+.metrics-table tfoot .avg-sub{font:500 10px "IBM Plex Mono",monospace;letter-spacing:.04em;color:var(--muted);display:block;margin-top:2px}
+.metrics-table tfoot td{color:var(--text);font-size:13px}
 .metrics-table tbody tr:hover td{background:rgba(45,212,191,.06)}
 .metrics-table td:first-child{font:700 13px "IBM Plex Mono",monospace;color:var(--text);letter-spacing:-.02em}
 .metrics-table .v-mae,.metrics-table .v-cov{font:700 16px "IBM Plex Mono",monospace;letter-spacing:-.03em;color:var(--text)}
@@ -162,6 +166,9 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
         <tbody id="metrics-body">
           <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:22px;font:500 13px &quot;IBM Plex Mono&quot;,monospace">Carregando métricas</td></tr>
         </tbody>
+        <tfoot id="metrics-foot">
+          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:12px;font:500 12px &quot;IBM Plex Mono&quot;,monospace">—</td></tr>
+        </tfoot>
       </table>
     </div>
   </section>
@@ -216,6 +223,20 @@ function renderMetrics(){
       tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
     }
     body.appendChild(tr);
+  }
+  // SECTION: média entre horizontes (respeita fold selecionado e modo avançado)
+  const foot=document.getElementById('metrics-foot');
+  if(foot){
+    const rows=[1,2,3,4,5,6,7,8].map(h=>metricsData[String(h)]).filter(Boolean).map(e=>e[metricsFold]||e['avg']).filter(Boolean);
+    const mean=k=>{const vs=rows.map(r=>r?.[k]).filter(v=>v!=null&&!Number.isNaN(v));return vs.length?vs.reduce((a,b)=>a+b,0)/vs.length:null};
+    const nh=rows.length||8;
+    const bTxt=()=>{const b=mean('bias');return (b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1)};
+    const label=`<td><span class="avg-label">Média h1–h${nh}</span><span class="avg-sub">média entre horizontes</span></td>`;
+    if(metricsAdvanced){
+      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td>'+formatNum(mean('rmse'),1)+'</td><td>'+bTxt()+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td>'+formatNum(mean('wis_50'),1)+'</td><td>'+formatNum(mean('wis_90'),1)+'</td><td>'+formatNum(mean('width_50'),0)+'</td><td>'+formatNum(mean('width_90'),0)+'</td><td class="v-cov50">'+pct(mean('coverage_50'))+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td></tr>';
+    } else {
+      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td></tr>';
+    }
   }
   // update hero readout from selected fold
   const h1d=metricsData['1']?.[metricsFold]||metricsData['1']?.['avg'];

@@ -53,6 +53,8 @@ data/processed/
 models/*.pkl
 models/*.json
 models/*.bak
+models/.retrain_lock
+models/.retrain_last_se
 
 # Docker
 .docker/

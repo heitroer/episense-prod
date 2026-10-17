@@ -94,13 +94,17 @@ def _fetch_infodengue() -> pd.DataFrame:
     if full_path.exists():
         try:
             tmp = pd.read_csv(full_path, dtype={"SE": str})
-            keep_full = [c for c in ['SE', 'casos', 'casos_est'] if c in tmp.columns]
+            keep_full = [c for c in ['SE', 'casos', 'casos_est', 'Rt', 'p_rt1'] if c in tmp.columns]
             tmp = tmp[keep_full].copy()
             tmp['SE'] = tmp['SE'].astype(str).str.replace(".0","", regex=False).str.zfill(6)
             if 'casos' in tmp.columns:
                 tmp['casos'] = pd.to_numeric(tmp['casos'], errors='coerce').fillna(0).astype(int)
             if 'casos_est' in tmp.columns:
                 tmp['casos_est'] = pd.to_numeric(tmp['casos_est'], errors='coerce').fillna(0)
+            if 'Rt' in tmp.columns:
+                tmp['Rt'] = pd.to_numeric(tmp['Rt'], errors='coerce')
+            if 'p_rt1' in tmp.columns:
+                tmp['p_rt1'] = pd.to_numeric(tmp['p_rt1'], errors='coerce')
             df_full = tmp.drop_duplicates(subset=['SE']).sort_values('SE').reset_index(drop=True)
             logger.info(f"[api live] full history {len(df_full)} rows {df_full['SE'].min()}-{df_full['SE'].max()}")
         except Exception as e:
@@ -121,7 +125,7 @@ def _fetch_infodengue() -> pd.DataFrame:
                 return df.sort_values('SE').reset_index(drop=True)
             logger.warning("Empty fresh and no full")
             return df_fresh
-        keep_cols = ['SE', 'casos', 'casos_est']
+        keep_cols = ['SE', 'casos', 'casos_est', 'Rt', 'p_rt1']
         available_cols = [c for c in keep_cols if c in df_fresh.columns]
         df_fresh = df_fresh[available_cols].copy()
         df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)
@@ -129,6 +133,10 @@ def _fetch_infodengue() -> pd.DataFrame:
         df_fresh['semana'] = df_fresh['SE'].str[4:].astype(int)
         if 'casos' in df_fresh.columns:
             df_fresh['casos'] = pd.to_numeric(df_fresh['casos'], errors='coerce').fillna(0).astype(int)
+        if 'Rt' in df_fresh.columns:
+            df_fresh['Rt'] = pd.to_numeric(df_fresh['Rt'], errors='coerce')
+        if 'p_rt1' in df_fresh.columns:
+            df_fresh['p_rt1'] = pd.to_numeric(df_fresh['p_rt1'], errors='coerce')
         if df_full is not None and not df_full.empty:
             df_full['SE'] = df_full['SE'].astype(str).str.zfill(6)
             df_fresh['SE'] = df_fresh['SE'].astype(str).str.zfill(6)

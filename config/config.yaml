@@ -90,6 +90,7 @@ features:
   expand_extra: false
   expand_climatology: true
   expand_trend: true
+  expand_rt: true
   expand_outbreak: true
   expand_regime_conditional: true
   expand_peak_timing: true
@@ -223,6 +224,16 @@ training:
       "6": {"0.95": 10}
       "7": {"0.95": 10}
       "8": {"0.95": 10}
+    # v6 (Rt, Codeço et al. 2018 via InfoDengue): a família rt_*/p_rt1_* ganha em
+    # h1 (WIS -0.4%, w90 -7%), h3 (MAE -6.7%), h4 (MAE -0.9%/WIS -2.7%) e h8
+    # (MAE -8.9%) — mas regride de forma DETERMINÍSTICA em h2 (MAE +12.3%) e
+    # h5 (MAE +8.2%/WIS +7.1%), e é neutra-sem-ganho em h6/h7. Ban por
+    # horizonte: Rt entra só nos horizontes vencedores (prefixo/startswith).
+    banned_features_per_horizon:
+      "2": ["rt_", "p_rt1_"]
+      "5": ["rt_", "p_rt1_"]
+      "6": ["rt_", "p_rt1_"]
+      "7": ["rt_", "p_rt1_"]
   temporal_weighting:
     enabled: true
     half_life_years: 3.5

@@ -292,6 +292,7 @@ class EpisenseTrainer:
                 'expand_outbreak': bool(self.config.get('features', {}).get('expand_outbreak', True)),
                 'expand_regime_conditional': bool(self.config.get('features', {}).get('expand_regime_conditional', True)),
                 'expand_peak_timing': bool(self.config.get('features', {}).get('expand_peak_timing', True)),
+                'expand_rt': bool(self.config.get('features', {}).get('expand_rt', False)),
             }
         }
         fe = EpisenseFeatureEngineer(fe_cfg)
@@ -1251,6 +1252,15 @@ class EpisenseTrainer:
         quick_params['objective'] = 'quantile'
         per_tau_cols: Dict[float, List[str]] = {}
         keep_all = self._always_keep_cols(X_tr)
+        # v6b: ban por horizonte APLICADO ANTES da estimativa de importância —
+        # a presença de rt_* no pool de candidatos re-aloca ganho e desloca o
+        # ranking dos sobreviventes; filtrar só no corte deixava h2/h5 deslocados.
+        _ban_pre = self._banned_feature_patterns(horizon)
+        X_imp = X_tr
+        if _ban_pre:
+            _allowed_cols = [c for c in X_tr.columns if not any(c.startswith(p) for p in _ban_pre)]
+            X_imp = X_tr[_allowed_cols]
+            logger.info(f"    importance-pool h{horizon}: {X_tr.shape[1]} -> {X_imp.shape[1]} cols (ban {_ban_pre})")
         for tau in self.quantiles:
             try:
                 mf = int(mfq_h.get(str(tau), mfq_h.get(float(tau), max_features_default)) if isinstance(mfq_h, dict) and mfq_h else max_features_default)
@@ -1258,8 +1268,8 @@ class EpisenseTrainer:
                 mf = max_features_default
             qp = quick_params.copy()
             qp['alpha'] = tau
-            m = lgb.train(qp, lgb.Dataset(X_tr, label=y_tr), num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000))))
-            imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
+            m = lgb.train(qp, lgb.Dataset(X_imp, label=y_tr), num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000))))
+            imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_imp.columns)
             thr = float(tpq_h.get(str(tau), tpq_h.get(float(tau), threshold)) if isinstance(tpq_h, dict) else threshold)
             filtered = imp[imp > thr].sort_values(ascending=False)
             cols = filtered.head(mf).index.tolist()
@@ -1267,13 +1277,42 @@ class EpisenseTrainer:
                 remaining = imp[~imp.index.isin(cols)].sort_values(ascending=False).head(mf - len(cols)).index.tolist()
                 cols.extend(remaining)
             if not cols:
-                cols = X_tr.columns.tolist()[:mf]
+                cols = X_imp.columns.tolist()[:mf]
             # always_keep primeiro (entro do teto mf: substitui os de menor ganho na cauda)
             if keep_all:
                 cols = list(dict.fromkeys(list(keep_all) + list(cols)))
-            per_tau_cols[tau] = cols[:mf]
-            logger.info(f"    Separate q{int(tau*1000):04d}: {len(cols)}/{X_tr.shape[1]} feats (top gain {imp.max():.1f} thr {thr} mf {mf})")
+            finals = cols[:mf]
+            # v6: ban por horizonte (Rt melhora h1/h3/h4/h8 mas regride h2/h5 —
+            # família Codeço et al. 2018 aplicada seletivamente em rt_*/p_rt1_*)
+            _ban = self._banned_feature_patterns(horizon)
+            if _ban:
+                n0 = len(finals)
+                finals = [c for c in finals if not any(c.startswith(p) for p in _ban)]
+                logger.info(f"    ban h{horizon}: {n0} -> {len(finals)} feats (padrões {_ban})")
+            per_tau_cols[tau] = finals
+            logger.info(f"    Separate q{int(tau*1000):04d}: {len(per_tau_cols[tau])}/{X_tr.shape[1]} feats (top gain {imp.max():.1f} thr {thr} mf {mf})")
         return per_tau_cols
+
+    def _banned_feature_patterns(self, horizon: Optional[int]) -> List[str]:
+        """Prefixos banidos na seleção de features por horizonte
+        (training.feature_selection.banned_features_per_horizon).
+
+        Ex.: Rt (InfoDengue) entra em h1/h3/h4/h8 mas é banido em h2/h5-h7
+        (regressão determinística observada no cut-off per-tau)."""
+        if horizon is None:
+            return []
+        fs = self.config.get('training', {}).get('feature_selection', {})
+        bans = fs.get('banned_features_per_horizon', {})
+        if not isinstance(bans, dict):
+            return []
+        for cand in (str(horizon), int(horizon)):
+            try:
+                patterns = bans.get(cand)
+            except Exception:
+                patterns = None
+            if patterns:
+                return [str(p) for p in patterns]
+        return []
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -1552,6 +1591,20 @@ def load_processed_data(config: Dict) -> pd.DataFrame:
 
 
 def main():
+    # V6: trava cross-processo (flock em models/.retrain_lock). O fallback de
+    # auto-retreino do dashboard (dashboard.app) usa o MESMO arquivo via
+    # models/ volume-mountada — impede dois treinadores sobrescrevendo
+    # artefatos simultaneamente (host x container). Se já há retreino, sai.
+    import fcntl
+    _lock_fp = None
+    try:
+        _models_dir = Path('models')
+        _models_dir.mkdir(exist_ok=True)
+        _lock_fp = open(_models_dir / '.retrain_lock', 'w')
+        fcntl.flock(_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.info("Outro retreino em curso (lock models/.retrain_lock) — saindo sem treinar.")
+        return
     logger.info("Starting Episense quantile training...")
     config = load_config()
     # Modo smoke (EPISENSE_QUICK=1): 1 horizonte + 1 seed, para validar o pipeline

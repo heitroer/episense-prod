@@ -64,6 +64,7 @@ class EpisenseFeatureEngineer:
         self.expand_outbreak = bool(self.config.get('features', {}).get('expand_outbreak', False))
         self.expand_regime_conditional = bool(self.config.get('features', {}).get('expand_regime_conditional', False))
         self.expand_peak_timing = bool(self.config.get('features', {}).get('expand_peak_timing', False))
+        self.expand_rt = bool(self.config.get('features', {}).get('expand_rt', False))
         self.outbreak_threshold = self.config.get('metrics', {}).get('classification_thresholds', {}).get('outbreak_threshold', 50)
         self.outbreak_thresholds = [self.outbreak_threshold, self.outbreak_threshold * 2, self.outbreak_threshold * 4]
 
@@ -643,6 +644,39 @@ class EpisenseFeatureEngineer:
     # ------------------------------------------------------------------
     # NOVO v3: Peak timing (corrige S6 vs S15)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # NOVO Rt (Codeço, Villela & Coelho 2018 - Epidemics 25:101-111):
+    #   Rt efetivo da dengue com intervalo geracional dependente de
+    #   temperatura (estimativa InfoDengue/AlertaDengue). Rt>1 antecipa o
+    #   início de transmissão crescente semanas antes do volume absoluto
+    #   de casos — sinal de FASE/CINÉTICA, complementar aos lags de casos.
+    # Convenção: o valor de Rt da semana s é conhecido em s (idem log_casos);
+    # derivadas usam shift/rolling sobre o passado. Nada usa futuro.
+    # ------------------------------------------------------------------
+    def create_rt_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Features de Rt: nível, lags, momentum e fase epidêmica (share Rt≥1)."""
+        df = df.copy()
+        if 'Rt' not in df.columns or 'p_rt1' not in df.columns:
+            logger.warning("expand_rt: 'Rt'/'p_rt1' ausentes no dataframe — features Rt puladas")
+            return df
+        rt = pd.to_numeric(df['Rt'], errors='coerce')
+        # clip defensivo (Rt>=0; API pode devolver ruído)
+        rt = rt.clip(lower=0.0)
+        df['rt_now'] = rt
+        df['rt_lag1'] = rt.shift(1)
+        df['rt_lag2'] = rt.shift(2)
+        df['rt_lag3'] = rt.shift(3)
+        df['rt_ma3'] = rt.rolling(3, min_periods=2).mean()
+        df['rt_slope_2'] = rt - rt.shift(2)
+        df['rt_slope_4'] = rt - rt.shift(4)
+        df['rt_gt1_share_4'] = (rt >= 1.0).astype(float).rolling(4, min_periods=2).mean()
+        prt = pd.to_numeric(df['p_rt1'], errors='coerce').clip(lower=0.0, upper=1.0)
+        df['p_rt1_now'] = prt
+        df['p_rt1_lag1'] = prt.shift(1)
+        logger.info(f"expand_rt: {sum(c.startswith(('rt_', 'p_rt1_')) for c in df.columns)} features Rt adicionadas "
+                    f"(Rt notna {rt.notna().mean()*100:.0f}% | média {rt.mean():.2f})")
+        return df
+
     def create_peak_timing_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Features de timing de pico para corrigir viés S6 vs S15.
 
@@ -886,6 +920,11 @@ class EpisenseFeatureEngineer:
         # ============================================================
         if self.expand_peak_timing:
             df = self.create_peak_timing_features(df)
+        # ============================================================
+        # EXPANSAO 9 (expand_rt - Codeço et al. 2018): Rt efetivo + cinetica
+        # ============================================================
+        if self.expand_rt:
+            df = self.create_rt_features(df)
 
         if legacy_mode or convention == 'legacy':
             logger.warning("legacy_mode nao suportado no modo EXP (use convention='advanced')")
