@@ -211,11 +211,15 @@ training:
     # feats ficou ESTREITA demais no surto (cov90 raw 0.94->0.72-0.81) e o conformal
     # nesses horizontes degrada WIS (+12-22%); restaura-se a cauda fina original
     # (thr 0.035 / mf 10, cov90 0.89-0.94, largura grande) apenas para h6-h8.
+    # v5: h5 incluída no override — no retreino v4, h5 condicionada ficou pior em
+    # AMBOS os critérios (cov90 0.88->0.76 E WIS 27.1->29.4 vs cauda fina).
     threshold_per_quantile_per_horizon:
+      "5": {"0.95": 0.035}
       "6": {"0.95": 0.035}
       "7": {"0.95": 0.035}
       "8": {"0.95": 0.035}
     max_features_per_quantile_per_horizon:
+      "5": {"0.95": 10}
       "6": {"0.95": 10}
       "7": {"0.95": 10}
       "8": {"0.95": 10}

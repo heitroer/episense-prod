@@ -268,6 +268,14 @@ cauda nova, o conformal cobre apenas parcialmente (h6 0.72→0.78 com MAE +10% e
 `threshold_per_quantile_per_horizon` / `max_features_per_quantile_per_horizon`
 ("6","7","8"). Aplicação validada por teste unitário; retreino v4 executado.
 
+**Retreino v4 concluído (gate PASS, pior 0.931):** h6–h8 restauraram
+EXATAMENTE o comportamento da cauda fina (cov90 0.91/0.90/0.94; w90 522/515/632;
+WIS 32.1/31.8/31.6 = pré-B), e h1–h4 mantiveram os ganhos (WIS −15/−23%,
+w90 −43/−55%). **h5 foi o problema restante**: cauda condicionada ficou pior em
+AMBOS os critérios (cov90 0.88→0.76 E WIS 27.1→29.4) mesmo com conformal
+expanding. **v5:** h5 incluída no override da cauda fina (h1–h4 condicionadas;
+h5–h8 finas) — retreino v5 executado, resultados abaixo após validação.
+
 ### Limitações conhecidas deixadas abertas (documentadas)
 
 1. fold0 (surto 2023) em h4–h8: subestimação do pico e timing 6–8 SEM cedo, não
