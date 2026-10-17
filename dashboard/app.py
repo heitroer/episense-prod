@@ -33,6 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 BASE_CSV = ROOT / "data/processed/episense_base.csv"
 VAL_PRED = ROOT / "models/validation_predictions.json"
 VAL_RES = ROOT / "models/validation_results.json"
+CONFORMAL_JSON = ROOT / "models/quantile_conformal.json"
 CONFIG_PATH = ROOT / "config/config.yaml"
 
 # Caches com mtime para reload automático quando nova semana entra (sem cron)
@@ -40,6 +41,127 @@ _df_base_mtime = None
 _val_pred_mtime = None
 _val_res_mtime = None
 _config_mtime = None
+_conformal = None
+_conformal_mtime = None
+
+TAU_ORDER = ("0.05", "0.25", "0.5", "0.75", "0.95")
+
+
+def _load_conformal():
+    """Artefato de calibração conformal de produção (pool 4 folds)."""
+    global _conformal, _conformal_mtime
+    try:
+        if CONFORMAL_JSON.exists():
+            mtime = CONFORMAL_JSON.stat().st_mtime
+            if _conformal is None or _conformal_mtime != mtime:
+                with open(CONFORMAL_JSON) as f:
+                    _conformal = json.load(f)
+                _conformal_mtime = mtime
+                logger.info(f"conformal recarregado (production h={sorted((_conformal.get('production') or {}).keys())})")
+    except Exception as e:
+        logger.warning(f"falha ao recarregar conformal: {e}")
+    return _conformal
+
+
+def _qc_cfg():
+    """Config quantile_conformal (enabled, apply_horizons, regime_thresholds)."""
+    qc = config.get("quantile_conformal") if isinstance(config, dict) else None
+    return qc if isinstance(qc, dict) else {}
+
+
+_regime_hook_cache = {"mtime": None, "hook": None, "casos": None}
+
+
+def _get_casos_by_se():
+    """Dict SE(zfill6)->casos do df_base; rebuild quando o CSV muda."""
+    df = df_base
+    mtime = _df_base_mtime
+    c = _regime_hook_cache
+    if df is None or mtime is None:
+        return {}
+    if c["mtime"] == mtime and c["casos"] is not None:
+        return c["casos"]
+    casos = {}
+    try:
+        for se, v in zip(df["SE"], df["casos"]):
+            fv = float(v)
+            if np.isfinite(fv):
+                casos[str(se).zfill(6)] = fv
+    except Exception as e:
+        logger.warning(f"casos_by_se falhou: {e}")
+        return {}
+    c["mtime"] = mtime
+    c["casos"] = casos
+    return casos
+
+
+def _get_regime_hook():
+    """Hook (h, target_se) -> regime-base, como na produção/recompute."""
+    c = _regime_hook_cache
+    if c["hook"] is not None and c["mtime"] == _df_base_mtime:
+        return c["hook"]
+    try:
+        from models.calibration import make_regime_hook
+
+        hook = make_regime_hook(_get_casos_by_se(), _qc_cfg().get("regime_thresholds") or None)
+        c["hook"] = hook
+        c["mtime"] = _df_base_mtime
+        return hook
+    except Exception as e:
+        logger.warning(f"regime hook indisponível: {e}")
+        return None
+
+
+def _calibrate_qvals(h_int: int, target_se: str, qvals: dict):
+    """Aplica deltas conformal de PRODUÇÃO (pool 4 folds) aos quantis de uma
+    semana-alvo (log1p + median_shift + non-crossing).
+
+    qvals: {"0.05": v|None, ..., "0.95": v|None} -> (qvals_out, applied)
+    """
+    qc = _qc_cfg()
+    horizons = set(int(x) for x in (qc.get("apply_horizons") or []) if str(x).strip().lstrip("-").isdigit())
+    if not qc.get("enabled") or int(h_int) not in horizons:
+        return qvals, False
+    conf = _load_conformal()
+    prod = (conf or {}).get("production") or {}
+    if not prod:
+        return qvals, False
+    entry = {}
+    try:
+        from models.calibration import entry_for_key
+
+        hook = _get_regime_hook()
+        regime = hook(int(h_int), str(target_se)) if hook else "global"
+        entry = entry_for_key(prod, int(h_int), regime)
+    except Exception as e:
+        logger.info(f"calibração indisponível h={h_int} t={target_se}: {e}")
+    if not entry:
+        return qvals, False
+    shift = float(entry.get("median_shift") or 0.0)
+    deltas = entry.get("deltas") or {}
+    out = {}
+    for tau, v in qvals.items():
+        if v is None:
+            out[tau] = None
+            continue
+        lg = np.log1p(max(float(v), 0.0)) + shift
+        if abs(float(tau) - 0.5) > 1e-9:
+            try:
+                d = float(deltas.get(f"{float(tau):.2f}"))
+            except Exception:
+                d = 0.0
+            if np.isfinite(d):
+                lg += d
+        out[tau] = float(np.clip(np.expm1(lg), 0.0, None))
+    # non-crossing por semana entre os taus presentes
+    present = [(t, out[t]) for t in TAU_ORDER if out.get(t) is not None]
+    if len(present) >= 2:
+        ordered = sorted(present, key=lambda x: x[1])
+        if any(a[0] != b[0] for a, b in zip(present, ordered)):
+            # reatribui os valores ordenados seguindo a ordem dos taus
+            for (t_orig, _), (_, val) in zip(present, ordered):
+                out[t_orig] = val
+    return out, True
 
 def _load_df_base():
     global df_base, _df_base_mtime
@@ -1110,6 +1232,28 @@ def api_history(horizon: str = "1", window: int = 52):
                     points[se]["pred_high"] = float(pred)
                     points[se]["q95"] = float(pred)
 
+    # Calibração conformal DE PRODUÇÃO (pool 4 folds, regimes pela semana-base)
+    # sobre os pontos de validação: mesmas bandas que o modelo implantado teria
+    # publicado — coerente com o fan do /api/forecast e com as linhas live do
+    # archive (que já saem calibradas da inferência). h fora de apply_horizons
+    # permanecem raw.
+    try:
+        for se, pv in points.items():
+            taus = {"0.05": pv.get("q05"), "0.25": pv.get("q25"), "0.5": pv.get("pred"),
+                    "0.75": pv.get("q75"), "0.95": pv.get("q95")}
+            cal, applied = _calibrate_qvals(int(h), str(se).zfill(6), taus)
+            if not applied:
+                continue
+            pv["pred"] = cal.get("0.5")
+            pv["pred_low"] = cal.get("0.05")
+            pv["pred_high"] = cal.get("0.95")
+            pv["q05"] = cal.get("0.05")
+            pv["q25"] = cal.get("0.25")
+            pv["q75"] = cal.get("0.75")
+            pv["q95"] = cal.get("0.95")
+    except Exception as e:
+        logger.warning(f"calibração history falhou (mantendo raw): {e}")
+
     # Real deve ser live (mesma lógica API 8001 com nowcast), não CSV defasado
     try:
         eng_live = _get_live_engineered()
@@ -1356,35 +1500,79 @@ def api_forecast(origin_se: str, horizon: str = None):
             return {"error": f"SE {origin_se} not found", "origin_se": origin_se}
 
     def lookup_validation():
+        """Fan histórico walk-forward por ORIGEM.
+
+        Para cada h∈1..8 a previsão vinda da semana-origem é a predição de
+        validação do alvo origin+h (fold que cobre o alvo; no cruzamento de
+        folds vale 'último vence', mesma regra do /api/history). Os quantis
+        recebem a calibração conformal DE PRODUÇÃO (pool dos 4 folds — o que
+        o modelo implantado de fato produziria), com chips de fold e flag
+        `calibrated`. Linhas sem predição validada ficam `disponivel=false`
+        (fan parcial perto do fim do histórico / 2026).
+        """
         result = {
             "origin_se": origin_se,
             "origin_date": se_to_date(origin_se),
             "forecast": [],
             "source": "validation",
+            "calibration_scheme": "production_pool_cqr_delta_only",
             "quantiles": {"low": "0.05", "median": "0.5", "high": "0.95"},
         }
-        complete = True
+        casos_by_se = _get_casos_by_se()
+        any_available = False
+        any_calibrated = False
+        last_data_se = ""
+        try:
+            if df_base is not None and len(df_base):
+                last_data_se = str(df_base["SE"].max()).zfill(6)
+        except Exception:
+            last_data_se = ""
         for hh in range(1, 9):
             hstr = str(hh)
             target_se = add_epiweeks(origin_se, hh)
-            qvals = {"q05": None, "q25": None, "q50": None, "q75": None, "q95": None}
+            target_se = str(target_se).zfill(6)
+            qvals = {"0.05": None, "0.25": None, "0.5": None, "0.75": None, "0.95": None}
+            fold_by_tau = {}
             if hstr in val_pred:
-                for q, out_key in [("0.05", "q05"), ("0.25", "q25"), ("0.5", "q50"), ("0.75", "q75"), ("0.95", "q95")]:
-                    for fold in val_pred[hstr].get(q, []):
-                        ses = [str(x) for x in fold.get("test_se", [])]
+                for q in ("0.05", "0.25", "0.5", "0.75", "0.95"):
+                    folds = val_pred[hstr].get(q, [])
+                    # mesmo filtro do /api/history: descarta fold legacy 2021
+                    final = [f for f in folds
+                             if not (f.get("test_se") and str(f["test_se"][0]) < "202236")] or folds
+                    for fold in final:
+                        ses = [str(x).zfill(6) for x in fold.get("test_se", [])]
                         if target_se in ses:
                             idx = ses.index(target_se)
-                            qvals[out_key] = int(round(float(fold["y_pred_casos"][idx])))
-                            break
-            if qvals["q50"] is None:
-                complete = False
-            result["forecast"].append({
+                            try:
+                                v = float(fold["y_pred_casos"][idx])
+                            except Exception:
+                                continue
+                            if np.isfinite(v):
+                                qvals[q] = v
+                                fold_by_tau[q] = fold.get("fold")
+                    # last-win implícito: itera na ordem salva (fold0..3)
+                    # e o último fold que cobre o alvo sobrescreve
+            cal, applied = _calibrate_qvals(hh, target_se, qvals)
+            any_calibrated = any_calibrated or applied
+            real = casos_by_se.get(target_se)
+            if target_se > last_data_se:
+                real = None  # semana sem observação publicada
+            disponivel = cal.get("0.5") is not None
+            any_available = any_available or disponivel
+            row = {
                 "h": hh,
                 "target_se": target_se,
                 "target_date": se_to_date(target_se),
-                **qvals,
-            })
-        return result if complete else None
+                "q05": cal.get("0.05"), "q25": cal.get("0.25"),
+                "q50": cal.get("0.5"), "q75": cal.get("0.75"), "q95": cal.get("0.95"),
+                "real": real,
+                "fold": fold_by_tau.get("0.5"),
+                "calibrated": bool(applied),
+                "disponivel": bool(disponivel),
+            }
+            result["forecast"].append(row)
+        result["any_calibrated"] = any_calibrated
+        return result if any_available else None
 
     # Se a origem é a mais recente, SEMPRE faz live fresco (mesma lógica da API 8001)
     is_latest = (origin_se == live_latest) or (origin_se == _get_base_max_se())
@@ -1396,22 +1584,24 @@ def api_forecast(origin_se: str, horizon: str = None):
             pass
         else:
             # para origens antigas, mantém cache rápido (validação)
+            # stamp: invalida quando val_pred/df_base/conformal mudam (mtime)
+            stamp = (_val_pred_mtime, _df_base_mtime, _conformal_mtime)
             with _forecast_cache_lock:
                 if cache_key in _forecast_cache:
                     # se cache é live para latest, não retorna validado antigo
                     cached = _forecast_cache[cache_key]
                     if is_latest and cached.get("source") == "validation":
                         pass
-                    else:
+                    elif cached.get("_stamp") == stamp:
                         return cached
             val_lookup = lookup_validation()
             if val_lookup is not None and not is_latest:
                 with _forecast_cache_lock:
-                    if cache_key not in _forecast_cache:
-                        if len(_forecast_cache) >= _forecast_cache_max:
-                            oldest = next(iter(_forecast_cache))
-                            del _forecast_cache[oldest]
-                        _forecast_cache[cache_key] = val_lookup
+                    val_lookup["_stamp"] = stamp
+                    if len(_forecast_cache) >= _forecast_cache_max:
+                        oldest = next(iter(_forecast_cache))
+                        del _forecast_cache[oldest]
+                    _forecast_cache[cache_key] = val_lookup
                 return val_lookup
     except Exception:
         pass
