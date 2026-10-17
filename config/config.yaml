@@ -287,15 +287,17 @@ quantile_recalibration:
 quantile_conformal:
   # CQR (conformized quantile regression) DELTA-ONLY por horizonte x regime-base.
   # Regime = intensidade OBSERVÁVEL da semana-base (casos), decidível em produção.
-  # Evidência dos experimentos out/2026: cov90 h1 0.82->0.90, MAE estável (fold1
-  # 0.77->0.88, fold3 0.80->0.92); delta-only em h4-h8 cruza regimes contraditórios
-  # entre temporadas e DEGRADA WIS -- por isso apply_horizons [1,2,3].
+  # Evidência dos experimentos out/2026 (expanding, por fold): cov90 h1 0.82->0.90,
+  # MAE estável (fold1 0.77->0.88, fold3 0.80->0.92); delta-only em h6-h8 cruza
+  # regimes contraditórios entre temporadas e degrada WIS. h4 ambíguo pós-retreino
+  # (f1 cov90 0.81->0.94 MAS f3 0.65->0.56 / cov50 0.37->0.15) => excluído; h5
+  # melhora todos os folds (f1 0.85->0.90, f2 0.94->1.00, f3 0.58->0.73) => incluído.
   # Median shift desabilitado (transfere mal a amplitude entre temporadas).
   # Valid honesta: expanding (fold calibrado só com folds anteriores) no recompute.
   enabled: true
   half_life_years: 2.5
   max_abs_delta: 1.0
-  apply_horizons: [1, 2, 3]
+  apply_horizons: [1, 2, 3, 5]
   apply_median_shift: false
   max_abs_median_shift: 0.8
   regime_thresholds:

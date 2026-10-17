@@ -103,7 +103,7 @@ Detalhes dos experimentos podem ser vistos no GitHub (commits a partir de `15934
 
 | # | Fraqueza (P) | Mudança | Arquivo | Desenho |
 |---|---|---|---|---|
-| 1 |P8, P2, P9| **CQR delta-only** (`quantile_conformal`) por horizonte × regime-base, calibrada nos 4 folds com pesos temporais (meia-vida 2,5 a) e deltas limitados a ±1.0 log | `models/calibration.py` (novo) | Aplicado em **h1–h3** (evidência abaixo); validação **expanding** (fold calibrado só com folds anteriores) |
+| 1 |P8, P2, P9| **CQR delta-only** (`quantile_conformal`) por horizonte × regime-base, calibrada nos 4 folds com pesos temporais (meia-vida 2,5 a) e deltas limitados a ±1.0 log | `models/calibration.py` (novo) | Aplicado em **h1–h3 e h5** (h6–h8 rejeitados; h4 excluído pós-retreino — evidência abaixo); validação **expanding** (fold calibrado só com folds anteriores) |
 | 2 |P2, P4| **Regime-base por intensidade observável** (casos da semana-base: high ≥100 / mid 20–100 / low <20) — decidível em produção | `models/calibration.py::make_regime_hook` | Substitui o regime por mês-do-alvo, que misturava temporadas de amplitudes distintas |
 | 3 |P1, P3, P4| **`always_keep` de features de regime** na seleção (16 features: YTD-ratio, YoY, growth-ratio, momentum, slopes/accel, anomalies clim., vs-EWMA proxy de R) | `scripts/train.py` + config | Sobrevivem ao corte 380→120 por ganho |
 | 4 |P7| **Deployment gate por fold**: reprova retreino se pior fold completo (≥52 sem) tiver MAE > 1,35× baseline sazonal | `scripts/train.py` (`deployment_gate.json`) + `scripts/update_pipeline.py` | Falha ⇒ backup `_backup_stable` restaurado, sem md5 novo e sem restart da API |
@@ -125,10 +125,13 @@ Decisões de projeto registradas:
   temporadas de amplitudes 10× e o shift da mediana transfere mal (o peso temporal
   domina com os dados recentes, mas a próxima temporada pode ter outra amplitude).
   A correção de viés fica por conta das features de regime (item 3) no retreino.
-- **Deltas fora de h4–h8** (`apply_horizons: [1,2,3]`): em horizontes longos os erros
-  de cobertura são contraditórios ENTRE temporadas (fold2 bandas 2–4× reais vs fold3
-  bandas apertadas) — o conformal com pool cruzado degrada WIS. O problema P9
-  (cov50 h7–h8 ~0.40) fica para o modelo recombinado + futura calibração
+- **Deltas em h1–h3 e h5** (`apply_horizons: [1,2,3,5]`): em horizontes muito longos
+  (h6–h8) os erros de cobertura são contraditórios ENTRE temporadas (fold2 bandas
+  2–4× reais vs fold3 bandas apertadas) — o conformal com pool cruzado degrada WIS.
+  Pós-retreino, h4 ficou **ambíguo** no expanding (fold1 cov90 0.81→0.94, porém fold3
+  0.65→0.56 com cov50 0.37→0.15 e WIS fold2 +19%) e foi excluído; h5 melhorou
+  **todos** os folds (fold1 0.85→0.90, fold2 0.94→1.00, fold3 0.58→0.73) e foi
+  incluído. O problema P9 (cov50 h7–h8 ~0.4) fica para uma futura calibração
   condicional por horizonte com mais temporadas.
 - Nota honesta: **fold0 fica sem calibração** na avaliação expanding (era o
   histórico disponível até então). Em produção o artefato carrega os 4 folds.
@@ -143,6 +146,81 @@ calibrados, as métricas canônicas passam a refletir o estado FINAL da cadeia
 
 ## Resultados pós-retreino
 
-(A ser preenchido após o retreino full com as mudanças acima.)
+Retreino completo executado em 2026-10-16 (`scripts/train.py`, 8 horizontes, 4 folds,
+seeds intactos, seleção com `always_keep` de 16 features de regime) — exit 0.
+**Deployment gate: PASS** (pior razão fold/baseline = 0.732, h4·fold1; budget 1.35).
+API e dashboard reconstruídos e verificados (`/metrics` e `/api/metrics` servindo as
+métricas canônicas calibradas; `/predict/5002704` com conformal carregado e aplicado).
+
+### Comparação global — média dos 4 folds (canônica: modelo + calibração expanding)
+
+| h | MAE (antes→depois) | Bias | Cov50 | Cov90 | W90 | WIS_total |
+|---|---|---|---|---|---|---|
+| h1 | 43.6→**37.6** (−14%) | −24.4→**−16.7** | 0.45→**0.52** | 0.82→**0.88** | 229→521 | 14.3→16.0 (**+9%**) |
+| h2 | 60.3→**49.6** (−18%) | −36.9→**−17.6** | 0.51→**0.60** | 0.87→**0.92** | 269→545 | 19.6→19.7 |
+| h3 | 68.3→**60.1** (−12%) | −41.1→**−17.8** | 0.50→**0.54** | 0.89→**0.90** | 429→626 | 24.7→**23.6** |
+| h4 | 84.4→**71.0** (−16%) | −53.8→**−30.3** | 0.50→0.46 | 0.92→0.83 ⚠ | 478→580 | 28.7→**26.5** |
+| h5 | 87.8→**73.1** (−17%) | −62.3→**−12.8** | 0.47→0.42 | 0.91→0.88 | 521→529 | 30.5→**27.1** |
+| h6 | 91.7→95.0 (+4%) | −63.5→−66.5 | 0.48→0.43 | 0.87→**0.91** | 508→523 | 32.7→**31.9** |
+| h7 | 98.2→103.4 (+5%) | −65.8→−67.8 | 0.40→**0.43** | 0.90→0.89 | 575→515 | 33.6→**32.3** |
+| h8 | 98.2→103.6 (+5%) | −68.4→−69.5 | 0.41→**0.42** | 0.87→**0.94** | 567→632 | 34.3→**32.0** |
+
+Leitura: MAE e bias melhoram forte em h1–h5; WIS (que pune larguras supérfluas)
+melhora ou fica estável em h2–h8 e piora 9% em h1 — o custo de bandas
+**honestamente mais largas** no surto (fold0 h1: w90 330→1246), que compraram
+cobertura (cov90 h1 0.82→0.88; fold0 h8 0.75→0.92). h4·cov90 0.83 é regressão
+pontual do novo modelo (algumas semanas do fold1; raw = calibrado, pois a
+calibração de h4 foi ambígua e ficou de fora — ver decisão abaixo).
+
+### Por fold (canônico) — mudanças-chave
+
+| fold·h | MAE | bias | cov50 | cov90 | w90 | wis |
+|---|---|---|---|---|---|---|
+| f0·h1 | 64.7→63.7 | −43.5→−43.3 | 0.48→0.50 | 0.81→**0.88** | 330→1246 | 21.1→28.6 |
+| f1·h1 | 48.5→54.9 ⚠ | −25.7→−27.3 | 0.29→0.31 | 0.77→**0.73** ⚠ | 249→449 | 15.3→21.8 |
+| f2·h1 | 17.6→18.5 | −4.0→−3.7 | 0.58→**0.66** | 0.89→**0.94** | 108→300 | 6.5→8.8 |
+| f3·h1 | 15.1→**13.3** | +9.3→+7.6 | 0.52→**0.62** | 0.80→**0.94** | 87→88 | 5.8→**4.9** |
+| f0·h4 | 153.1→**141.4** | −136.2→−121.3 | 0.29→0.25 | 0.87→0.88 | 602→1006 | 48.9→51.4 |
+| f3·h4 | 41.6→**40.5** | +38.1→+38.0 | 0.32→**0.37** | 0.66→0.65 | 194→214 | 12.8→**12.2** |
+| f0·h8 | 187.4→**186.6** | −168.0→−167.7 | 0.12→**0.15** | 0.75→**0.92** ✅ | 792→1033 | 59.0→**56.2** |
+| f1·h8 | 88.9→97.7 ⚠ | −34.6→−33.7 | 0.46→**0.50** | 0.88→**0.92** | 435→629 | 31.3→**29.4** |
+| f2·h8 | 18.2→26.4 ⚠ | −2.7→−7.1 | 0.66→0.60 | 0.96→0.96 | 473→**234** | 12.6→**10.5** |
+| f3·h8 | 63.9→**60.2** | +57.8→+55.5 | 0.19→0.20 | 0.53→0.55 | 296→**173** | 22.5→**20.2** |
+
+### Status por fraqueza (P1–P9, pós-retreino)
+
+- **P1 — picos: parcial.** Bias global h1–h5 −25% a −70% melhor. Mediana no pico
+  202314 (real 1132): h1 830→**904** (−27%→−20% ✅), mas h4 461→**303** e h8 535→**259**
+  pioram na semana EXATA (timing antecipado). Pico 202407 (769): h4 590 (−23% ✅).
+  Bins ≥400 (pooled): h1 −97 (era −95), h4 −233 (era −162), h8 −323 (era −296) →
+  tail de horizonte longo **piorou**. Permanece a limitação central em h4–h8.
+- **P2 — cobertura condicional: majoritariamente corrigida.** Global: h1 0.88,
+  h2 0.92, h8 0.94 (nominal 0.90); fração y<q05 h1 pooled 7.7–21.2% por fold
+  (era 15.5%). fold0: h8 0.75→0.92 ✅. Piores casos RESTANTES: fold1 h1 0.73
+  (21% abaixo de q05) e fold3 h8 0.55 (45% abaixo de q05, era 47%).
+- **P3 — perde para persistência: melhorou, não virou o jogo.** f0 h1 63.7 vs 59.0
+  (era 64.7); f3 h1 13.3 vs 10.6 (era 15.1); f3 h4 40.5 vs 18.8 (2.2×, era 2.2×).
+- **P4 — piso em semanas <10: melhora leve.** Bias (pooled) +40 (h1) a +84 (h8)
+  (era +36 a +96). Não resolvido por calibração (median shift rejeitado).
+- **P5 — top-10%: piorou** (MAE 122/334/422 em h1/h4/h8, era 77/198/212).
+  Trade do retreino: semanas típicas muito melhores, extremos piores — alvo do
+  experimento 2 (tweedie p=1.7 / correção multiplicativa de tendência).
+- **P6 — timing: melhorou em fold3** (pico 202613 previsto vs real 202612, ±1 SEM em
+  h1/h4/h8 — era "fase errada"); fold0: h1 ±1 SEM ✅, h4/h8 ainda 6–8 SEM cedo.
+- **P7 — pior fold visível: resolvido como processo** (gate por fold, worst 0.732
+  PASS; `update_pipeline` fará rollback automático se superado).
+- **P8 — recalibração holdout fraca: resolvido** (legacy off; conformal 4 folds).
+- **P9 — cov50 h7–h8: leve melhora, segue aberto** (0.43/0.42 vs nominal 0.50).
+
+### Limitações conhecidas deixadas abertas (documentadas)
+
+1. fold0 (surto 2023) em h4–h8: subestimação do pico e timing 6–8 SEM cedo, não
+  corrigíveis por conformal (resíduos inconsistentes entre temporadas) — alvo do
+  experimento 2 (loss tweedie 1.7) se necessário.
+2. fold1 h1 cobertura 0.73 (novo modelo; na calibração expanding há história
+  mínima disponível para esse fold).
+3. fold3 (2026 fraco) cov90 h8 0.55.
+4. Bandas mais largas no surto (WIS h1 +9%) — largura honesta escolhida em vez
+  de cobertura nominal sem largura.
 
 — Gerado em out/2026 a partir das artefatos de validação do projeto.
