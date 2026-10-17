@@ -196,15 +196,17 @@ calibração de h4 foi ambígua e ficou de fora — ver decisão abaixo).
   tail de horizonte longo **piorou**. Permanece a limitação central em h4–h8.
 - **P2 — cobertura condicional: majoritariamente corrigida.** Global: h1 0.88,
   h2 0.92, h8 0.94 (nominal 0.90); fração y<q05 h1 pooled 7.7–21.2% por fold
-  (era 15.5%). fold0: h8 0.75→0.92 ✅. Piores casos RESTANTES: fold1 h1 0.73
-  (21% abaixo de q05) e fold3 h8 0.55 (45% abaixo de q05, era 47%).
+  (era 15.5%). fold0: h8 0.75→0.92 ✅. Pós-v5: **fold1 h1 0.73→0.87** (y>q95
+  15%→1.9%) e larguras de surto honestas (w90 h1 203). Piores casos RESTANTES:
+  fold3 h5 0.58 e fold3 h8 0.55 (45% abaixo de q05, era 47%).
 - **P3 — perde para persistência: melhorou, não virou o jogo.** f0 h1 63.7 vs 59.0
   (era 64.7); f3 h1 13.3 vs 10.6 (era 15.1); f3 h4 40.5 vs 18.8 (2.2×, era 2.2×).
 - **P4 — piso em semanas <10: melhora leve.** Bias (pooled) +40 (h1) a +84 (h8)
   (era +36 a +96). Não resolvido por calibração (median shift rejeitado).
-- **P5 — top-10%: piorou** (MAE 122/334/422 em h1/h4/h8, era 77/198/212).
-  Trade do retreino: semanas típicas muito melhores, extremos piores — alvo do
-  experimento 2 (tweedie p=1.7 / correção multiplicativa de tendência).
+- **P5 — top-10%: piorou vs pré-B, mitigado pela v5** (MAE 77→118 (h1), 198→275
+  (h4), 212→367 (h8); na cadeia v3 eram 122/334/422). Trade do retreino:
+  semanas típicas muito melhores, extremos piores — alvo do experimento
+  tweedie p=1.7 / correção multiplicativa de tendência, se necessário.
 - **P6 — timing: melhorou em fold3** (pico 202613 previsto vs real 202612, ±1 SEM em
   h1/h4/h8 — era "fase errada"); fold0: h1 ±1 SEM ✅, h4/h8 ainda 6–8 SEM cedo.
 - **P7 — pior fold visível: resolvido como processo** (gate por fold, worst 0.732
@@ -275,6 +277,26 @@ w90 −43/−55%). **h5 foi o problema restante**: cauda condicionada ficou pior
 AMBOS os critérios (cov90 0.88→0.76 E WIS 27.1→29.4) mesmo com conformal
 expanding. **v5:** h5 incluída no override da cauda fina (h1–h4 condicionadas;
 h5–h8 finas) — retreino v5 executado, resultados abaixo após validação.
+
+### Estado final em produção (v5, 17/10) — gate PASS; API/dashboard verificados
+
+Canônica expandida (modelo + conformal expanding ativa em h1–h3+h5):
+
+| h | MAE (v3→**v5**) | Bias | Cov50 | Cov90 | W90 (v3→**v5**) | WIS (v3→**v5**) |
+|---|---|---|---|---|---|---|
+| h1 | 37.6→**35.8** | −16.7→**−14.1** | 0.52 | **0.88** | 521→**203** (−61%) | 16.0→**12.4** (−23%) |
+| h2 | 49.6→**48.7** | −17.6→**−11.9** | 0.60 | **0.91** | 545→**245** (−55%) | 19.7→**16.8** (−15%) |
+| h3 | 60.1→65.3 (+9%) | −17.8→**−6.0** | 0.54 | **0.89** | 626→**306** (−51%) | 23.6→**21.3** (−10%) |
+| h4 | 71.0→71.8 | −30.3→−30.4 | 0.46→0.45 | 0.83→**0.84** | 580→**330** (−43%) | 26.5→**23.9** (−10%) |
+| h5 | 73.1→74.6 (+2%) | −12.8→−16.5 | 0.42 | 0.88→0.85 | 529 | 27.1 |
+| h6–h8 | ≈ | ≈ | 0.47/0.44/0.41 | **0.91/0.90/0.94** | 522/515/633 | 32.1/31.8/31.6 |
+
+Mediana (q50) e features do centro **não mudam**: P1 (picos) e P6 (timing)
+idênticos ao estado v3. Guardas medidos: fold1 h1 **y>q95 15%→1,9%**;
+razão q95/mediana em semanas calmas **29,7×→3,6×** (fold0 h1) e 6,6×→2,8×
+(fold3 h1); excesso p90 de q95−y cai ~8× (h1 f0). WIS_90 de h1 17.4→**7.2**
+(raw). Custo honesto: MAE de h3 +9% (65.3, ainda < baseline sazonal com folgado
+gate 0.735) e cov90 h5 −3pp (0.85) — documentados como trade da largura.
 
 ### Limitações conhecidas deixadas abertas (documentadas)
 
