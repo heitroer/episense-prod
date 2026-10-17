@@ -832,7 +832,7 @@ class EpisenseTrainer:
 
             if separate_mode:
                 # 380 por quantil independentes (sem leakage so X_tr_base)
-                per_tau_cols = self._get_selected_columns_per_quantile(X_tr_base, y_tr_base)
+                per_tau_cols = self._get_selected_columns_per_quantile(X_tr_base, y_tr_base, horizon=horizon)
                 X_tr_dict = {tau: X_tr_base[cols] for tau, cols in per_tau_cols.items()}
                 X_val_dict = {tau: X_val_base.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
                 X_test_dict = {tau: X_test.reindex(columns=cols, fill_value=0) for tau, cols in per_tau_cols.items()}
@@ -946,7 +946,7 @@ class EpisenseTrainer:
                 X_full_base = X_full_base.drop(columns=['ano_raw'])
                 self.ano_normalization_params[horizon] = {'ano_min': ano_min, 'ano_max': ano_max}
             if separate_mode:
-                per_tau_full_cols = self._get_selected_columns_per_quantile(X_full_base, y_full_src)
+                per_tau_full_cols = self._get_selected_columns_per_quantile(X_full_base, y_full_src, horizon=horizon)
                 # feature_names[horizon] passa a ser dict tau->list
                 self.feature_names[horizon] = per_tau_full_cols
                 logger.info(f"  h{horizon} separate features FULL: " + ", ".join([f"q{int(t*1000):04d}:{len(c)}" for t,c in per_tau_full_cols.items()]))
@@ -1215,16 +1215,30 @@ class EpisenseTrainer:
             logger.info(f"    always_keep: garantidas {len(keep)} features de regime")
         return keep
 
-    def _get_selected_columns_per_quantile(self, X_tr: pd.DataFrame, y_tr: pd.Series) -> Dict[float, List[str]]:
+    def _get_selected_columns_per_quantile(self, X_tr: pd.DataFrame, y_tr: pd.Series,
+                                           horizon: Optional[int] = None) -> Dict[float, List[str]]:
         """380 features INDEPENDENTES por quantil (separate_quantile_features).
         Cada tau tem seu top 380 por ganho, sem leakage (so X_tr). Corrige q05 flat h4/h8.
-        v3: usa threshold por quantil (0.0005 para q05). Fase1: suporte max_features_per_quantile {0.05:200}."""
+        v3: usa threshold por quantil (0.0005 para q05). Fase1: suporte max_features_per_quantile {0.05:200}.
+        v4 (out/2026): overrides por horizonte — threshold_per_quantile_per_horizon /
+        max_features_per_quantile_per_horizon (ex.: cauda fina em h6-h8 onde a astringente
+        original era estável, cauda condicionada em h1-h5)."""
         fs = self.config.get('training', {}).get('feature_selection', {})
         max_features_default = int(fs.get('max_features', 380))
         # Fase1: per-quantil max_features (ex: q05/q95 200, q50 380) sem quebrar compat
         mfq = fs.get('max_features_per_quantile', {})
         threshold = float(fs.get('threshold', 0.001))
         tpq = fs.get('threshold_per_quantile', {})
+        # v4: overrides por horizonte (aceita chave str '6' ou int 6)
+        tpq_h, mfq_h = tpq, mfq
+        if horizon is not None:
+            ovr_t = fs.get('threshold_per_quantile_per_horizon', {})
+            ovr_m = fs.get('max_features_per_quantile_per_horizon', {})
+            for cand in (str(horizon), int(horizon)):
+                if isinstance(ovr_t, dict) and isinstance(ovr_t.get(cand), dict):
+                    tpq_h = ovr_t[cand]
+                if isinstance(ovr_m, dict) and isinstance(ovr_m.get(cand), dict):
+                    mfq_h = ovr_m[cand]
         quick_params = self.model_params.copy()
         quick_params['random_state'] = 42
         quick_params['seed'] = 42
@@ -1239,14 +1253,14 @@ class EpisenseTrainer:
         keep_all = self._always_keep_cols(X_tr)
         for tau in self.quantiles:
             try:
-                mf = int(mfq.get(str(tau), mfq.get(float(tau), max_features_default)) if isinstance(mfq, dict) and mfq else max_features_default)
+                mf = int(mfq_h.get(str(tau), mfq_h.get(float(tau), max_features_default)) if isinstance(mfq_h, dict) and mfq_h else max_features_default)
             except Exception:
                 mf = max_features_default
             qp = quick_params.copy()
             qp['alpha'] = tau
             m = lgb.train(qp, lgb.Dataset(X_tr, label=y_tr), num_boost_round=min(200, int(self.model_params.get('n_estimators', 3000))))
             imp = pd.Series(m.feature_importance(importance_type='gain'), index=X_tr.columns)
-            thr = float(tpq.get(str(tau), tpq.get(float(tau), threshold)) if isinstance(tpq, dict) else threshold)
+            thr = float(tpq_h.get(str(tau), tpq_h.get(float(tau), threshold)) if isinstance(tpq_h, dict) else threshold)
             filtered = imp[imp > thr].sort_values(ascending=False)
             cols = filtered.head(mf).index.tolist()
             if len(cols) < mf:
@@ -1543,13 +1557,16 @@ def main():
     # Modo smoke (EPISENSE_QUICK=1): 1 horizonte + 1 seed, para validar o pipeline
     # rapidamente JUNTO com EPISENSE_MODELS_DIR (não sobrescreve artefatos de produção).
     if os.environ.get('EPISENSE_QUICK'):
-        config.setdefault('targets', {})['horizons'] = [1]
-        config['targets']['target_cols'] = ['target_h1']
+        # EPISENSE_QUICK_HORIZONS: horizontes alternativos p/ smoke (ex.: "6" ou "1,5")
+        _qh = [int(x) for x in os.environ.get('EPISENSE_QUICK_HORIZONS', '1').split(',') if x.strip()]
+        _hs = _qh or [1]
+        config.setdefault('targets', {})['horizons'] = _hs
+        config['targets']['target_cols'] = [f'target_h{h}' for h in _hs]
         ens_cfg = config.setdefault('model', {}).setdefault('ensemble', {})
         ens_cfg['seeds'] = [42]
         ens_cfg['n_seeds'] = 1
         config.setdefault('training', {})['parallel_horizons'] = {'enabled': False}
-        logger.info("EPISENSE_QUICK=1: modo smoke (h=[1], seeds=[42], sequencial)")
+        logger.info(f"EPISENSE_QUICK=1: modo smoke (h={_hs}, seeds=[42], sequencial)")
     df = load_processed_data(config)
     if df.empty:
         logger.error("No data available")

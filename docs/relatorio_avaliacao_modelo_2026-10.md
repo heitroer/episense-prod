@@ -256,6 +256,18 @@ Seleção pós-mudança: **51–55 features** (antes 22–25), smoke test ínteg
 (gate PASS) e **retreino completo em andamento** — resultados serão anexados
 após a validação expanding da nova cadeia.
 
+Retreino B concluído (gate PASS, pior 0.927). Cauda condicionada em TODOS os
+horizontes: WIS h1 −23% (16.0→12.4), w90 h1 521→203, MAE igual/melhor em
+h1–h3 — mas **cov90 degrada em h6–h8** (raw: 0.91/0.89/0.94→0.72/0.81/0.81).
+**Experimento C (conformal em h1–h8 no tail condicionado, rejeitado):** com a
+cauda nova, o conformal cobre apenas parcialmente (h6 0.72→0.78 com MAE +10% e WIS
++12%; h8 0.81→0.83 com WIS +22%; h5 0.76 sem melhora) — não compensa.
+**Decisão v4:** cauda **por horizonte** — h1–h5 com `thr 0.01/mf 40`
+(condicionada, WIS muito melhor), h6–h8 restauram a cauda fina original
+`thr 0.035/mf 10` (cov90 0.89–0.94 conhecido) via novos
+`threshold_per_quantile_per_horizon` / `max_features_per_quantile_per_horizon`
+("6","7","8"). Aplicação validada por teste unitário; retreino v4 executado.
+
 ### Limitações conhecidas deixadas abertas (documentadas)
 
 1. fold0 (surto 2023) em h4–h8: subestimação do pico e timing 6–8 SEM cedo, não
