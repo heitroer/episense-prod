@@ -17,6 +17,11 @@ Convenções (tudo em escala de CASOS, pós-expm1):
 - width_50 / width_90 = largura média dos intervalos [q25,q75] / [q05,q95]
 - coverage_50 / coverage_90 = fração de semanas reais dentro do intervalo
                (nominais 50% / 90%)
+- wape = Σ|y − p| / Σ|y| — erro absoluto ponderado pelo volume real (peso
+               linear; não explode em semanas de poucos casos como o MAPE)
+- skill_mae / skill_wis = 1 − mae/baseline_mae e 1 − wis_total/baseline_wis
+               (derivadas nos scripts onde o baseline existe; na agregação
+               entram como razão das médias — helper skill_score() abaixo)
 Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
 quantile_crossed e fbias.
 Todas as métricas usam máscara finita e retornam NaN quando não computáveis.
@@ -71,6 +76,41 @@ def coverage_interval(y_true: np.ndarray, q_lo: np.ndarray,
     return float(np.mean(inside))
 
 
+def wape(y_true: np.ndarray, pred: np.ndarray) -> float:
+    """WAPE: Σ|y − p| / Σ|y| — erro absoluto em % do volume real.
+
+    Percentual ponderado pelo volume (peso linear |y|): semanas com muitos
+    casos pesam proporcionalmente mais; não explode em semanas de poucos
+    casos como o MAPE removido na spec 2026-10. NaN quando não computável.
+    """
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(pred, dtype=float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if not np.any(m):
+        return float('nan')
+    denom = float(np.sum(np.abs(y[m])))
+    if not (np.isfinite(denom) and denom > 0):
+        return float('nan')
+    return float(np.sum(np.abs(y[m] - p[m])) / denom)
+
+
+def skill_score(value: float, baseline: float) -> float:
+    """Ganho vs baseline (skill): 1 − value/baseline.
+
+    >0 = corta X% do erro do baseline sazonal; 0 = empata; <0 = pior que
+    colar o histórico. NaN quando baseline ou value não computáveis
+    (NaN/∞) ou baseline ≤ 0.
+    """
+    try:
+        v = float(value)
+        b = float(baseline)
+    except (TypeError, ValueError):
+        return float('nan')
+    if not (np.isfinite(v) and np.isfinite(b)) or b <= 0:
+        return float('nan')
+    return float(1.0 - v / b)
+
+
 def compute_all_metrics(y_true_cases: np.ndarray,
                         pred_cases: Mapping[float, np.ndarray]) -> Dict[str, float]:
     """Métricas canônicas para uma janela de avaliação (escala de casos).
@@ -89,8 +129,9 @@ def compute_all_metrics(y_true_cases: np.ndarray,
         out['mae'] = float(np.mean(np.abs(err)))
         out['rmse'] = float(np.sqrt(np.mean(err ** 2)))
         out['bias'] = float(np.mean(median[m_fin] - y[m_fin]))
+        out['wape'] = wape(y, median)
     else:
-        out['mae'] = out['rmse'] = out['bias'] = float('nan')
+        out['mae'] = out['rmse'] = out['bias'] = out['wape'] = float('nan')
 
     # ---- Familia probabilística (pinball) ----
     pins = {tau: np.asarray(pred_cases[tau], dtype=float)

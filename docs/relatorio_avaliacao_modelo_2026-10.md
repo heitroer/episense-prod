@@ -389,3 +389,138 @@ reconstruiu a base com revisões OpenMeteo/InfoDengue das semanas finais
 (202636–202640) — resposta legítima do pipeline à atualização do dado, não
 ruído de treino. Estado canônico vigente = honesto com o dado mais recente
 (gate PASS, pior fold 0.873).
+
+## Adendo 5 — Calibração da mediana e objetivo assimétrico (v6c–v6d, out/2026)
+
+Diagnóstico que motiva os testes: bias sistemicamente negativo (−15 h1 →
+−66 h6–h8) e fold0 (surto 2022/23) dominando o erro. Dois experimentos em
+sequência, cada mudança isolada e medida contra o estado canônico v6
+(`/tmp/exp_f1f2/baseline/`):
+
+### EXP-A — median shift conformal por regime (rejeitado)
+
+Hipótese: o shift rejeitado em out/2026 era **global**; a variante
+**por regime-base (high/mid/low)** com validação expanding honesta nunca
+tinha sido medida. Mudança: `quantile_conformal.apply_median_shift: true`
++ o recompute passou a ler a flag do config (`use_median_shift` e
+`max_shift` propagados ao `compute_conformal` por fold — antes hardcoded
+`False`/default). Escopo: `apply_horizons` [1,2,3,5]; fold0 permanece sem
+calibração (sem histórico prévio — paralelo honesto à produção).
+
+Resultado (expanding, ensemble): cobertura melhora em TODOS os horizontes do
+escopo (cov90 h1 0.83→0.87, h2 0.85→0.92, h3 0.81→0.87, h5 0.81→0.86), MAS
+as métricas de ponto degradam (MAE h1 +1.5%, h3 **+5.5%**, h5 +2.4%; WIS
+h3 +4.3%, h5 +2.2%). O mecanismo da degradação é idêntico ao do shift
+global antigo: **overshoot no fold1** (h3 f1 bias −24.7 → +60.3; h5 f1
+−39.6 → +25.4) — o pool de calibração do fold1 contém só o fold0 (surto),
+cujos resíduos positivos grandes dominam o shift. Cap agressivo
+(0.8→0.25) muda nada: os shifts efetivos já são ≤0.25; o overshoot é do
+pool, não do cap.
+
+Veredito: **rejeitado** — trocar MAE/WIS por cobertura não atende ao
+objetivo central. Config voltou a `apply_median_shift: false`; a plumbing
+do recompute (flags config-driven) fica para futuros testes com
+shrinkage dependente da dispersão do pool.
+
+### EXP-B — objetivo assimétrico custom (pinball 2× p/ undershoot) — patológico
+
+Mecanismo: `asymmetric_loss` (config) com `_asymmetric_quantile_obj` — callable
+objective do LightGBM 4.5 para τ=0.5 em h≥4 (only_median, undershoot 2.0).
+Avaliação PLÍVEL: mesma base (b42dd0ba, revisão 14:44) em ambos os lados —
+EXP-B (asym ON) vs B0 (asym OFF, baseline honesto no dado revisado).
+
+Resultado no escopo h≥4 (ensemble): MAE h4 71.16→86.24 (+21%), h5 74.59→96.96
+(+30%), h6 93.99→124.78 (+33%), h7 97.85→112.15 (+15%), h8 92.96→104.61
+(+12.5%); o BIAS piora EM VEZ de melhorar (h4 −31.6→−72.0; h6 −66.3→−104.0) e
+cov90 incha (0.85→0.96 etc.). h1–h3 idênticos (sem asym — confirmação do gate).
+
+Diagnóstico: callable objective do LightGBM DESLIGA o `boost_from_average`
+(works only with built-in objectives) — as árvores partem de init_score=0 e,
+com gradiente de pinball (leaf Newton com hess=1), convergem mal em poucas
+centenas de rounds: mediana SUBTREINADA (baixa), resíduos inflados, build
+conformal alarga as bandas. A "correção para cima" esperada (o objetiva
+empurra o ponto de equilibro para o quantil ~0.67) nunca aparece porque o
+modelo inteiro fica defasado.
+
+Veredito: **rejeitado e marcado como antipadrão**. Alternativa confiável:
+shift de LABEL no treino da mediana (EXP-B2, abaixo) que usa o objetivo
+quantile PADRÃO (translation-equivariant) — mesmo efeito direcional sem
+desligar o boost.
+
+### EXP-B2 — shift de label na mediana (APROVADO, δ=0.15)
+
+Mecanismo: `median_label_shift` (config) — treino de τ=0.5 com `y_log + δ`
+para h≥4 (`horizon_min: 4`), val de early-stopping em escala real. Objetivo
+quantile PADRÃO (pinball é translation-equivariant → mediana sobe ~δ);
+sem custom objective. Implementação: `_median_label_shift` +
+hook em `train_single_model` e `train_single_model_full`. Live: o modelo
+full já sai "adiantado" — nenhuma mudança em inferência/conformal.
+
+Resultado vs B0 (mesma base b42dd0ba, ensemble):
+
+| h | MAE B0→B2 | Δ% | WIS B0→B2 | Δ% | bias B0→B2 | cov90 |
+|---|-----------|-----|-----------|-----|------------|-------|
+| 4 | 71.11→67.96 | −4.4% | 23.29→22.41 | −3.8% | −31.6→−16.3 | 0.85→0.86 |
+| 5 | 74.59→74.47 | −0.2% | 27.12→26.72 | −1.5% | −16.5→−7.5 | 0.85→0.86 |
+| 6 | 94.03→85.78 | −8.8% | 32.08→30.86 | −3.8% | −66.3→−49.9 | 0.91→0.91 |
+| 7 | 101.88→92.19 | −9.5% | 31.84→30.69 | −3.6% | −67.3→−50.7 | 0.90→0.92 |
+| 8 | 93.01→92.63 | −0.4% | 31.56→31.40 | −0.5% | −59.4→−48.8 | 0.94→0.94 |
+
+h1–h3 EXATAMENTE intocados (gate de horizonte ✓); fold0 do surto melhora
+pesado (h6 f0 MAE 183.5→162.0, h7 f0 194.8→165.6); folds calmos pagam
+custo pequeno (f2/f3 +2 a +8 MAE). Média h1–h8: MAE 72.57→69.87 (−3.7%),
+WIS 24.43→23.96 (−2.0%), bias médio −33.6→−25.1. Gate PASS (pior fold
+mantém-se sob o baseline). y_true idêntico em ambos (mesma base).
+
+### EXP-B3 — sweep do δ (0.20) — rejeitado em favor de 0.15
+
+δ=0.20: média MAE 70.11 (vs 69.87 do 0.15), WIS marginalmente melhor
+(23.88 vs 23.96), bias médio −22.7 — mas MAE piora em h7 (94.59 vs 92.19)
+e h8 (94.36 vs 92.63) e o dano nos folds calmos cresce (f3 h8: 81.6 vs
+78.7). Trade mais agressivo sem ganho líquido em métrica de erro. Ficou
+δ=0.15 como canônico (comentado no config).
+
+Estado final v6d: median_label_shift δ=0.15 h≥4 + shift conformal OFF +
+Rt features v6. Artefatos canônicos regenerados no host (base
+b42dd0ba3c470ae1c3c35c763ef292cf, dashboard pausado durante os treinos).
+
+## Adendo 6 — Métricas de leitura direta: ganho vs baseline (skill) e WAPE (nov/2026)
+
+Motivação: o conjunto canônico é absoluto (casos) e só responde "isso é bom?" quando
+comparado mentalmente ao baseline. Duas adições dão leitura imediata, SEM retreino
+(recalc via `scripts/recompute_metrics.py` sobre `validation_predictions.json`):
+
+- **skill_mae / skill_wis = 1 − métrica/baseline_*** — ganho % vs o baseline sazonal
+  (persistência Ano-1, mesmo mecanismo sem vazamento). +43% = erra 43% menos que colar o
+  histórico; 0 = empata; <0 = pior que o baseline. Definido por fold como razão direta;
+  nas agregações (`ensemble_avg`/`full_4folds_avg`) entra como **razão das médias**,
+  consistente com as médias canônicas (média das razões por fold fica em
+  `per_fold_ensemble`, apenas diagnóstico). Helper: `skill_score()` em `models/metrics.py`.
+- **WAPE = Σ|y − p| / Σ|y|** — erro absoluto em % do volume real, peso linear: semanas com
+  muitos casos pesam proporcionalmente mais e semanas de poucos casos NÃO explodem (vício
+  do MAPE removido na spec 2026-10). Integrado ao `compute_all_metrics` (fonte única).
+
+Exposição: API `/metrics` e dashboard `/api/metrics` incluem `wape`, `skill_mae`,
+`skill_wis`; tabela avançada do dashboard ganha colunas **Ganho MAE / Ganho WIS / WAPE**;
+novo painel **"Ganho vs baseline sazonal"** (barras H1–H8, referência no zero, segue o fold
+selecionado nas abas); `metrics_dataframe.csv` ganha colunas `WAPE, Skill_MAE, Skill_WIS`.
+
+### Valores (ensemble_avg = 3 folds completos, 2022–2024)
+
+| h | MAE | WIS | WAPE | Ganho MAE | Ganho WIS |
+|---|------|------|------|-----------|-----------|
+| 1 | 37.97 | 13.81 | 21.3% | +68.5% | +67.9% |
+| 2 | 54.79 | 18.04 | 32.6% | +54.8% | +57.5% |
+| 3 | 60.66 | 20.52 | 38.6% | +50.2% | +51.4% |
+| 4 | 66.47 | 21.92 | 45.2% | +46.9% | +48.4% |
+| 5 | 74.43 | 27.08 | 48.4% | +42.8% | +37.6% |
+| 6 | 79.66 | 27.30 | 53.8% | +41.8% | +39.3% |
+| 7 | 89.83 | 28.40 | 62.8% | +37.3% | +39.1% |
+| 8 | 92.69 | 32.02 | 36.3% | +43.7% | +37.1% |
+
+DUAS notas de leitura: (a) WAPE do h8 (36.3%) é menor que o do h7 (62.8%) porque os alvos
+h8 caem em semanas de alto volume (epidemiológicas) — o denominador Σ|y| cresce mais rápido
+que o erro; leia WAPE por horizonte com este contexto. (b) skill_mae h8 > h7 segue a mesma
+lógica do baseline: a dificuldade não cresce monotonicamente com h nas temporadas
+avaliadas. Ganho monótono de h1..h7 confirma a degradação esperada; h8 permanece +43%.
+Média h1–h8: ganho MAE +48.3% (WIS +47.3%), WAPE 42.4% do volume.

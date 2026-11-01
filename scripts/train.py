@@ -400,6 +400,10 @@ class EpisenseTrainer:
         params = self.model_params.copy()
         params['random_state'] = seed
         params['seed'] = seed
+        # v6d EXP-B2: shift de label só no treino da mediana (val fica real)
+        _shift = self._median_label_shift(horizon) if abs(quantile - 0.5) < 1e-6 else 0.0
+        if _shift:
+            y_tr = y_tr + _shift
         # v3: override por quantil (q05 mais sensivel)
         qh = self._get_quantile_hparams(quantile)
         if qh:
@@ -447,6 +451,10 @@ class EpisenseTrainer:
         params['random_state'] = seed
         params['seed'] = seed
         params.pop('early_stopping_rounds', None)
+        # v6d EXP-B2: shift de label na mediana do modelo de produção
+        _shift = self._median_label_shift(horizon) if abs(quantile - 0.5) < 1e-6 else 0.0
+        if _shift:
+            y = y + _shift
         # v3 per-quantile hparams
         qh = self._get_quantile_hparams(quantile)
         if qh:
@@ -498,6 +506,24 @@ class EpisenseTrainer:
         for j, tau in enumerate(q_order):
             y_pred_dict[tau] = stack[:, j]
         return y_pred_dict
+
+    def _median_label_shift(self, horizon: int) -> float:
+        """v6d EXP-B2: shift de LABEL no treino da mediana (objetivo quantile padrão).
+
+        Treina tau=0.5 com y_log + delta (h>=horizon_min). Como o pinball é
+        translation-equivariant, a predição da mediana sobe ~delta — o modelo
+        aprende a antecipar o viés de subestimação de crescimento. SEM custom
+        objective (o callable do LightGBM 4.5 desliga boost_from_average e
+        subtreina as árvores — EXP-B provou piora de MAE +12-36%).
+        Apenas linhas de TREINO; val de early-stopping fica em escala real
+        (seleção honesta por residual verdadeiro).
+        """
+        cfg = self.config.get('median_label_shift', {}) or {}
+        if not cfg.get('enabled', False):
+            return 0.0
+        if horizon < int(cfg.get('horizon_min', 4)):
+            return 0.0
+        return float(cfg.get('delta_log', 0.0))
 
     def _asymmetric_quantile_obj(self, tau: float, horizon: int):
         """Custom gradient for asymmetric quantile loss (undershoot penalized).
@@ -576,11 +602,11 @@ class EpisenseTrainer:
         y_pred_median = y_pred_dict_cases[0.50]
 
         # ---- Conjunto canônico (models/metrics.py, fonte única) ----
-        # mae, rmse, bias, wis_total, wis_50, wis_90,
+        # mae, rmse, bias, wape, wis_total, wis_50, wis_90,
         # width_50, width_90, coverage_50, coverage_90.
         # Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
         # quantile_crossed e fbias (todas as variantes/estratificações P75).
-        from models.metrics import compute_all_metrics
+        from models.metrics import compute_all_metrics, skill_score
         metrics = {}
         metrics.update(compute_all_metrics(y_true_cases, y_pred_dict_cases))
         # quantile_crossed removido da spec (não é métrica de qualidade)
@@ -687,6 +713,9 @@ class EpisenseTrainer:
                 metrics['baseline_wis'] = baseline_wis
                 metrics['baseline_mae'] = baseline_mae
                 metrics['baseline_coverage_90'] = baseline_coverage
+                # Ganho vs baseline (skill): por fold, razão direta
+                metrics['skill_mae'] = skill_score(metrics.get('mae'), baseline_mae)
+                metrics['skill_wis'] = skill_score(metrics.get('wis_total'), baseline_wis)
         else:
             pass
 
@@ -1021,6 +1050,17 @@ class EpisenseTrainer:
                 ensemble_avg['full_4folds_avg'] = ensemble_avg_full
                 logger.info(f"  h{horizon} 2025 parcial {partial_folds} excluido da media: mae 3folds={ensemble_avg.get('mae', float('nan')):.3f} vs 4folds={ensemble_avg_full.get('mae', float('nan')):.3f}")
 
+        # Skills (ganho vs baseline) como razão das MÉDIAS na agregação —
+        # consistente com ensemble_avg/full_4folds_avg; a razão por fold
+        # (média das razões ≠ razão das médias) fica exposta em
+        # per_fold_ensemble apenas como diagnóstico.
+        from models.metrics import skill_score
+        for _agg in (ensemble_avg, ensemble_avg.get('full_4folds_avg')):
+            if not isinstance(_agg, dict):
+                continue
+            _agg['skill_mae'] = skill_score(_agg.get('mae'), _agg.get('baseline_mae'))
+            _agg['skill_wis'] = skill_score(_agg.get('wis_total'), _agg.get('baseline_wis'))
+
         # Persist per-week prediction series (diagnostic/outbreak analysis):
         # predicted vs actual cases, week by week, per fold per horizon per quantile.
         # IMPORTANTE: aplicar non_crossing antes de salvar, senao mediana>q95 em picos (bug fold 0 h1 8 semanas)
@@ -1069,7 +1109,8 @@ class EpisenseTrainer:
                     f"WIS_total={ensemble_avg.get('wis_total', float('nan')):.2f} "
                     f"(50: {ensemble_avg.get('wis_50', float('nan')):.2f} | 90: {ensemble_avg.get('wis_90', float('nan')):.2f}), "
                     f"Cov50={ensemble_avg.get('coverage_50', 0):.2f} Cov90={ensemble_avg.get('coverage_90', 0):.2f}, "
-                    f"Width50={ensemble_avg.get('width_50', 0):.1f} Width90={ensemble_avg.get('width_90', 0):.1f}")
+                    f"Width50={ensemble_avg.get('width_50', 0):.1f} Width90={ensemble_avg.get('width_90', 0):.1f}, "
+                    f"skill_mae={ensemble_avg.get('skill_mae', float('nan')):+.1%} vs sazonal, WAPE={ensemble_avg.get('wape', float('nan')):.1%}")
 
         self.models[horizon] = models
         return models
@@ -1540,7 +1581,7 @@ class EpisenseTrainer:
         try:
             df_metrics = self.get_metrics_dataframe()
             print("\n" + "=" * 90)
-            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: MAE, RMSE, Bias, WIS_total, WIS_50, WIS_90, Width_50, Width_90, Coverage_50, Coverage_90")
+            print("DATAFRAME CONSOLIDADO (por Horizonte) - colunas: MAE, RMSE, Bias, WAPE, WIS_total, WIS_50, WIS_90, Width_50, Width_90, Coverage_50, Coverage_90, Skill_MAE, Skill_WIS")
             print(df_metrics.to_string(float_format=lambda x: f"{x:.3f}"))
             # Salva CSV para plotagem
             df_metrics.to_csv(Path("models") / "metrics_dataframe.csv")
@@ -1550,15 +1591,17 @@ class EpisenseTrainer:
 
     def get_metrics_dataframe(self) -> pd.DataFrame:
         """Retorna DataFrame indexado por Horizonte com o conjunto canônico.
-        Colunas: [MAE, RMSE, Bias, WIS_total, WIS_50, WIS_90,
-                  Width_50, Width_90, Coverage_50, Coverage_90]
+        Colunas: [MAE, RMSE, Bias, WAPE, WIS_total, WIS_50, WIS_90,
+                  Width_50, Width_90, Coverage_50, Coverage_90,
+                  Skill_MAE, Skill_WIS]
         Sem vazamento: todas métricas vêm de validation_results (teste não usado no treino).
         """
         keys = {
-            'MAE': 'mae', 'RMSE': 'rmse', 'Bias': 'bias',
+            'MAE': 'mae', 'RMSE': 'rmse', 'Bias': 'bias', 'WAPE': 'wape',
             'WIS_total': 'wis_total', 'WIS_50': 'wis_50',
             'WIS_90': 'wis_90', 'Width_50': 'width_50', 'Width_90': 'width_90',
             'Coverage_50': 'coverage_50', 'Coverage_90': 'coverage_90',
+            'Skill_MAE': 'skill_mae', 'Skill_WIS': 'skill_wis',
         }
         rows = []
         for h in sorted(self.validation_results.keys()):

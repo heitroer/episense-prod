@@ -76,6 +76,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .year-row .pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.controls{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.readout{grid-template-columns:repeat(4,1fr)}}
+.sw.skill-mae{background:var(--accent)}
+.sw.skill-wis{background:var(--accent-2)}
 @media(max-width:760px){.page{padding:12px}.top{height:auto;align-items:flex-start;flex-direction:column;padding-bottom:12px}.brand{align-items:flex-start;flex-direction:column;gap:4px}.hero-block{padding:18px}.readout{grid-template-columns:repeat(2,1fr)}.horizon{grid-template-columns:repeat(4,1fr)}.plot-wrap{height:360px}.chart-head{flex-direction:column}.chart-meta{justify-content:flex-start}.fc-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>
@@ -172,6 +174,20 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       </table>
     </div>
   </section>
+
+  <section class="metrics" id="skill-section">
+    <div class="metrics-head">
+      <h3>Ganho vs baseline sazonal</h3>
+      <p>Quanto (%) o modelo erra menos que o baseline de persistência sazonal (repetir a mediana histórica da mesma semana). Barra acima do zero = melhor que o baseline; abaixo = pior.</p>
+    </div>
+    <div class="metrics-table-wrap" style="padding:10px 14px 0">
+      <div style="position:relative;height:300px"><canvas id="skill-chart" aria-label="Ganho percentual vs baseline por horizonte" role="img"></canvas></div>
+    </div>
+    <div class="legend">
+      <span><i class="sw skill-mae"></i>Ganho MAE</span>
+      <span><i class="sw skill-wis"></i>Ganho WIS</span>
+    </div>
+  </section>
 </div>
 <script>
 const css = getComputedStyle(document.documentElement);
@@ -194,10 +210,11 @@ function seFmt(se){const s=String(se);return s.slice(0,4)+'S'+s.slice(4).padStar
 function seLabel(se){const s=String(se);return s.slice(2,4)+'/'+s.slice(4).padStart(2,'0')}
 async function json(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(String(r.status));return r.json()}
 function pct(v){return v==null||Number.isNaN(v)?'--':(v*100).toFixed(1)+'%'}
+function spct(v){return v==null||Number.isNaN(v)?'--':(v>=0?'+':'')+(v*100).toFixed(1)+'%'}
 function num(v){return v==null||Number.isNaN(v)?'--':Math.round(v).toLocaleString('pt-BR')}
 function level(v){if(v==null)return ['--',C('--muted')]; if(v<10)return ['Baixo',C('--ok')]; if(v<50)return ['Médio',C('--warn')]; if(v<100)return ['Alto',C('--forecast')]; return ['Crítico',C('--danger')]}
 function hButtons(){el.horizon.innerHTML=''; for(let h=1;h<=8;h++){const b=document.createElement('button');b.type='button';b.className='pill'+(String(h)===state.h?' active':'');b.textContent='H'+h;b.onclick=()=>setH(String(h));el.horizon.appendChild(b)}}
-let metricsData=null;let metricsFold='avg';let metricsAdvanced=false;
+let metricsData=null;let metricsFold='avg';let metricsAdvanced=false;let skillChart=null;
 function formatNum(v, digits=1){return v==null||Number.isNaN(v)?'--':Number(v).toFixed(digits)}
 function renderMetrics(){
   if(!metricsData) return;
@@ -205,7 +222,7 @@ function renderMetrics(){
   const thead=document.getElementById('metrics-head-row');
   if(thead){
     if(metricsAdvanced){
-      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>RMSE</span><small>casos</small></th><th><span>Bias</span><small>− = subestima</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>WIS 50%</span><small>q25–q75</small></th><th><span>WIS 90%</span><small>q05–q95</small></th><th><span>Width 50%</span><small>largura IC</small></th><th><span>Width 90%</span><small>largura IC</small></th><th><span>Cobertura 50%</span><small>acerto IC 50%</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
+      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>RMSE</span><small>casos</small></th><th><span>Bias</span><small>− = subestima</small></th><th><span>Ganho MAE</span><small>% vs sazonal</small></th><th><span>Ganho WIS</span><small>% vs sazonal</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>WIS 50%</span><small>q25–q75</small></th><th><span>WIS 90%</span><small>q05–q95</small></th><th><span>Width 50%</span><small>largura IC</small></th><th><span>Width 90%</span><small>largura IC</small></th><th><span>Cobertura 50%</span><small>acerto IC 50%</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th><th><span>WAPE</span><small>% do volume real</small></th></tr>';
     } else {
       thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
     }
@@ -218,7 +235,7 @@ function renderMetrics(){
     const tr=document.createElement('tr');
     if(metricsAdvanced){
       let b=d?.bias; let bTxt=(b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1);
-      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.rmse,1)+'</td><td>'+bTxt+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td>'+formatNum(d?.wis_50,1)+'</td><td>'+formatNum(d?.wis_90,1)+'</td><td>'+formatNum(d?.width_50,0)+'</td><td>'+formatNum(d?.width_90,0)+'</td><td class="v-cov50">'+pct(d?.coverage_50)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
+      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.rmse,1)+'</td><td>'+bTxt+'</td><td>'+spct(d?.skill_mae)+'</td><td>'+spct(d?.skill_wis)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td>'+formatNum(d?.wis_50,1)+'</td><td>'+formatNum(d?.wis_90,1)+'</td><td>'+formatNum(d?.width_50,0)+'</td><td>'+formatNum(d?.width_90,0)+'</td><td class="v-cov50">'+pct(d?.coverage_50)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td><td>'+pct(d?.wape)+'</td>';
     } else {
       tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
     }
@@ -233,7 +250,7 @@ function renderMetrics(){
     const bTxt=()=>{const b=mean('bias');return (b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1)};
     const label=`<td><span class="avg-label">Média h1–h${nh}</span><span class="avg-sub">média entre horizontes</span></td>`;
     if(metricsAdvanced){
-      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td>'+formatNum(mean('rmse'),1)+'</td><td>'+bTxt()+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td>'+formatNum(mean('wis_50'),1)+'</td><td>'+formatNum(mean('wis_90'),1)+'</td><td>'+formatNum(mean('width_50'),0)+'</td><td>'+formatNum(mean('width_90'),0)+'</td><td class="v-cov50">'+pct(mean('coverage_50'))+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td></tr>';
+      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td>'+formatNum(mean('rmse'),1)+'</td><td>'+bTxt()+'</td><td>'+spct(mean('skill_mae'))+'</td><td>'+spct(mean('skill_wis'))+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td>'+formatNum(mean('wis_50'),1)+'</td><td>'+formatNum(mean('wis_90'),1)+'</td><td>'+formatNum(mean('width_50'),0)+'</td><td>'+formatNum(mean('width_90'),0)+'</td><td class="v-cov50">'+pct(mean('coverage_50'))+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td><td>'+pct(mean('wape'))+'</td></tr>';
     } else {
       foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td></tr>';
     }
@@ -246,6 +263,31 @@ function renderMetrics(){
   const c4=document.getElementById('m-h4'); if(c4) c4.textContent=formatNum(h4d?.mae,1);
   const c8=document.getElementById('m-h8'); if(c8) c8.textContent=formatNum(h8d?.mae,1);
   const cc=document.getElementById('m-cov'); if(cc) cc.textContent=pct(h1d?.coverage_90);
+  renderSkillChart();
+}
+// Ganho vs baseline sazonal (%) por horizonte — barras refletindo o fold selecionado
+const skillZeroPlugin={id:'skillZero',afterDraw(chart){const y=chart.scales.y;if(!y)return;const z=y.getPixelForValue(0);const a=chart.chartArea;if(!isFinite(z)||z<a.top||z>a.bottom)return;const ctx=chart.ctx;ctx.save();ctx.strokeStyle=C('--text-2');ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(a.left,z);ctx.lineTo(a.right,z);ctx.stroke();ctx.restore()}};
+function skillBar(y){return (y==null||Number.isNaN(y))?C('--panel-3'):(y>=0?C('--accent'):C('--danger'))}
+function skillBarW(y){return (y==null||Number.isNaN(y))?C('--panel-3'):(y>=0?C('--accent-2'):C('--danger'))}
+function renderSkillChart(){
+  const cv=document.getElementById('skill-chart'); if(!cv||!metricsData) return;
+  const rows=[1,2,3,4,5,6,7,8].map(h=>{const e=metricsData[String(h)];return e?(e[metricsFold]||e['avg']):null});
+  const col=k=>rows.map(r=>{const v=r?.[k];return (v==null||Number.isNaN(v))?null:Number(v)*100});
+  const data={labels:['H1','H2','H3','H4','H5','H6','H7','H8'],datasets:[
+    {label:'Ganho MAE',data:col('skill_mae'),backgroundColor:ctx=>skillBar(ctx.parsed?.y),borderRadius:4,maxBarThickness:24},
+    {label:'Ganho WIS',data:col('skill_wis'),backgroundColor:ctx=>skillBarW(ctx.parsed?.y),borderRadius:4,maxBarThickness:24}
+  ]};
+  const opts={responsive:true,maintainAspectRatio:false,animation:{duration:reducedMotion?0:500},
+    scales:{
+      y:{ticks:{color:C('--muted'),callback:v=>v+'%'},grid:{color:'rgba(36,48,68,.55)'},border:{color:C('--line')}},
+      x:{ticks:{color:C('--muted-2')},grid:{display:false}}
+    },
+    plugins:{
+      legend:{display:false},
+      tooltip:{callbacks:{label:ctx=>{const y=ctx.parsed.y;return ctx.dataset.label+': '+((y==null||Number.isNaN(y))?'--':(y>=0?'+':'')+Number(y).toFixed(1)+'%')}}}
+    }};
+  if(!skillChart){skillChart=new Chart(cv,{type:'bar',data,options:opts,plugins:[skillZeroPlugin]})}
+  else{skillChart.data=data;skillChart.update('none')}
 }
 function buildMetricsTabs(){
   const tabs=document.getElementById('metrics-tabs'); if(!tabs||!metricsData) return;

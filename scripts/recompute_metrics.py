@@ -9,9 +9,10 @@ full_4folds_avg = referência com os 4 folds.
 
 Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
 quantile_crossed, fbias.
-Métricas: mae, rmse, bias, wis_total, wis_50, wis_90,
+Métricas: mae, rmse, bias, wape, wis_total, wis_50, wis_90,
 width_50, width_90, coverage_50, coverage_90 (+ baseline_wis/baseline_mae/
-baseline_coverage_90 como referência sazonal).
+baseline_coverage_90 como referência sazonal e skill_mae/skill_wis = ganho
+vs baseline, razão das médias na agregação).
 
 Uso:  ./.venv/bin/python3 scripts/recompute_metrics.py
 """
@@ -28,7 +29,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.metrics import compute_all_metrics, QUANTILES, PAIR_50, PAIR_90, pinball_mean  # noqa: E402
+from models.metrics import compute_all_metrics, QUANTILES, PAIR_50, PAIR_90, pinball_mean, skill_score  # noqa: E402
 from models.calibration import compute_conformal  # noqa: E402
 from data.epiweeks import epiweek_to_date, date_to_epiweek  # noqa: E402
 
@@ -160,7 +161,8 @@ def main():
     QC_ENABLED = bool(qc_cfg.get('enabled', False))
     QC = {'half_life_years': float(qc_cfg.get('half_life_years', 2.5)),
           'max_delta': float(qc_cfg.get('max_abs_delta', 1.0)),
-          'max_shift': float(qc_cfg.get('max_abs_median_shift', 0.8))}
+          'max_shift': float(qc_cfg.get('max_abs_median_shift', 0.8)),
+          'use_median_shift': bool(qc_cfg.get('apply_median_shift', False))}
     try:
         QC['apply_horizons'] = set(int(x) for x in qc_cfg.get('apply_horizons', [1, 2, 3]))
     except Exception:
@@ -219,7 +221,9 @@ def main():
                                 pool, regime_hook,
                                 half_life_years=QC['half_life_years'],
                                 max_delta=QC['max_delta'],
-                                use_median_shift=False)
+                                max_shift=QC['max_shift'],
+                                use_median_shift=QC['use_median_shift']
+                                    and int(h) in QC.get('apply_horizons', {}))
                         except Exception as e:
                             print(f"AVISO: conformal expanding fold {fid0} falhou ({e})")
             except Exception as e:
@@ -278,7 +282,7 @@ def main():
                         preds_cal[t][w] = s_vals[i]
             m = compute_all_metrics(y_true, preds_cal) if QC_ENABLED else dict(m_raw)
             m['raw_uncalibrated'] = {k: m_raw.get(k) for k in
-                                     ('mae', 'rmse', 'bias', 'wis_total', 'wis_50', 'wis_90',
+                                     ('mae', 'rmse', 'bias', 'wape', 'wis_total', 'wis_50', 'wis_90',
                                       'width_50', 'width_90', 'coverage_50', 'coverage_90')}
             m['calibration'] = {'applied': bool(conf_all), 'scheme': 'expanding_cqr_delta_only',
                                 'half_life_years': QC['half_life_years'],
@@ -289,6 +293,9 @@ def main():
             pool = base[base["SE"].str.zfill(6) < pool_end]
             b_rows = build_baseline_preds(pool, ses, min_se=min_se)
             m.update(baseline_metrics(y_true, b_rows))
+            # Ganho vs baseline (skill): por fold, razão direta
+            m['skill_mae'] = skill_score(m.get('mae'), m.get('baseline_mae'))
+            m['skill_wis'] = skill_score(m.get('wis_total'), m.get('baseline_wis'))
             m['fold'] = int(fid)
             m['horizon'] = int(h)
             m['n_weeks'] = len(ses)
@@ -309,6 +316,11 @@ def main():
         full.pop('n_weeks', None)
         full['horizon'] = int(h)
         avg['full_4folds_avg'] = full
+        # skills como razão das MÉDIAS (consistente com as médias canônicas);
+        # a média das razões por fold fica em per_fold_ensemble como diagnóstico
+        for _agg in (avg, full):
+            _agg['skill_mae'] = skill_score(_agg.get('mae'), _agg.get('baseline_mae'))
+            _agg['skill_wis'] = skill_score(_agg.get('wis_total'), _agg.get('baseline_wis'))
         # referência de seeds do JSON antigo (relatório não recalcula seeds)
         if old_raw and h in old_raw:
             old_avg = old_raw[h].get('ensemble_avg', {})
@@ -326,17 +338,19 @@ def main():
             return v if isinstance(v, (int, float)) else float('nan')
         df_rows.append({
             'Horizonte': int(h), 'MAE': _g('mae'), 'RMSE': _g('rmse'),
-            'Bias': _g('bias'),
+            'Bias': _g('bias'), 'WAPE': _g('wape'),
             'WIS_total': _g('wis_total'), 'WIS_50': _g('wis_50'),
             'WIS_90': _g('wis_90'), 'Width_50': _g('width_50'),
             'Width_90': _g('width_90'), 'Coverage_50': _g('coverage_50'),
             'Coverage_90': _g('coverage_90'),
+            'Skill_MAE': _g('skill_mae'), 'Skill_WIS': _g('skill_wis'),
         })
         print(f"  h{h}{' [CQR-EXP]' if QC_ENABLED else ''}: mae={_g('mae'):.2f} rmse={_g('rmse'):.2f} "
-              f"bias={_g('bias'):+.2f} wis_total={_g('wis_total'):.2f} "
+              f"bias={_g('bias'):+.2f} wape={_g('wape'):.1%} wis_total={_g('wis_total'):.2f} "
               f"(50 {_g('wis_50'):.2f} / 90 {_g('wis_90'):.2f}) "
               f"cov50={_g('coverage_50'):.2f} cov90={_g('coverage_90'):.2f} "
-              f"w50={_g('width_50'):.1f} w90={_g('width_90'):.1f}")
+              f"w50={_g('width_50'):.1f} w90={_g('width_90'):.1f} "
+              f"skill_mae={_g('skill_mae'):+.1%} skill_wis={_g('skill_wis'):+.1%}")
 
     # backup do legado (apenas na primeira regeneração) e escrita do novo
     legacy = VAL_RES.with_name("validation_results_legacy.json.bak")

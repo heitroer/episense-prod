@@ -1203,11 +1203,12 @@ def api_metrics():
         per = val_res[h].get("per_fold_ensemble", [])
         by_fold = {str(r.get("fold")): r for r in per}
         # conjunto canônico exposto (spec 2026-10, sem MAPE/CRPS) + referência do baseline
-        # (MaxAE/dados legados removidos)
-        adv_keys = ["mae", "rmse", "bias", "wis_total",
-                    "wis_50", "wis_90", "width_50", "width_90",
+        # e métricas de leitura direta (gain vs baseline / WAPE); (MaxAE/dados legados removidos)
+        adv_keys = ["mae", "rmse", "bias", "wape",
+                    "wis_total", "wis_50", "wis_90", "width_50", "width_90",
                     "coverage_50", "coverage_90",
-                    "baseline_wis", "baseline_mae", "baseline_coverage_90"]
+                    "baseline_wis", "baseline_mae", "baseline_coverage_90",
+                    "skill_mae", "skill_wis"]
         def pick(src):
             return {k: src.get(k) for k in adv_keys} if src else None
         out[h] = {

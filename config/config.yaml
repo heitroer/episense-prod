@@ -324,14 +324,22 @@ quantile_conformal:
   # regimes contraditórios entre temporadas e degrada WIS. h4 ambíguo pós-retreino
   # (f1 cov90 0.81->0.94 MAS f3 0.65->0.56 / cov50 0.37->0.15) => excluído; h5
   # melhora todos os folds (f1 0.85->0.90, f2 0.94->1.00, f3 0.58->0.73) => incluído.
-  # Median shift desabilitado (transfere mal a amplitude entre temporadas).
+  # Median shift (v6c EXP-A): por-REGIME (high/mid/low), validação expanding
+  # honesta no recompute (fold calibrado só com anteriores). O experimento
+  # antigo falho era o shift GLOBAL (amplitude 10x entre folds); a variante
+  # regime-condicionada nunca tinha sido medida. Scope: apply_horizons.
   # Valid honesta: expanding (fold calibrado só com folds anteriores) no recompute.
   enabled: true
   half_life_years: 2.5
   max_abs_delta: 1.0
   apply_horizons: [1, 2, 3, 5]
+  # Median shift: REJEITADO de novo (v6c EXP-A out/2026): variante por-REGIME
+  # (high/mid/low) com validação expanding — cov90 melhora (h1 0.87, h2 0.92,
+  # h3 0.87, h5 0.86) MAS MAE/WIS pioram em h1/h3/h5 (fold1 ganha overshoot:
+  # pool do surto fold0 domina os resíduos). Mantém desligado; machinery
+  # incluída no recompute (config-driven) para futuros testes com peso/shrinkage.
   apply_median_shift: false
-  max_abs_median_shift: 0.8
+  max_abs_median_shift: 0.25
   regime_thresholds:
     high: 100.0   # casos na semana-base => cluster 'high' (surto instalado)
     mid: 20.0     # 20-100 => 'mid'; <20 => 'low' (endemia baixa)
@@ -349,14 +357,20 @@ phantom_gating:
 # horizon_weights disabled: pesos iguais por horizonte evita overfit
 horizon_weights:
   enabled: false
-# asymmetric_loss: desabilitado — teste com 1.25 piorou FBias (-0.19→-0.34 em h2). Subestimação é estrutural (mediana < média em distribuição assimétrica)
-# Solução para viés levemente superestimador será via correção post-hoc leve em inference (fator 1.08) e não via loss assimétrica.
+# asymmetric_loss: teste antigo (peso 1.25, h>=2, com caudas) piorou FBias (-0.19->-0.34 em h2).
+# v6 EXP-B (out/2026): variante v3 nunca medida — ONLY MEDIANA, h>=4, undershoot 2.0
+# (ataca o bias -24/-66 e o fold0 h4-h8). Resultado: ver Adendo 5 do relatório.
 asymmetric_loss:
   enabled: false
-  horizon_threshold: 2
-  undershoot_weight: 1.0
-  overshoot_weight: 1.0
-  only_median: true
+  horizon_threshold: 4
+# v6d EXP-B2: shift de label no TREINO da mediana (tau=0.5), h>=4.
+# Motivação: bias de subestimação estrutural em h>=4 (fold0: -120/-177). Treinar
+# a mediana com y_log+delta antecipa o viés (pinball translation-equivariant) sem
+# custom objective (que subtreina — EXP-B). Val de early-stopping em escala real.
+median_label_shift:
+  enabled: true
+  horizon_min: 4
+  delta_log: 0.15  # sweep: 0.20 melhora bias mas degrada MAE h7/h8 e folds calmos; 0.15 = melhor média MAE
 epidemiological_periods:
   outbreak_months:
   - 10
