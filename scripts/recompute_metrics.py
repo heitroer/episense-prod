@@ -167,6 +167,10 @@ def main():
         QC['apply_horizons'] = set(int(x) for x in qc_cfg.get('apply_horizons', [1, 2, 3]))
     except Exception:
         QC['apply_horizons'] = {1, 2, 3}
+    # Post-processamento EXP ci (v7 experimentos — exp v7 nov/2026; desligado por padrão)
+    POST_CFG = cfg.get('postprocessing', {}) or {}
+    if not isinstance(POST_CFG, dict):
+        POST_CFG = {}
     base = pd.read_csv(BASE, usecols=["SE", "casos"], dtype={"SE": str})
     base["SE"] = base["SE"].str.replace(".0", "", regex=False)
 
@@ -197,38 +201,30 @@ def main():
                         truth[str(se).zfill(6)] = float(true_v) if np.isfinite(float(true_v)) else float('nan')
 
         per_fold = []
-        # Calibração conformal EXPANDING v3 (honesto p/ implantação sequencial):
-        # fold f é calibrado SÓ com os folds ANTERIORES (o artefato de produção usa
-        # os folds disponíveis até então); fold0 fica sem calibração (história nula).
-        # Deltas conformal delta-only por regime-base (intensidade da semana-base).
-        fold_conformal = {}
+        # ==============================================================
+        # Pós-processamento EXPANDING (experimentos v7, config-driven)
+        # Camada A (nível): EXP-C4 combinação modelo+baseline e EXP-C3 correção
+        #   de nível por slope (anti "regressão à média": y_log ~ a + b·pred_log,
+        #   b fitado nos folds anteriores). Banda recentrada no novo nível
+        #   (deltas de banda do modelo preservados em log — mesma geometria).
+        # Camada B (conformal CQR delta-only): fitada PÓS-camada A, SÓ com os
+        #   folds anteriores (mesma honestidade do esquema expanding v3).
+        # Flags em cfg['postprocessing'] — todas false mantém o estado canônico.
+        # ==============================================================
+        apply_horizons_eff = (list(range(1, 9)) if POST_CFG.get('conformal_all_horizons')
+                              else sorted(QC['apply_horizons']))
+        regime_hook = None
         if QC_ENABLED:
             try:
-                from models.calibration import compute_conformal, make_regime_hook, entry_for_key, apply_deltas_log
+                from models.calibration import make_regime_hook, compute_conformal, entry_for_key
                 casos_by_se = {str(se).zfill(6): float(v) for se, v in zip(base['SE'], base['casos'])
                                if np.isfinite(float(v))}
                 regime_hook = make_regime_hook(casos_by_se, qc_cfg.get('regime_thresholds') or None)
-                fold_ids = sorted(int(str(b['fold'])) for blocks in hd.values() for b in blocks)
-                for fid0 in sorted(set(fold_ids)):
-                    pool = {h_int: {str(tau): [blocks[j] for j in range(len(blocks))
-                                               if int(blocks[j]['fold']) < fid0]
-                                    for tau, blocks in bd.items()}
-                            for h_int, bd in ({int(h): hd}).items()}
-                    has_pool = any(blocks for bd in pool.values() for blocks in bd.values())
-                    if has_pool:
-                        try:
-                            fold_conformal[str(fid0)] = compute_conformal(
-                                pool, regime_hook,
-                                half_life_years=QC['half_life_years'],
-                                max_delta=QC['max_delta'],
-                                max_shift=QC['max_shift'],
-                                use_median_shift=QC['use_median_shift']
-                                    and int(h) in QC.get('apply_horizons', {}))
-                        except Exception as e:
-                            print(f"AVISO: conformal expanding fold {fid0} falhou ({e})")
             except Exception as e:
-                print(f"AVISO: conformal expanding indisponível ({e})")
-        for fid in sorted(fold_map.keys()):
+                print(f"AVISO: regime hook indisponível ({e})")
+        processed_blocks: dict = {float(t): [] for t in QUANTILES}  # pós-camada A (fit do conformal)
+        level_pool: list = []                                       # {'y': arr, 'x_c4': arr} em log1p
+        for fid in sorted(fold_map.keys(), key=int):
             fm = fold_map[fid]
             truth = fm.pop("_truth", {})
             ses = sorted(se for se in fm if se >= FIRST_TEST_SE)
@@ -246,15 +242,148 @@ def main():
                     for i, t in enumerate(QUANTILES):
                         preds[t][w] = s_vals[i]
             m_raw = compute_all_metrics(y_true, preds)
-            # ---- Aplica calibração conformal EXPANDING (delta-only, log1p) ----
-            # Regime de cada semana-alvo: intensidade da semana-BASE (alvo − h),
-            # mesma regra da produção (make_regime_hook).
-            conf_all = fold_conformal.get(str(fid), {})
-            conf_all = conf_all if int(h) in QC['apply_horizons'] else {}
+
+            # ---- baseline do pool anterior ao teste (gap de 8 semanas) ----
+            start = ses[0]
+            pool_end = se_shift(start, -FOLD_GAP_WEEKS)
+            pool = base[base["SE"].str.zfill(6) < pool_end]
+            b_rows = build_baseline_preds(pool, ses, min_se=min_se)
+            base_med = np.array([r[0.50] for r in b_rows], dtype=float)
+
+            # ---- Camada A (nível) — parâmetros fitados nos folds ANTERIORES ----
+            y_log = np.log1p(np.clip(y_true, 0.0, None))
+            med_log = np.log1p(np.clip(med, 0.0, None))
+            base_log = np.log1p(np.clip(base_med, 0.0, None))
+            post_meta: dict = {}
+            x0 = med_log
+            c4_scope = [int(x) for x in (POST_CFG.get('baseline_combination_horizons') or list(range(1, 9)))]
+            if POST_CFG.get('baseline_combination') and int(h) in c4_scope:
+                fin = np.isfinite(y_log) & np.isfinite(med_log) & np.isfinite(base_log)
+                lam = 1.0
+                if int(fin.sum()) >= 8:
+                    yv, mv, bv = y_log[fin], med_log[fin], base_log[fin]
+                    den = float(np.sum((mv - bv) ** 2))
+                    if den > 1e-9:
+                        lam = float(np.clip(np.sum((mv - bv) * (yv - bv)) / den, 0.0, 1.0))
+                post_meta['combo_lambda'] = float(lam)
+                x0 = lam * med_log + (1.0 - lam) * base_log
+            b_s = a_s = None
+            if POST_CFG.get('level_slope_correction') and level_pool:
+                X = np.concatenate([e['x_c4'] for e in level_pool])
+                Y = np.concatenate([e['y'] for e in level_pool])
+                fin = np.isfinite(X) & np.isfinite(Y)
+                if int(fin.sum()) >= 8:
+                    xbar, ybar = float(X[fin].mean()), float(Y[fin].mean())
+                    den = float(np.sum((X[fin] - xbar) ** 2))
+                    if den > 1e-9:
+                        b_s = float(np.clip(np.sum((X[fin] - xbar) * (Y[fin] - ybar)) / den,
+                                            float(POST_CFG.get('level_slope_min', 0.6)),
+                                            float(POST_CFG.get('level_slope_max', 1.5))))
+                        a_s = float(ybar - b_s * xbar)
+            post_meta['slope'] = {'a': a_s, 'b': b_s}
+            med_proc_log = (a_s + b_s * x0) if b_s is not None else x0
+            # EXP-C6: amplificação do desvio vs nível sazonal (anti-regressão à média,
+            # 1 parâmetro m por horizonte fitado nos folds anteriores):
+            #   pred'_log = base_log + m·(pred_log − base_log), m ∈ [min, max].
+            m_amp = None
+            if POST_CFG.get('level_amplification'):
+                h_amp_scope = [int(v) for v in (POST_CFG.get('level_amplification_horizons') or list(range(1, 9)))]
+                if int(h) in h_amp_scope and level_pool:
+                    Dp = np.concatenate([np.asarray(e['x_c4'], float) - np.asarray(e['b'], float)
+                                         for e in level_pool])
+                    Rp = np.concatenate([np.asarray(e['y'], float) - np.asarray(e['b'], float)
+                                         for e in level_pool])
+                    fin = np.isfinite(Dp) & np.isfinite(Rp)
+                    side = str(POST_CFG.get('level_amplification_side', 'both'))
+                    m_max = float(POST_CFG.get('level_amplification_max', 1.5))
+                    m_min = float(POST_CFG.get('level_amplification_min', 1.0))
+                    if side == 'up':
+                        sel = fin & (Dp > 0)
+                        if int(sel.sum()) >= 12:
+                            den = float(np.sum(Dp[sel] ** 2))
+                            if den > 1e-9:
+                                m_amp = float(np.clip(np.sum(Dp[sel] * Rp[sel]) / den, m_min, m_max))
+                        if m_amp is not None:
+                            d_i = med_proc_log - base_log
+                            amp = np.where(d_i > 0, m_amp, 1.0)
+                            med_proc_log = base_log + amp * d_i
+                    else:
+                        if int(fin.sum()) >= 12:
+                            den = float(np.sum(Dp[fin] ** 2))
+                            if den > 1e-9:
+                                m_amp = float(np.clip(np.sum(Dp[fin] * Rp[fin]) / den, m_min, m_max))
+                        if m_amp is not None:
+                            med_proc_log = base_log + m_amp * (med_proc_log - base_log)
+            post_meta['level_amp'] = {'slope': m_amp,
+                                      'side': POST_CFG.get('level_amplification_side', 'both')}
+            # EXP-C5: correção por quintil de NÍVEL PREVISTO (ataca o erro condicional
+            # nos dois extremos: pico subestimado / nível baixo superestimado).
+            # g(bin) = shrink * média(y − med) em log nos folds ANTERIORES por bin.
+            bin_edges_cal = None
+            if POST_CFG.get('level_bin_correction') and not POST_CFG.get('level_amplification'):
+                h_bin_scope = POST_CFG.get('level_bin_correction_horizons') or list(range(1, 9))
+                if int(h) in [int(x) for x in h_bin_scope] and level_pool:
+                    Xp = np.concatenate([e['x_c4'] for e in level_pool])
+                    Yp = np.concatenate([e['y'] for e in level_pool])
+                    fin = np.isfinite(Xp) & np.isfinite(Yp)
+                    bin_edges_cal = np.quantile(Xp[fin], [0.2, 0.4, 0.6, 0.8]) if fin.sum() >= 20 else None
+                    if bin_edges_cal is not None:
+                        nb = len(bin_edges_cal) + 1
+                        idx = np.clip(np.searchsorted(bin_edges_cal, Xp[fin]), 0, nb - 1)
+                        shrink = float(POST_CFG.get('level_bin_shrink', 0.5))
+                        nmin = int(POST_CFG.get('level_bin_nmin', 8))
+                        g = np.zeros(nb)
+                        for k in range(nb):
+                            sel = idx == k
+                            if int(sel.sum()) >= nmin:
+                                g[k] = shrink * float(np.mean(Yp[fin][sel] - Xp[fin][sel]))
+                        post_meta['level_bin_g'] = [float(v) for v in g]
+                        gilt = np.clip(np.searchsorted(bin_edges_cal, x0), 0, nb - 1)
+                        med_proc_log = x0 + g[gilt]
+                    else:
+                        post_meta['level_bin_g'] = None
+                else:
+                    post_meta['level_bin_g'] = None
+            # banda recentrada no novo nível (preserva a geometria do modelo)
+            logs_a = {}
+            for t in QUANTILES:
+                lt = np.log1p(np.clip(preds[t], 0.0, None))
+                logs_a[t] = (med_proc_log if t == 0.50
+                             else med_proc_log + (lt - med_log))
+            pred_post = {}
+            for t in QUANTILES:
+                pred_post[t] = np.clip(np.expm1(logs_a[t]), 0.0, None)
+            # non-crossing pós-camada A (por semana)
+            for w in range(len(ses)):
+                vals = [pred_post[t][w] for t in QUANTILES if np.isfinite(pred_post[t][w])]
+                if len(vals) == len(QUANTILES) and np.any(np.diff(vals, axis=0) < 0):
+                    s_vals = sorted(vals)
+                    for i, t in enumerate(QUANTILES):
+                        pred_post[t][w] = s_vals[i]
+
+            # ---- Camada B: conformal fitado nas previsões PÓS-camada A anteriores ----
+            fold_conformal_prev = {}
+            if QC_ENABLED and regime_hook is not None:
+                has_pool = any(blocks for blocks in processed_blocks.values())
+                if has_pool:
+                    pool_fs = {h: {str(tau): [dict(b) for b in blocks]
+                                   for tau, blocks in processed_blocks.items()}
+                               for h in [int(h)]}
+                    try:
+                        fold_conformal_prev = compute_conformal(
+                            pool_fs, regime_hook,
+                            half_life_years=QC['half_life_years'],
+                            max_delta=QC['max_delta'],
+                            max_shift=QC['max_shift'],
+                            use_median_shift=QC['use_median_shift']
+                                and int(h) in apply_horizons_eff)
+                    except Exception as e:
+                        print(f"AVISO: conformal expanding fold {fid} falhou ({e})")
+            conf_all = fold_conformal_prev if int(h) in apply_horizons_eff else {}
             preds_cal = {}
             for t in QUANTILES:
-                logs = np.log1p(np.clip(preds[t], 0.0, None))
-                if conf_all:
+                logs = np.array(logs_a[t], dtype=float)
+                if conf_all and regime_hook is not None:
                     for i, se in enumerate(ses):
                         try:
                             entry = entry_for_key(conf_all, int(h), regime_hook(int(h), str(se)))
@@ -281,17 +410,26 @@ def main():
                     for i, t in enumerate(QUANTILES):
                         preds_cal[t][w] = s_vals[i]
             m = compute_all_metrics(y_true, preds_cal) if QC_ENABLED else dict(m_raw)
+            scheme = 'expanding_cqr_delta_only'
+            if post_meta.get('level_amp', {}).get('slope') is not None:
+                scheme += '+level_amp'
+            elif post_meta.get('level_bin_g') is not None:
+                scheme += '+level_bin'
+            elif post_meta.get('slope', {}).get('b') is not None:
+                scheme += '+level_slope'
+            if 'combo_lambda' in post_meta:
+                scheme += '+baseline_combo'
             m['raw_uncalibrated'] = {k: m_raw.get(k) for k in
                                      ('mae', 'rmse', 'bias', 'wape', 'wis_total', 'wis_50', 'wis_90',
                                       'width_50', 'width_90', 'coverage_50', 'coverage_90')}
-            m['calibration'] = {'applied': bool(conf_all), 'scheme': 'expanding_cqr_delta_only',
+            m['calibration'] = {'applied': bool(conf_all), 'scheme': scheme,
                                 'half_life_years': QC['half_life_years'],
-                                'apply_horizons': sorted(QC['apply_horizons'])}
-            # baseline do pool anterior ao teste (gap de 8 semanas)
-            start = ses[0]
-            pool_end = se_shift(start, -FOLD_GAP_WEEKS)
-            pool = base[base["SE"].str.zfill(6) < pool_end]
-            b_rows = build_baseline_preds(pool, ses, min_se=min_se)
+                                'apply_horizons': sorted(apply_horizons_eff),
+                                'post': {'conformal_all_horizons': bool(POST_CFG.get('conformal_all_horizons')),
+                                         'level_slope_correction': bool(POST_CFG.get('level_slope_correction')),
+                                         'level_bin_correction': bool(POST_CFG.get('level_bin_correction')),
+                                         'baseline_combination': bool(POST_CFG.get('baseline_combination')),
+                                         **post_meta}}
             m.update(baseline_metrics(y_true, b_rows))
             # Ganho vs baseline (skill): por fold, razão direta
             m['skill_mae'] = skill_score(m.get('mae'), m.get('baseline_mae'))
@@ -301,6 +439,16 @@ def main():
             m['n_weeks'] = len(ses)
             m['stratified'] = stratified_for_fold(y_true, preds, ses)
             per_fold.append(m)
+            # ---- registra exemplos/blocos p/ os folds seguintes (fit expanding) ----
+            level_pool.append({'y': y_log, 'x_c4': np.array(x0, dtype=float),
+                               'b': np.array(base_log, dtype=float)})
+            for t in QUANTILES:
+                processed_blocks[float(t)].append({
+                    'fold': int(fid),
+                    'test_se': [str(s).zfill(6) for s in ses],
+                    'y_test_casos': [float(v) if np.isfinite(v) else float('nan') for v in y_true],
+                    'y_pred_casos': [float(v) if np.isfinite(v) else float('nan') for v in pred_post[t]],
+                })
 
         if not per_fold:
             continue

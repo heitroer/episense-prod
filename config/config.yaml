@@ -243,6 +243,13 @@ training:
     weight_200: 1.3
     weight_500: 1.4  # 1.8->1.4 reduz peso excessivo de picos medios (evita 4x peso combinado)
     weight_1000: 1.8  # 2.2->1.8 reduz peso de picos extremos
+  transition_weighting:
+    # EXP-R1 (nov/2026): peso extra p/ amostras cujo ALVO (SE+horizon) desvia da
+    # climatologia da própria semana-alvo (|y_log − mediana_log(semana)| > thresh):
+    # transições de regime (subidas/quedas fortes) viram hard-examples.
+    enabled: false
+    weight: 1.5
+    momentum_thresh: 0.6
   gap_per_horizon: true
   parallel_horizons:
     enabled: true
@@ -343,6 +350,40 @@ quantile_conformal:
   regime_thresholds:
     high: 100.0   # casos na semana-base => cluster 'high' (surto instalado)
     mid: 20.0     # 20-100 => 'mid'; <20 => 'low' (endemia baixa)
+postprocessing:
+  # Experimentos v7 (nov/2026) — pós-processamento no recompute (sem retreino).
+  # conformal_all_horizons: CQR delta-only em TODOS os horizontes (antes [1,2,3,5]).
+  # level_slope_correction: anti "regressão à média" — y_log ~ a + b·pred_log com
+  #   (a,b) fitados nos folds ANTERIORES (expanding); banda recentrada no nível.
+  # baseline_combination: mistura log-space mediana modelo+baseline com λ por
+  #   horizonte fitado expanding (ataca P3: transições de regime).
+  conformal_all_horizons: false
+  level_slope_correction: false
+  level_slope_min: 0.6
+  level_slope_max: 1.5
+  level_bin_correction: true
+  level_bin_shrink: 0.5
+  level_bin_nmin: 8
+  level_bin_correction_horizons: [4]
+  level_amplification: false
+  level_amplification_min: 1.0
+  level_amplification_max: 1.5
+  level_amplification_side: both
+  level_amplification_horizons: [1, 2, 3, 4, 5, 6, 7, 8]
+  baseline_combination: true
+  baseline_combination_horizons: [1, 2, 3]
+residual_stage2:
+  # EXP-R2 (nov/2026): booster de resíduos stage-2 por horizonte, fitado SÓ com os
+  # folds ANTERIORES (expanding — mesma honestidade do conformal). LGBM l2 r̂=f(X)
+  # somado a TODOS os quantis em log (mesmo shift, clip ±max_shift_log). Ataca o
+  # erro condicional de nível em h>=4 que recalibração global não resolve (Fase 1).
+  enabled: false
+  horizons: [4, 5, 6, 7, 8]
+  rounds: 60
+  lr: 0.05
+  num_leaves: 7
+  max_shift_log: 0.8
+  min_rows: 48
 deployment_gate:
   # Gate de implantação por fold (P7): exige MAE de CADA fold completo (>=52 sem)
   # <= max_baseline_ratio * baseline sazonal; se reprovar, update_pipeline.py

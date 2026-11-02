@@ -89,6 +89,15 @@ def normalize_se(se) -> str:
         s = s.split('.')[0]
     return s.zfill(6) if len(s) < 6 else s
 
+
+# EXP-R1: SE-alvo (SE + k semanas epi), respeita weeks_in_year via datas (não lag 52)
+def se_shift_weeks(se, weeks: int) -> str:
+    s = normalize_se(se)
+    ano, sem = int(s[:4]), int(s[4:])
+    _d = epiweek_to_date(ano, sem) + pd.Timedelta(weeks=int(weeks))
+    return str(date_to_epiweek(_d)).zfill(6)
+
+
 # --- Unified seasonal helpers (FIX Bug5 Bug12) ---
 def _seasonal_lookup(train_se_to_y: dict, target_se: str, fallback_k: int = 4):
     """Unified seasonal predecessor lookup: same WW previous year with fallback ±k via dates.
@@ -326,14 +335,18 @@ class EpisenseTrainer:
         logger.info(f"Horizon h{horizon}: {len(X)} samples, {len(feature_cols)} potential features")
         return X, y, se_index, df_clean
 
-    def _compute_sample_weights(self, y_tr: pd.Series, X_tr: Optional[pd.DataFrame] = None, se_index: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
-        """v3: peso por recencia + pico. Retorna None se desabilitado (peso uniforme)."""
+    def _compute_sample_weights(self, y_tr: pd.Series, X_tr: Optional[pd.DataFrame] = None, se_index: Optional[np.ndarray] = None,
+                                horizon: Optional[int] = None) -> Optional[np.ndarray]:
+        """v3: peso por recencia + pico. EXP-R1: + peso de transição de regime
+        (alvo desviado da climatologia da própria semana). None se tudo desabilitado."""
         cfg = self.config.get('training', {})
         tw_cfg = cfg.get('temporal_weighting', {})
         pw_cfg = cfg.get('peak_weighting', {})
+        tr_cfg = cfg.get('transition_weighting', {})
         tw_enabled = bool(tw_cfg.get('enabled', False)) if isinstance(tw_cfg, dict) else False
         pw_enabled = bool(pw_cfg.get('enabled', False)) if isinstance(pw_cfg, dict) else False
-        if not tw_enabled and not pw_enabled:
+        tr_enabled = isinstance(tr_cfg, dict) and bool(tr_cfg.get('enabled', False)) and horizon is not None
+        if not tw_enabled and not pw_enabled and not tr_enabled:
             return None
         n = len(y_tr)
         w = np.ones(n, dtype=float)
@@ -370,6 +383,34 @@ class EpisenseTrainer:
                 w = w * w_time
             except Exception as e:
                 logger.warning(f"temporal weighting failed: {e}")
+        # EXP-R1: transition weighting — amostras cujo ALVO (SE+horizon) desvia da
+        # climatologia da própria semana-alvo (|y_log − mediana_log(semana)| > thresh)
+        # recebem peso extra: são as transições de regime (subida/queda forte) que o
+        # modelo tende a amortecer (P1: pico escapa nas transições). Feito ANTES do
+        # normalize/clip para que o peso extra sobreviva à normalização.
+        if tr_enabled:
+            try:
+                _tr_w = float(tr_cfg.get('weight', 1.5))
+                _tr_t = float(tr_cfg.get('momentum_thresh', 0.6))
+                y_arr_tr = np.asarray(y_tr, dtype=float)
+                fin_tr = np.isfinite(y_arr_tr)
+                wk_alvo = np.full(n, -1, dtype=int)
+                if se_index is not None and len(se_index) == n:
+                    for _i, _se in enumerate(se_index):
+                        try:
+                            wk_alvo[_i] = int(se_shift_weeks(_se, horizon)[4:6])
+                        except Exception:
+                            wk_alvo[_i] = -1
+                _clim = np.full(n, np.nan, dtype=float)
+                for _wk in np.unique(wk_alvo[fin_tr & (wk_alvo > 0)]):
+                    _sel = wk_alvo == _wk
+                    _clim[_sel] = float(np.nanmedian(np.asarray(y_tr, dtype=float)[_sel]))
+                _dev = np.abs(y_arr_tr - _clim)
+                _mask = fin_tr & np.isfinite(_clim) & (_dev > _tr_t)
+                if np.any(_mask):
+                    w[_mask] *= _tr_w
+            except Exception as e:
+                logger.warning(f"transition weighting failed: {e}")
         # normaliza para media 1
         w = w / (np.mean(w) + 1e-10)
         # clip para evitar peso extremo
@@ -422,8 +463,8 @@ class EpisenseTrainer:
             params['metric'] = 'quantile'
 
         feature_names = X_tr.columns.tolist()
-        w_tr = self._compute_sample_weights(y_tr, X_tr, se_tr)
-        w_val = self._compute_sample_weights(y_val, X_val, se_val)
+        w_tr = self._compute_sample_weights(y_tr, X_tr, se_tr, horizon=horizon)
+        w_val = self._compute_sample_weights(y_val, X_val, se_val, horizon=horizon)
         if w_tr is not None:
             train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names, weight=w_tr)
         else:
@@ -472,7 +513,7 @@ class EpisenseTrainer:
             params['metric'] = 'quantile'
 
         feature_names = X.columns.tolist()
-        w_full = self._compute_sample_weights(y, X, se_full)
+        w_full = self._compute_sample_weights(y, X, se_full, horizon=horizon)
         if w_full is not None:
             data = lgb.Dataset(X, label=y, feature_name=feature_names, weight=w_full)
         else:
@@ -996,6 +1037,73 @@ class EpisenseTrainer:
                 models[tau][seed] = self.train_single_model_full(X_full_tau, y_full_src, seed, horizon, tau, n_iters, se_full=se_full_src)
 
         # ------------------------------------------------------------------
+        # EXP-R2: stage-2 residual booster (config-driven; honesto expanding)
+        # Resíduo alvo: y_log − mediana_ensemble (pré-correção, pós non-crossing).
+        # Fit LGBM (l2) SOMA nos folds ANTERIORES; r̂ do fold atual é somado a
+        # TODOS os quantis em log (mesmo shift — preserva geometria das bandas).
+        # No fold 0 não há histórico → sem correção (mesma honestidade do conformal).
+        # ------------------------------------------------------------------
+        st2_cfg = self.config.get('residual_stage2', {}) or {}
+        st2_enabled = isinstance(st2_cfg, dict) and bool(st2_cfg.get('enabled', False))
+        st2_horizons = set(int(x) for x in (st2_cfg.get('horizons') or []))
+        st2_shift: Dict[int, np.ndarray] = {}
+        st2_meta: Dict[int, Dict[str, Any]] = {}
+        st2_final_log: Dict[int, Dict[float, np.ndarray]] = {}
+        if st2_enabled and horizon in st2_horizons:
+            try:
+                _rounds = int(st2_cfg.get('rounds', 60))
+                _lr = float(st2_cfg.get('lr', 0.05))
+                _leaves = int(st2_cfg.get('num_leaves', 7))
+                _max_shift = float(st2_cfg.get('max_shift_log', 0.8))
+                _min_rows = int(st2_cfg.get('min_rows', 48))
+                _pool = []
+                for _fid in sorted(fold_prep.keys()):
+                    _prep = fold_prep[_fid]
+                    _ens_all = {t: np.nanmean(np.array([fold_predictions[_fid][t][s]
+                                                        for s in self.ensemble_seeds], dtype=float), axis=0)
+                                for t in self.quantiles}
+                    _ens_med = self.enforce_non_crossing(_ens_all, log_scale=True)[float(0.50)]
+                    _resid = np.asarray(_prep['y_test'], dtype=float) - _ens_med
+                    _pool.append({'X': _prep['X_test'], 'resid': _resid})
+                    _prev = _pool[:-1]
+                    _n_rows = int(sum(len(p['resid']) for p in _prev))
+                    _shift = np.zeros(len(_resid), dtype=float)
+                    _applied = False
+                    if _n_rows >= _min_rows:
+                        _cols: Optional[set] = None
+                        for p in _prev:
+                            c = set(p['X'].columns)
+                            _cols = set(c) if _cols is None else (_cols & c)
+                        _cols_list = sorted(_cols) if _cols else []
+                        if len(_cols_list) > 0:
+                            X_fit = pd.concat([p['X'][_cols_list] for p in _prev], ignore_index=True)
+                            X_fit = X_fit.fillna(0).astype(float)
+                            y_fit = np.concatenate([p['resid'] for p in _prev]).astype(float)
+                            _fin = np.isfinite(y_fit)
+                            X_fit = X_fit.iloc[_fin]
+                            y_fit = y_fit[_fin]
+                            params2 = {'objective': 'l2', 'learning_rate': _lr, 'num_leaves': _leaves,
+                                       'min_data_in_leaf': 15, 'min_sum_hessian_in_leaf': 1.0,
+                                       'feature_fraction': 0.9, 'bagging_fraction': 0.9, 'bagging_freq': 1,
+                                       'lambda_l2': 1.0, 'verbosity': -1, 'seed': 42, 'num_threads': 2,
+                                       'force_col_wise': True}
+                            X_cur = _prep['X_test'][_cols_list].fillna(0).astype(float)
+                            _b = lgb.train(params2, lgb.Dataset(X_fit, label=y_fit), num_boost_round=_rounds)
+                            _pred = np.asarray(_b.predict(X_cur, num_iteration=_rounds), dtype=float)
+                            _fin2 = np.isfinite(_pred)
+                            _shift[_fin2] = np.clip(_pred[_fin2], -_max_shift, _max_shift)
+                            _applied = True
+                    st2_shift[_fid] = _shift
+                    st2_meta[_fid] = {'applied': bool(_applied), 'n_train_rows': _n_rows,
+                                      'mean_shift': float(np.mean(_shift)) if len(_shift) else 0.0}
+                    logger.info(f"  h{horizon} stage2 fold {_fid}: n_prev={_n_rows} "
+                                f"applied={_applied} shift_med={st2_meta[_fid]['mean_shift']:+.3f}")
+            except Exception as e:
+                logger.warning(f"  h{horizon} stage2 falhou ({e}) — segue sem correção")
+                st2_shift = {}
+                st2_meta = {}
+
+        # ------------------------------------------------------------------
         # Ensemble metrics: average predictions across seeds per (fold, quantile)
         # ------------------------------------------------------------------
         ensemble_fold_metrics = []
@@ -1006,12 +1114,23 @@ class EpisenseTrainer:
                 y_pred_ens[tau] = np.nanmean(np.array(preds, dtype=float), axis=0)
             # Enforce monotonicity on the ensembled quantiles
             self.enforce_non_crossing(y_pred_ens, log_scale=True)
+            # EXP-R2: shift stage-2 (mesmo Δ log em TODOS os quantis — preserva
+            # a geometria das bandas e a monotonicidade).
+            _st2 = st2_shift.get(fold_idx)
+            _st2_note = st2_meta.get(fold_idx)
+            if _st2 is not None and np.any(_st2 != 0.0):
+                for tau in self.quantiles:
+                    y_pred_ens[tau] = np.asarray(y_pred_ens[tau], dtype=float) + _st2
+            st2_final_log[fold_idx] = {tau: np.array(y_pred_ens[tau], dtype=float)
+                                       for tau in self.quantiles}
             mets = self.calculate_metrics(prep['y_test'], y_pred_ens,
                                                    y_train=prep['y_train'],
                                                    train_se=prep['train_se'],
                                                    test_se=prep['test_se'],
                                                   horizon=horizon)
             mets['fold'] = fold_idx
+            if _st2_note is not None:
+                mets['stage2'] = dict(_st2_note)
             mets['seed'] = 'ensemble'
             mets['horizon'] = horizon
             # Stratified (outbreak/calm) using fold's SEs for the median - finite guard before expm1
@@ -1070,9 +1189,13 @@ class EpisenseTrainer:
         for tau in self.quantiles:
             self.fold_series[horizon].setdefault(tau, [])
             for fold_idx, prep in fold_prep.items():
-                preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
-                y_pred_ens = np.nanmean(np.array(preds, dtype=float), axis=0)
-                # enforce será aplicado em conjunto abaixo; por enquanto guarda raw temporário
+                if fold_idx in st2_final_log:
+                    # EXP-R2: reusa o ensemble pós-stage-2 já enforced (idêntico
+                    # ao que gerou as métricas acima — consistência dos artefatos)
+                    y_pred_ens = st2_final_log[fold_idx][tau]
+                else:
+                    preds = [fold_predictions[fold_idx][tau][s] for s in self.ensemble_seeds]
+                    y_pred_ens = np.nanmean(np.array(preds, dtype=float), axis=0)
                 # finite guard for expm1
                 _y_pred_cases = np.full_like(y_pred_ens, np.nan, dtype=float)
                 _m_pred = np.isfinite(y_pred_ens)

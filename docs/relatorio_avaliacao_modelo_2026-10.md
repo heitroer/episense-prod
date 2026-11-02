@@ -524,3 +524,78 @@ que o erro; leia WAPE por horizonte com este contexto. (b) skill_mae h8 > h7 seg
 lógica do baseline: a dificuldade não cresce monotonicamente com h nas temporadas
 avaliadas. Ganho monótono de h1..h7 confirma a degradação esperada; h8 permanece +43%.
 Média h1–h8: ganho MAE +48.3% (WIS +47.3%), WAPE 42.4% do volume.
+
+## Adendo 7 — Fase de calibração honesta e experimentos de retreino (v7.1, nov/2026)
+
+Objetivo declarado: melhorar métricas canônicas E as previsões históricas
+(walk-forward 2022–2025) sem violar honestidade expanding, non-crossing e o
+gate de pior fold. Todo experimento correu o walk-forward completo e
+comparou-se via `scripts/recompute_metrics.py` (maçã-com-maçã). Arquivos:
+`logs/metrics_exp_{C1,C3,C4,C45,C45b,C6both,R2,R1,R1b}.json` + logs
+`logs/exp_*_20261102.log`; snapshot base v6d em `logs/metrics_baseline_v6d.json`.
+
+### Parte A — Pós-processamento (sem retreino, Camada A nível + Camada B conformal)
+
+O `recompute_metrics.py` ganhou duas camadas config-driven (flags todas
+desligadas = estado canônico provado BYTE-IDENTICAL ao estado anterior —
+`NOOP_OK vs logs/metrics_baseline_v6d.json`):
+
+- **Camada A (nível, expanding)**: EXP-C4 combinação mediana modelo+baseline
+  no espaço log com λ por horizonte fitado NOS FOLDS ANTERIORES
+  (λ=Σ(m−b)(y−b)/Σ(m−b)², clip [0,1]); EXP-C3 slope global
+  (y_log~a+b·pred_log); EXP-C5 correção por quintil de nível previsto
+  (ganho g(bin)=shrink·média(y−x) no log dos folds anteriores); EXP-C6
+  amplificação do desvio vs nível sazonal.
+- **Camada B (conformal CQR delta-only)**: fitada sobre as previsões PÓS-Camada
+  A dos folds anteriores — a mesma honestidade expanding do esquema v3.
+
+Resultados (ΔMAE vs v6d as-is):
+
+| EXP | h1 | h2 | h3 | h4 | h5 | h6 | h7 | h8 | Veredito |
+|---|---|---|---|---|---|---|---|---|---|
+| C1 conformal h1–h8 | 0 | 0 | 0 | +3.7 | 0 | +3.2 | −0.2 | −0.8 | REJEITADO (deltas não transferem h≥4) |
+| C3 slope global | +7.1 | +11.4 | +8.1 | −1.2 | +11.2 | +7.4 | +7.5 | +9.2 | REJEITADO (só h4 melhora) |
+| C4 combo baseline | −0.1 | −1.0 | −2.3 | +3.9 | +5.6 | +7.4 | +4.7 | +7.3 | APROVADO h1–h3 |
+| C5 quintil de nível | — | — | — | −2.1 | +4.4 | +1.9 | +5.5 | +5.2 | APROVADO h4 (ΔWIS −0.77, ΔWAPE −3.0%, cov50 +0.03) |
+| C6 amplificação | +4.3 | +4.9 | −2.1 | 0 | 0 | 0 | 0 | 0 | REJEITADO (m fitado ≤1.0 em h≥4: o desvio longo prazo não é shrink) |
+
+**Estado promovido v7.1**: `baseline_combination: [1,2,3]` +
+`level_bin_correction: [4]` (shrink 0.5); demais flags off. Ganhos vs v6d:
+h1 −0.06 / h2 −1.01 / h3 −2.30 / h4 −2.12 (h5–h8 idênticos). Snapshot em
+`logs/metrics_v71post_v6d.json`.
+
+**Conclusão estrutural da Parte A**: recalibração global não resolve h≥4. O
+erro condicional de nível (regressão à média nos dois extremos de temporada)
+só rende em h4 via correção por nível previsto; nos demais horizontes a
+estrutura X→resíduo NÃO transfere entre temporadas.
+
+### Parte B — Retreinos (autorizados; um experimento por vez, flag isolada)
+
+Barra de ruído de retreino estabelecida pelo próprio R2 nos horizontes FORA do
+seu escopo (h1–h3 rodaram sem stage-2): ΔMAE entre −0.28 e +1.16 ⇒ efeitos
+<~1.0 MAE não são decisão.
+
+| EXP | Design | ΔMAE vs v6d-as-is (h1..h8) | Veredito |
+|---|---|---|---|
+| R2 | stage-2 booster de resíduos: LGBM l2 (60 rounds, lr 0.05, 7 folhas) fitado SÓ nos folds anteriores, r̂(X) somado a todos os quantis em log (clip ±0.8) | −0.3/−1.1/−1.1/**+6.2/+21.4/+23.4/+8.6/+20.3** | **REJEITADO** — amplifica o erro em h≥4; dbias +11..+36 |
+| R1 | transition weighting: peso ×1.5 p/ amostras cujo alvo (SE+horizon) desvia >0.6 log da climatologia da semana-alvo | +0.3/+1.0/+0.3/+1.5/+0.6/+2.7/−0.1/+4.7 | REJEITADO (ver R1b) |
+| R1b | R1 branda: ×1.2, limiar 0.8 | +0.3/+1.8/+4.1/+0.8/+2.5/+3.1/−0.6/+3.9 | **REJEITADO** — skill médio +48.8%→+47.3%; família R1 encerrada (tuning esgotado: 1.5/0.6 e 1.2/0.8 pioram) |
+
+Lições da Parte B (consistentes com a Parte A): resíduo e transição NÃO são
+estacionários entre temporadas — o mapeamento X→erro muda de aridade por fold
+(2022 sob Perron-sazonal diferente de 2024/2025). Correções fitadas no passado
+amplificam ruído; o caminho correto para h≥4 é estrutural (features de fase) —
+a features Rt kinetics/regime (v6) já cobrem; novas features ficam para v8.
+
+### Parte C — Estado final v7.1 e gate
+
+- `models/` restaurado ao estado estável v6d (backup pre-retreino em
+  `models/_backup_stable`, mecanismo do `update_pipeline.py`).
+- Artefatos canônicos regenerados com flags v7.1: `validation_results.json`,
+  `metrics_dataframe.csv` (skill/WAPE inclusos), `validation_predictions.json` v6d.
+- Pós-proc promovido: C4 h1–h3 + C5 h4 — ver tabela da Parte A.
+- Follow-up pendente (consistência live vs validação): o path de inferência
+  (`api/main.py` + `models/inference.py`) precisa aplicar o MESMO pós-proc
+  promovido (combinação λ h1–3 via baseline expansível e ganho de nível por
+  bin em h4) — materializado em `quantile_conformal.json` na próxima
+  regeneração de artefato de produção.
