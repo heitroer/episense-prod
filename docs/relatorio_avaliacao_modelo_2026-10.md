@@ -599,3 +599,130 @@ a features Rt kinetics/regime (v6) já cobrem; novas features ficam para v8.
   promovido (combinação λ h1–3 via baseline expansível e ganho de nível por
   bin em h4) — materializado em `quantile_conformal.json` na próxima
   regeneração de artefato de produção.
+
+## Adendo 8 — v7.2: leak do C4, vazamento banda→mediana e fold 2022-23 (nov/2026)
+
+Sessão de auditoria disparada pela leitura dos quantis "malucos" do fold
+2022-23 (q95 superestima em todos os períodos; q05 subestima o período
+inteiro). Três achados de mecanismo e três experimentos; o canônico vira
+**v7.2 = C5 h4 + repair median-protetor** (C4 sai da promoção).
+
+### Achado 1 — C4 da v7.1 fitava λ IN-FOLD (vazamento)
+
+O recompute aplicava a combinação modelo+baseline com λ fitado nos ERROS DO
+PRÓPRIO FOLD (`y_log/med_log/base_log` da janela avaliada, commit ce90a5c,
+recompute linha ~264) — exatamente o padrão de vazamento que a Fase 1
+combateu nas camadas conformais. Ao refazer o techo com pool honesto
+(expanding/loo, refactor de 3 passos), λ expandindo fica ≈1.0: o baseline NÃO
+transfere para a mediana entre temporadas (mesmo diagnóstico da Parte B do
+Adendo 7, agora no nível). **C4 removido da promoção**
+(`postprocessing.baseline_combination: false`); a meta `combo_lambda` permanece
+no JSON para rastreio. O histórico `metrics_v71post_v6d.json` é conservado como
+contaminado (h2−h3 dele não são legítimos). Comparação honesta: C5-único = nova
+referência intermediária (`logs/metrics_v72base_c5only.json`: ΔMAE h4 −2.12).
+
+### Achado 2 — vazamento banda→mediana no non-crossing pós-conformal
+
+Realimentação descoberta ao investigar anomalia do EXP-PH (fold1 h3, MAE
+84.50 vs 74.31 raw): os deltas de banda do conformal CQR (q05/q25/q75/q95)
+podem cruzar a mediana; o reparo non-crossing por semana (sort, paridade do
+`inference.py:781`) **reatribui o slot q50** e a MAE canônica ("só mediana")
+muda sem qualquer mudança de nível — medido: 51/52 semanas do fold1 h3 (22/52
+no fold3). A inferência de PRODUÇÃO usa o mesmo repair, logo o efeito existe
+em live também — é paridade, não artefato de validação — mas rompe a semântica
+da métrica (calibração de banda alterando pontual).
+
+**EXP-NC** (`postprocessing.nc_protect_median`, novo em v7.2): o repair
+pós-conformal passa a CLIPAR a banda em torno da mediana pós-camada A
+(`q25=min(q25,med)`, `q05=min(q05,q25,med)`, `q75=max(q75,med)`,
+`q95=max(q95,q75,med)`); o slot q50 nunca é reatribuído ⇒ deltas de banda não
+vazam no MAE. Resultado walk-forward (vs estado C5-único):
+
+| h | ΔMAE | ΔWIS | Δcov50 |
+|---|---|---|---|
+| 1 | +0.13 | +0.05 | 0.00 |
+| 2 | +0.51 | +0.26 | +0.01 |
+| 3 | **−1.67** | −0.11 | +0.02 |
+| 4 | 0.00 | 0.00 | 0.00 (conformal h4 fora do escopo) |
+| 5 | **−1.07** | +0.10 | +0.02 |
+| 6–8 | 0.00 | 0.00 | 0.00 (conformal fora do escopo) |
+
+Por fold (MAE médio h1–h8): f1 −1.78, f2 +0.03, f3 +0.70, f0 0.00 (sem
+conformal). Net: **MAE médio 69.30 → 69.03; skill 48.5% → 48.7%**; WIS ~neutro
+(+0.07/h divergente); h3 W90 −3.28 (bandas mais agudas). Promovido como
+**correção de semântica** (não é retreino nem fit novo): MAE volta a medir o
+que anuncia. Resíduo conhecido: o `inference.py` mantém sort (comportamento
+live intacto); alinhar o repair live para 'protect_median' é follow-up com
+verificação de fan em API/dashboard.
+
+### EXPRESS: EXP-L0 (conformal LOO) — REJEITADO
+
+`validation_scheme: loo` (cada fold calibrado nos folds ≠ f; fold0 deixaria
+de ficar sem ajuste — a raiz estrutural dos quantis malucos). Resultado: h4
++1.55, h5 +4.55 MAE na média; skill 48.5% → 47.9%; cov50 do fold1 piora
+(0.44→0.29 em h3). Calibrar a cauda com resíduos de OUTRAS temporadas não
+transfere (o fold0 isola o 2022-23 por uma razão real: 2022 não tem análogo
+no pool restante — ver Achado 3). Rejeitado; `expanding` permanece canônico.
+
+### EXPRESS: EXP-PH / PH2 (paridade do phantom gating)
+
+Espelhar o cap de q95 da produção (`phantom_gating.enabled: true`, calma
+1.5×mediana, surto 2.0×mês-alvo) na validação. **A primeira rodagem
+(metrics_exp_PH.json) é INVÁLIDA**: bug de transformação dupla no recompute
+(`expm1` aplicado sobre valores já em casos ⇒ cap efetivo ~med+0.4 e `inf` no
+q95 quando q95>~709; cov90 colapsado era artefato). Corrigido, o **EXP-PH2**
+(metrics_exp_PH2.json) é o veredito: MAE intocado por horizonte (cap só
+desmagnetiza a cauda alta ⇒ determinismo restaurado — fecha a anomalia do
+fold1 h3 como composto dos bugs do próprio recompute), mas **cov90 do fold0
+colapsa mesmo assim** (0.87→0.52 h3, 0.92→0.60 h6): o cap segue a mediana
+SUBESTIMADA do fold0 nos picos e corta a parte correta da banda. Rejeitado —
+o gating live existe para conter flares em produção, não para calibrar
+validação; paridade total exigirá corrigir o NÍVEL do fold0 (ver Achado 3),
+não o cap.
+
+### Achado 3 — fold 2022-23: diagnóstico fechado (é estrutural)
+
+Métricas canônicas mostram bias da mediana −57..−161 (subestima nível,
+esp. picos q50 290–786 vs real 826–1132) e cov50 0.13–0.35; nas semanas
+calmas da cabeça do fold (reais 0–9) a BANDA INTEIRA está acima
+(q05 31–36, q50 71–89, q95 203–256). Explicações encadeadas:
+1. fold0 é o único sem pool de calibração expanding (pool vazio ⇒ nenhuma
+   camada pós-A/conformal atua nele);
+2. as duas alternativas de atribuir pool (LOO, phantom cap) foram medidas e
+   rejeitadas acima;
+3. o ensemble foi treinado majoritariamente em regimes epidêmicos; o "piso"
+   da mediana não desce abaixo de ~30 e a amplitude de pico não se
+   estica 2× sem features de fase.
+Correção honesta disponível nas regras atuais: NENHUMA (pós-ajuste com pool
+inexistente é vazamento ou estruturalmente insuficiente). Caminho = **v8:
+features de fase** (trainável em qualquer temporada) — registro no plano
+`episense-melhorias-2026-11.md`. Candidatos registrados para lá: floor de
+q05 espelhando o cap do phantom (com idêntica elucidação de paridade live),
+regressão quantílica por fase temporária, e live-path da camada A.
+
+### Estado v7.2 (canônico)
+
+- `config.yaml`: `postprocessing`: C4 false (removido por leak), C5 h4 true,
+  `nc_protect_median: true`, `validation_scheme: expanding`,
+  `phantom_parity: false`; tudo mais off.
+- Artefatos regenerados + byte-parity: `models/validation_results.json` ==
+  `logs/metrics_v72base.json`; `logs/metrics_v72base_c5only.json` conserva a
+  referência intermediária; inválidos/experimentos arquivados em
+  `logs/metrics_exp_L0.json`, `logs/metrics_exp_NC.json`,
+  `logs/metrics_exp_PH2.json` (`metrics_exp_PH.json` mantido apenas como
+  registro do run contaminado).
+- Tabela canônica (vs as-is v6d):
+
+| h | as-is | v7.2 | ΔMAE |
+|---|---|---|---|
+| 1 | 37.97 | 38.10 | +0.13 |
+| 2 | 54.79 | 55.29 | +0.51 |
+| 3 | 60.66 | 58.99 | **−1.67** |
+| 4 | 66.47 | 64.34 | **−2.12** |
+| 5 | 74.43 | 73.37 | **−1.07** |
+| 6 | 79.66 | 79.66 | 0.00 |
+| 7 | 89.83 | 89.83 | 0.00 |
+| 8 | 92.69 | 92.69 | 0.00 |
+
+**MAE médio 69.56 → 69.03; skill médio +48.3% → +48.7%.** Gate de deployment
+intocado (P7 é retreino; sem retreino nesta fase).

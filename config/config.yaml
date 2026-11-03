@@ -370,8 +370,18 @@ postprocessing:
   level_amplification_max: 1.5
   level_amplification_side: both
   level_amplification_horizons: [1, 2, 3, 4, 5, 6, 7, 8]
-  baseline_combination: true
+  baseline_combination: false
   baseline_combination_horizons: [1, 2, 3]
+  validation_scheme: expanding
+  # 'expanding' (implantação incremental; fold0 sem ajuste) | 'loo' (fold calibrado
+  # com folds≠f — sem auto-resíduo, espelha artefato de produção)
+  phantom_parity: false
+  # Espelha o phantom gating do inference no caminho de validação (q95 cap por
+  # regime do mês-alvo): paridade live-vs-validação do fold 2022-23.
+  nc_protect_median: true
+  # EXP-NC (v7.2, Adendo 8): repair pós-conformal median-protetor — o clip em
+  # torno da mediana pós-camada A evita que deltas de BANDA reatribuam o slot
+  # q50 pelo sort (vazamento banda->mediana; MAE volta a medir só o nível).
 residual_stage2:
   # EXP-R2 (nov/2026): booster de resíduos stage-2 por horizonte, fitado SÓ com os
   # folds ANTERIORES (expanding — mesma honestidade do conformal). LGBM l2 r̂=f(X)

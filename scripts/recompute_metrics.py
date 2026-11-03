@@ -19,6 +19,7 @@ Uso:  ./.venv/bin/python3 scripts/recompute_metrics.py
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from datetime import timedelta
@@ -202,15 +203,20 @@ def main():
 
         per_fold = []
         # ==============================================================
-        # Pós-processamento EXPANDING (experimentos v7, config-driven)
-        # Camada A (nível): EXP-C4 combinação modelo+baseline e EXP-C3 correção
-        #   de nível por slope (anti "regressão à média": y_log ~ a + b·pred_log,
-        #   b fitado nos folds anteriores). Banda recentrada no novo nível
-        #   (deltas de banda do modelo preservados em log — mesma geometria).
-        # Camada B (conformal CQR delta-only): fitada PÓS-camada A, SÓ com os
-        #   folds anteriores (mesma honestidade do esquema expanding v3).
-        # Flags em cfg['postprocessing'] — todas false mantém o estado canônico.
+        # Pós-processamento v7/v8 (experimentos, config-driven)
+        # Camada A (nível): C4 combinação modelo+baseline (λ) e C3/C6/C5
+        #   correções de nível — banda recentrada no novo nível (geometria preservada).
+        # Camada B: conformal CQR delta-only por regime-base (fit pós-camada A).
+        # Camada C (paridade live): phantom gating do q95 (cap = max(med·fator,
+        #   med+5) por regime do MÊS-ALVO), espelhado de models/inference.py.
+        # validation_scheme define o pool de calibração de CADA fold f:
+        #   'expanding': folds ANTERIORES (implantação incremental; fold0 fica sem
+        #     nenhum ajuste — é a razão do fold 2022-23 aparentar quantis "malucos").
+        #   'loo': folds ≠ f (sem auto-resíduo; espelha o artefato de produção,
+        #     que calibra com todos os folds disponíveis) — fold0 recebe ajuste real.
+        # Todas as flags false + 'expanding' = estado canônico (provado no-op).
         # ==============================================================
+        APPLY_SCHEME = str(POST_CFG.get('validation_scheme', 'expanding'))
         apply_horizons_eff = (list(range(1, 9)) if POST_CFG.get('conformal_all_horizons')
                               else sorted(QC['apply_horizons']))
         regime_hook = None
@@ -222,8 +228,18 @@ def main():
                 regime_hook = make_regime_hook(casos_by_se, qc_cfg.get('regime_thresholds') or None)
             except Exception as e:
                 print(f"AVISO: regime hook indisponível ({e})")
-        processed_blocks: dict = {float(t): [] for t in QUANTILES}  # pós-camada A (fit do conformal)
-        level_pool: list = []                                       # {'y': arr, 'x_c4': arr} em log1p
+        # Camada C: paridade do phantom gating (mesmo cfg do inference)
+        PH_CFG = cfg.get('phantom_gating', {}) or {}
+        phantom_parity = bool(POST_CFG.get('phantom_parity', False))
+        nc_protect_median = bool(POST_CFG.get('nc_protect_median', False))
+        ph_disabled = set(int(x) for x in (PH_CFG.get('disabled_horizons') or []))
+        ph_cal_fac = float(PH_CFG.get('calm_q95_max_factor', 1.5))
+        ph_out_fac = float(PH_CFG.get('outbreak_q95_max_factor', 2.0))
+        ph_outbreak_months = set(cfg.get('epidemiological_periods', {}).get(
+            'outbreak_months', [10, 11, 12, 1, 2, 3, 4, 5]))
+
+        # ---- Passo 0: primitivas por fold (raw já non-crossing, baseline, cru) ----
+        units: dict = {}
         for fid in sorted(fold_map.keys(), key=int):
             fm = fold_map[fid]
             truth = fm.pop("_truth", {})
@@ -242,135 +258,164 @@ def main():
                     for i, t in enumerate(QUANTILES):
                         preds[t][w] = s_vals[i]
             m_raw = compute_all_metrics(y_true, preds)
-
-            # ---- baseline do pool anterior ao teste (gap de 8 semanas) ----
+            # baseline do pool anterior ao teste (gap de 8 semanas)
             start = ses[0]
             pool_end = se_shift(start, -FOLD_GAP_WEEKS)
-            pool = base[base["SE"].str.zfill(6) < pool_end]
-            b_rows = build_baseline_preds(pool, ses, min_se=min_se)
+            pool_b = base[base["SE"].str.zfill(6) < pool_end]
+            b_rows = build_baseline_preds(pool_b, ses, min_se=min_se)
             base_med = np.array([r[0.50] for r in b_rows], dtype=float)
+            units[fid] = {'ses': ses, 'y_true': y_true, 'preds': preds,
+                          'y_log': np.log1p(np.clip(y_true, 0.0, None)),
+                          'med_log': np.log1p(np.clip(med, 0.0, None)),
+                          'base_log': np.log1p(np.clip(base_med, 0.0, None)),
+                          'm_raw': m_raw, 'b_rows': b_rows}
 
-            # ---- Camada A (nível) — parâmetros fitados nos folds ANTERIORES ----
-            y_log = np.log1p(np.clip(y_true, 0.0, None))
-            med_log = np.log1p(np.clip(med, 0.0, None))
-            base_log = np.log1p(np.clip(base_med, 0.0, None))
-            post_meta: dict = {}
-            x0 = med_log
-            c4_scope = [int(x) for x in (POST_CFG.get('baseline_combination_horizons') or list(range(1, 9)))]
+        if not units:
+            continue
+
+        def _pool_fids(fid):
+            if APPLY_SCHEME == 'loo':
+                return [x for x in units.keys() if x != fid]
+            return [x for x in units.keys() if int(x) < int(fid)]
+
+        # ---- Camada A passo 1: λ da combinação (C4) por fold ----
+        c4_scope = [int(x) for x in (POST_CFG.get('baseline_combination_horizons') or list(range(1, 9)))]
+        for fid, u in units.items():
+            pm: dict = {}
+            u['pm'] = pm
+            x0 = u['med_log']
             if POST_CFG.get('baseline_combination') and int(h) in c4_scope:
-                fin = np.isfinite(y_log) & np.isfinite(med_log) & np.isfinite(base_log)
+                _pf = _pool_fids(fid)
                 lam = 1.0
-                if int(fin.sum()) >= 8:
-                    yv, mv, bv = y_log[fin], med_log[fin], base_log[fin]
-                    den = float(np.sum((mv - bv) ** 2))
-                    if den > 1e-9:
-                        lam = float(np.clip(np.sum((mv - bv) * (yv - bv)) / den, 0.0, 1.0))
-                post_meta['combo_lambda'] = float(lam)
-                x0 = lam * med_log + (1.0 - lam) * base_log
+                if _pf:
+                    _Yp = np.concatenate([units[k]['y_log'] for k in _pf])
+                    _Mp = np.concatenate([units[k]['med_log'] for k in _pf])
+                    _Bp = np.concatenate([units[k]['base_log'] for k in _pf])
+                    _fin = np.isfinite(_Yp) & np.isfinite(_Mp) & np.isfinite(_Bp)
+                    if int(_fin.sum()) >= 8:
+                        _den = float(np.sum((_Mp[_fin] - _Bp[_fin]) ** 2))
+                        if _den > 1e-9:
+                            lam = float(np.clip(
+                                np.sum((_Mp[_fin] - _Bp[_fin]) * (_Yp[_fin] - _Bp[_fin])) / _den,
+                                0.0, 1.0))
+                    # v7.2 FIX: λ foi descoberto in-fold (self-fit) na v7.1 — versão
+                    # honesta (pool expanding/loo) fica ~1.0 ⇒ C4 sai da promoção.
+                    # Mantém compat de meta (tag + combo_lambda) p/ rastrear.
+                pm['combo_lambda'] = float(lam)
+                x0 = lam * u['med_log'] + (1.0 - lam) * u['base_log']
+            u['x0'] = np.asarray(x0, dtype=float)
+
+        # ---- Camada A passo 2: correções de nível (C3 slope / C6 amp / C5 bins) ----
+        for fid, u in units.items():
+            pm = u['pm']
+            _pf = _pool_fids(fid)
+            if _pf:
+                _Yp = np.concatenate([units[k]['y_log'] for k in _pf])
+                _Xp = np.concatenate([units[k]['x0'] for k in _pf])
+                _Bp = np.concatenate([units[k]['base_log'] for k in _pf])
+            else:
+                _Yp = _Xp = _Bp = np.array([], dtype=float)
+            _fin = np.isfinite(_Yp) & np.isfinite(_Xp)
             b_s = a_s = None
-            if POST_CFG.get('level_slope_correction') and level_pool:
-                X = np.concatenate([e['x_c4'] for e in level_pool])
-                Y = np.concatenate([e['y'] for e in level_pool])
-                fin = np.isfinite(X) & np.isfinite(Y)
-                if int(fin.sum()) >= 8:
-                    xbar, ybar = float(X[fin].mean()), float(Y[fin].mean())
-                    den = float(np.sum((X[fin] - xbar) ** 2))
-                    if den > 1e-9:
-                        b_s = float(np.clip(np.sum((X[fin] - xbar) * (Y[fin] - ybar)) / den,
-                                            float(POST_CFG.get('level_slope_min', 0.6)),
-                                            float(POST_CFG.get('level_slope_max', 1.5))))
-                        a_s = float(ybar - b_s * xbar)
-            post_meta['slope'] = {'a': a_s, 'b': b_s}
-            med_proc_log = (a_s + b_s * x0) if b_s is not None else x0
-            # EXP-C6: amplificação do desvio vs nível sazonal (anti-regressão à média,
-            # 1 parâmetro m por horizonte fitado nos folds anteriores):
-            #   pred'_log = base_log + m·(pred_log − base_log), m ∈ [min, max].
+            if POST_CFG.get('level_slope_correction') and len(_Xp) >= 8 and int(_fin.sum()) >= 8:
+                _xbar, _ybar = float(_Xp[_fin].mean()), float(_Yp[_fin].mean())
+                _den = float(np.sum((_Xp[_fin] - _xbar) ** 2))
+                if _den > 1e-9:
+                    b_s = float(np.clip(np.sum((_Xp[_fin] - _xbar) * (_Yp[_fin] - _ybar)) / _den,
+                                        float(POST_CFG.get('level_slope_min', 0.6)),
+                                        float(POST_CFG.get('level_slope_max', 1.5))))
+                    a_s = float(_ybar - b_s * _xbar)
+            pm['slope'] = {'a': a_s, 'b': b_s}
+            med_proc_log = (a_s + b_s * u['x0']) if b_s is not None else u['x0']
+            # EXP-C6: amplificação do desvio vs nível sazonal (1 parâmetro/fold)
             m_amp = None
             if POST_CFG.get('level_amplification'):
                 h_amp_scope = [int(v) for v in (POST_CFG.get('level_amplification_horizons') or list(range(1, 9)))]
-                if int(h) in h_amp_scope and level_pool:
-                    Dp = np.concatenate([np.asarray(e['x_c4'], float) - np.asarray(e['b'], float)
-                                         for e in level_pool])
-                    Rp = np.concatenate([np.asarray(e['y'], float) - np.asarray(e['b'], float)
-                                         for e in level_pool])
-                    fin = np.isfinite(Dp) & np.isfinite(Rp)
+                if int(h) in h_amp_scope and len(_Xp) >= 12:
+                    Dp = _Xp - _Bp
+                    Rp = _Yp - _Bp
+                    f_amp = _fin & np.isfinite(_Bp)
                     side = str(POST_CFG.get('level_amplification_side', 'both'))
                     m_max = float(POST_CFG.get('level_amplification_max', 1.5))
                     m_min = float(POST_CFG.get('level_amplification_min', 1.0))
                     if side == 'up':
-                        sel = fin & (Dp > 0)
+                        sel = f_amp & (Dp > 0)
                         if int(sel.sum()) >= 12:
                             den = float(np.sum(Dp[sel] ** 2))
                             if den > 1e-9:
                                 m_amp = float(np.clip(np.sum(Dp[sel] * Rp[sel]) / den, m_min, m_max))
                         if m_amp is not None:
-                            d_i = med_proc_log - base_log
+                            d_i = med_proc_log - u['base_log']
                             amp = np.where(d_i > 0, m_amp, 1.0)
-                            med_proc_log = base_log + amp * d_i
+                            med_proc_log = u['base_log'] + amp * d_i
                     else:
-                        if int(fin.sum()) >= 12:
-                            den = float(np.sum(Dp[fin] ** 2))
+                        if int(f_amp.sum()) >= 12:
+                            den = float(np.sum(Dp[f_amp] ** 2))
                             if den > 1e-9:
-                                m_amp = float(np.clip(np.sum(Dp[fin] * Rp[fin]) / den, m_min, m_max))
+                                m_amp = float(np.clip(np.sum(Dp[f_amp] * Rp[f_amp]) / den, m_min, m_max))
                         if m_amp is not None:
-                            med_proc_log = base_log + m_amp * (med_proc_log - base_log)
-            post_meta['level_amp'] = {'slope': m_amp,
-                                      'side': POST_CFG.get('level_amplification_side', 'both')}
-            # EXP-C5: correção por quintil de NÍVEL PREVISTO (ataca o erro condicional
-            # nos dois extremos: pico subestimado / nível baixo superestimado).
-            # g(bin) = shrink * média(y − med) em log nos folds ANTERIORES por bin.
-            bin_edges_cal = None
+                            med_proc_log = u['base_log'] + m_amp * (med_proc_log - u['base_log'])
+            pm['level_amp'] = {'slope': m_amp, 'side': POST_CFG.get('level_amplification_side', 'both')}
+            # EXP-C5: correção por quintil de nível previsto (ganho g(bin) shrink)
             if POST_CFG.get('level_bin_correction') and not POST_CFG.get('level_amplification'):
                 h_bin_scope = POST_CFG.get('level_bin_correction_horizons') or list(range(1, 9))
-                if int(h) in [int(x) for x in h_bin_scope] and level_pool:
-                    Xp = np.concatenate([e['x_c4'] for e in level_pool])
-                    Yp = np.concatenate([e['y'] for e in level_pool])
-                    fin = np.isfinite(Xp) & np.isfinite(Yp)
-                    bin_edges_cal = np.quantile(Xp[fin], [0.2, 0.4, 0.6, 0.8]) if fin.sum() >= 20 else None
-                    if bin_edges_cal is not None:
-                        nb = len(bin_edges_cal) + 1
-                        idx = np.clip(np.searchsorted(bin_edges_cal, Xp[fin]), 0, nb - 1)
-                        shrink = float(POST_CFG.get('level_bin_shrink', 0.5))
-                        nmin = int(POST_CFG.get('level_bin_nmin', 8))
-                        g = np.zeros(nb)
-                        for k in range(nb):
-                            sel = idx == k
-                            if int(sel.sum()) >= nmin:
-                                g[k] = shrink * float(np.mean(Yp[fin][sel] - Xp[fin][sel]))
-                        post_meta['level_bin_g'] = [float(v) for v in g]
-                        gilt = np.clip(np.searchsorted(bin_edges_cal, x0), 0, nb - 1)
-                        med_proc_log = x0 + g[gilt]
-                    else:
-                        post_meta['level_bin_g'] = None
+                if int(h) in [int(x) for x in h_bin_scope] and len(_Xp) >= 20:
+                    bin_e = np.quantile(_Xp[_fin], [0.2, 0.4, 0.6, 0.8])
+                    nb = len(bin_e) + 1
+                    idx = np.clip(np.searchsorted(bin_e, _Xp[_fin]), 0, nb - 1)
+                    shrink = float(POST_CFG.get('level_bin_shrink', 0.5))
+                    nmin = int(POST_CFG.get('level_bin_nmin', 8))
+                    g = np.zeros(nb)
+                    for k in range(nb):
+                        sel = idx == k
+                        if int(sel.sum()) >= nmin:
+                            g[k] = shrink * float(np.mean(_Yp[_fin][sel] - _Xp[_fin][sel]))
+                    pm['level_bin_g'] = [float(v) for v in g]
+                    gilt = np.clip(np.searchsorted(bin_e, u['x0']), 0, nb - 1)
+                    med_proc_log = u['x0'] + g[gilt]
                 else:
-                    post_meta['level_bin_g'] = None
+                    pm['level_bin_g'] = None
             # banda recentrada no novo nível (preserva a geometria do modelo)
             logs_a = {}
             for t in QUANTILES:
-                lt = np.log1p(np.clip(preds[t], 0.0, None))
+                lt = np.log1p(np.clip(u['preds'][t], 0.0, None))
                 logs_a[t] = (med_proc_log if t == 0.50
-                             else med_proc_log + (lt - med_log))
+                             else med_proc_log + (lt - u['med_log']))
             pred_post = {}
             for t in QUANTILES:
                 pred_post[t] = np.clip(np.expm1(logs_a[t]), 0.0, None)
-            # non-crossing pós-camada A (por semana)
-            for w in range(len(ses)):
+            for w in range(len(u['ses'])):
                 vals = [pred_post[t][w] for t in QUANTILES if np.isfinite(pred_post[t][w])]
                 if len(vals) == len(QUANTILES) and np.any(np.diff(vals, axis=0) < 0):
                     s_vals = sorted(vals)
                     for i, t in enumerate(QUANTILES):
                         pred_post[t][w] = s_vals[i]
+            u['logs_a'] = logs_a
+            u['pred_post'] = pred_post
 
-            # ---- Camada B: conformal fitado nas previsões PÓS-camada A anteriores ----
-            fold_conformal_prev = {}
+        # ---- Camada B: conformal CQR delta-only por fold (pool por esquema) ----
+        all_blocks = {float(t): [] for t in QUANTILES}
+        for fid in sorted(units.keys(), key=int):
+            u = units[fid]
+            for t in QUANTILES:
+                all_blocks[float(t)].append({
+                    'fold': int(fid),
+                    'test_se': [str(s).zfill(6) for s in u['ses']],
+                    'y_test_casos': [float(v) if np.isfinite(v) else float('nan') for v in u['y_true']],
+                    'y_pred_casos': [float(v) if np.isfinite(v) else float('nan') for v in u['pred_post'][t]],
+                })
+        for fid, u in units.items():
+            fold_conf = {}
             if QC_ENABLED and regime_hook is not None:
-                has_pool = any(blocks for blocks in processed_blocks.values())
-                if has_pool:
-                    pool_fs = {h: {str(tau): [dict(b) for b in blocks]
-                                   for tau, blocks in processed_blocks.items()}
-                               for h in [int(h)]}
+                _pf = _pool_fids(fid)
+                _pb = {float(t): [dict(b) for b in all_blocks[float(t)] if int(b['fold']) != int(fid)]
+                       if APPLY_SCHEME == 'loo' else
+                       [dict(b) for b in all_blocks[float(t)] if int(b['fold']) < int(fid)]
+                       for t in QUANTILES}
+                if any(_pb.values()):
+                    pool_fs = {int(h): {str(tau): blocks for tau, blocks in _pb.items()}}
                     try:
-                        fold_conformal_prev = compute_conformal(
+                        fold_conf = compute_conformal(
                             pool_fs, regime_hook,
                             half_life_years=QC['half_life_years'],
                             max_delta=QC['max_delta'],
@@ -378,13 +423,13 @@ def main():
                             use_median_shift=QC['use_median_shift']
                                 and int(h) in apply_horizons_eff)
                     except Exception as e:
-                        print(f"AVISO: conformal expanding fold {fid} falhou ({e})")
-            conf_all = fold_conformal_prev if int(h) in apply_horizons_eff else {}
+                        print(f"AVISO: conformal fold {fid} falhou ({e})")
+            conf_all = fold_conf if int(h) in apply_horizons_eff else {}
             preds_cal = {}
             for t in QUANTILES:
-                logs = np.array(logs_a[t], dtype=float)
+                logs = np.array(u['logs_a'][t], dtype=float)
                 if conf_all and regime_hook is not None:
-                    for i, se in enumerate(ses):
+                    for i, se in enumerate(u['ses']):
                         try:
                             entry = entry_for_key(conf_all, int(h), regime_hook(int(h), str(se)))
                         except Exception:
@@ -402,53 +447,88 @@ def main():
                             if np.isfinite(d):
                                 logs[i] += d
                 preds_cal[t] = np.clip(np.expm1(logs), 0.0, None)
-            # non-crossing pós-calibração (por semana)
-            for w in range(len(ses)):
+            # ---- Camada C: paridade do phantom gating (cap q95 por regime do mês-alvo) ----
+            ph_n = 0
+            if phantom_parity and int(h) not in ph_disabled and conf_all is not None:
+                if 0.95 in preds_cal and 0.5 in preds_cal:
+                    try:
+                        from data.epiweeks import epiweek_to_date as _e2d
+                        med_c = np.clip(preds_cal[0.5], 0.0, None)   # casos
+                        q95_c = np.clip(preds_cal[0.95], 0.0, None)  # casos
+                        for i, se in enumerate(u['ses']):
+                            _se = str(se).zfill(6)
+                            try:
+                                _mo = _e2d(int(_se[:4]), int(_se[4:])).month
+                            except Exception:
+                                _mo = None
+                            fac = ph_out_fac if (_mo in ph_outbreak_months) else ph_cal_fac
+                            cap_c = max(float(med_c[i]) * fac, float(med_c[i]) + 5.0)
+                            if np.isfinite(q95_c[i]) and q95_c[i] > cap_c:
+                                q95_c[i] = cap_c
+                                ph_n += 1
+                        preds_cal[0.95] = np.clip(q95_c, 0.0, None)
+                    except Exception as e:
+                        print(f"AVISO: phantom parity fold {fid} falhou ({e})")
+            # non-crossing pós-calibração/phantom (por semana)
+            # EXP-NC: nc_protect_median repaira cruzamentos com CLIP em torno da
+            #   mediana pós-A (banda nunca reatribui o slot q50 ⇒ deltas de banda
+            #   não vazam no MAE). false = sort (paridade live do inference).
+            _med_prot = np.clip(preds_cal[0.50], 0.0, None)
+            for w in range(len(u['ses'])):
                 vals = [preds_cal[t][w] for t in QUANTILES if np.isfinite(preds_cal[t][w])]
                 if len(vals) == len(QUANTILES) and np.any(np.diff(vals, axis=0) < 0):
-                    s_vals = sorted(vals)
-                    for i, t in enumerate(QUANTILES):
-                        preds_cal[t][w] = s_vals[i]
-            m = compute_all_metrics(y_true, preds_cal) if QC_ENABLED else dict(m_raw)
-            scheme = 'expanding_cqr_delta_only'
-            if post_meta.get('level_amp', {}).get('slope') is not None:
+                    if nc_protect_median:
+                        med0 = _med_prot[w]
+                        q = {t: float(preds_cal[t][w]) for t in QUANTILES}
+                        q[0.25] = min(q[0.25], med0)
+                        q[0.05] = min(q[0.05], q[0.25], med0)
+                        q[0.75] = max(q[0.75], med0)
+                        q[0.95] = max(q[0.95], q[0.75], med0)
+                        for t in QUANTILES:
+                            preds_cal[t][w] = q[t]
+                    else:
+                        s_vals = sorted(vals)
+                        for i, t in enumerate(QUANTILES):
+                            preds_cal[t][w] = s_vals[i]
+            m = compute_all_metrics(u['y_true'], preds_cal) if QC_ENABLED else dict(u['m_raw'])
+            scheme = 'expanding_cqr_delta_only' if APPLY_SCHEME != 'loo' else 'loo_cqr_delta_only'
+            if phantom_parity and int(h) not in ph_disabled:
+                scheme += '+phantom'
+            if u['pm'].get('level_amp', {}).get('slope') is not None:
                 scheme += '+level_amp'
-            elif post_meta.get('level_bin_g') is not None:
+            elif u['pm'].get('level_bin_g') is not None:
                 scheme += '+level_bin'
-            elif post_meta.get('slope', {}).get('b') is not None:
+            elif u['pm'].get('slope', {}).get('b') is not None:
                 scheme += '+level_slope'
-            if 'combo_lambda' in post_meta:
+            if 'combo_lambda' in u['pm']:
                 scheme += '+baseline_combo'
-            m['raw_uncalibrated'] = {k: m_raw.get(k) for k in
+            if nc_protect_median:
+                scheme += '+ncmed'
+            m['raw_uncalibrated'] = {k: u['m_raw'].get(k) for k in
                                      ('mae', 'rmse', 'bias', 'wape', 'wis_total', 'wis_50', 'wis_90',
                                       'width_50', 'width_90', 'coverage_50', 'coverage_90')}
             m['calibration'] = {'applied': bool(conf_all), 'scheme': scheme,
+                                'pool': APPLY_SCHEME,
+                                'phantom_applied': int(ph_n),
                                 'half_life_years': QC['half_life_years'],
                                 'apply_horizons': sorted(apply_horizons_eff),
-                                'post': {'conformal_all_horizons': bool(POST_CFG.get('conformal_all_horizons')),
+                                'post': {'validation_scheme': APPLY_SCHEME,
+                                         'conformal_all_horizons': bool(POST_CFG.get('conformal_all_horizons')),
                                          'level_slope_correction': bool(POST_CFG.get('level_slope_correction')),
                                          'level_bin_correction': bool(POST_CFG.get('level_bin_correction')),
                                          'baseline_combination': bool(POST_CFG.get('baseline_combination')),
-                                         **post_meta}}
-            m.update(baseline_metrics(y_true, b_rows))
+                                         'phantom_parity': bool(phantom_parity),
+                                         'nc_protect_median': bool(nc_protect_median),
+                                         **{k: v for k, v in u['pm'].items()}}}
+            m.update(baseline_metrics(u['y_true'], u['b_rows']))
             # Ganho vs baseline (skill): por fold, razão direta
             m['skill_mae'] = skill_score(m.get('mae'), m.get('baseline_mae'))
             m['skill_wis'] = skill_score(m.get('wis_total'), m.get('baseline_wis'))
             m['fold'] = int(fid)
             m['horizon'] = int(h)
-            m['n_weeks'] = len(ses)
-            m['stratified'] = stratified_for_fold(y_true, preds, ses)
+            m['n_weeks'] = len(u['ses'])
+            m['stratified'] = stratified_for_fold(u['y_true'], u['preds'], u['ses'])
             per_fold.append(m)
-            # ---- registra exemplos/blocos p/ os folds seguintes (fit expanding) ----
-            level_pool.append({'y': y_log, 'x_c4': np.array(x0, dtype=float),
-                               'b': np.array(base_log, dtype=float)})
-            for t in QUANTILES:
-                processed_blocks[float(t)].append({
-                    'fold': int(fid),
-                    'test_se': [str(s).zfill(6) for s in ses],
-                    'y_test_casos': [float(v) if np.isfinite(v) else float('nan') for v in y_true],
-                    'y_pred_casos': [float(v) if np.isfinite(v) else float('nan') for v in pred_post[t]],
-                })
 
         if not per_fold:
             continue

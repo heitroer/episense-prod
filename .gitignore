@@ -1,4 +1,5 @@
 # Episense Production - .gitignore
+models/_backup_stable/
 
 # Python
 __pycache__/
