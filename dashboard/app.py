@@ -1346,6 +1346,30 @@ def api_history(horizon: str = "1", window: int = 52):
         se_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["data_inicio_semana"]))
         case_map = dict(zip(df_base["SE"].astype(str).str.zfill(6), df_base["casos"]))
         base_window = df_base.sort_values("SE").tail(window)
+    # FIX (v8, relato 03/11): o gráfico histórico nunca deve cortar o INÍCIO do
+    # walk-forward. O recorte por `window` (últimas N semanas do frame live/CSV)
+    # escondia o começo do Fold 2022 (202236): com window=200 o frame live só
+    # alcançava ~202301 — as ~19 primeiras semanas do fold0 não apareciam.
+    # Quando a janela pedida começa DEPOIS do primeiro fold exibido, prepend as
+    # semanas do CSV base (o tail live é preservado integralmente).
+    try:
+        _fold_start = min(
+            (str(f["test_se"][0]).zfill(6) for f in final_folds(q_mid) if f.get("test_se")),
+            default=None,
+        )
+        if _fold_start:
+            _se_col = base_window["SE"].astype(str).str.zfill(6)
+            _starts = list(_se_col)
+            if _starts and _fold_start < _starts[0]:
+                _base_se = df_base["SE"].astype(str).str.zfill(6)
+                _pre = df_base[(_base_se >= _fold_start) & (_base_se < _starts[0])].copy()
+                if len(_pre):
+                    _pre["SE"] = _pre["SE"].astype(str).str.zfill(6)
+                    base_window = pd.concat([_pre, base_window], ignore_index=True)
+                    base_window = base_window.sort_values("SE").reset_index(drop=True)
+                    logger.info(f"api_history: janela estendida até {_fold_start} — início do Fold 2022 preservado ({len(_pre)} semanas prependidas; window={window})")
+    except Exception as e:
+        logger.info(f"api_history fold-start extension skip: {e}")
     # Stitch archive live (todos os quantis) — preenche historico além da validacao walk-forward
     # Para cada SE sem pred (gap honesto pos 202632), usa a previsao live mais recente que mirava aquela SE.
     # Ex: 202633 H1 vem de origin 202632 H1; 202634 H1 vem de origin 202633 H1 (mais recente que 202632 H2).
