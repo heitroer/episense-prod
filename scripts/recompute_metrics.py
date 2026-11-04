@@ -232,6 +232,19 @@ def main():
         PH_CFG = cfg.get('phantom_gating', {}) or {}
         phantom_parity = bool(POST_CFG.get('phantom_parity', False))
         nc_protect_median = bool(POST_CFG.get('nc_protect_median', False))
+        # EXP-Q0 (v8.1): knobs do re-forma da banda 90% em torno da mediana
+        QR_CFG = POST_CFG.get('quantile_reshape', {}) if isinstance(POST_CFG.get('quantile_reshape', {}), dict) else {}
+        QR_ENABLED = bool(QR_CFG.get('enabled', False))
+        QR = {'roll': max(1, int(QR_CFG.get('smooth_roll4_weeks', 4))),
+              'target_cov90': float(QR_CFG.get('target_cov90', 0.90)),
+              'tol_pp': float(QR_CFG.get('miss_tol_pp', 1.0)),
+              'grid_step': float(QR_CFG.get('grid_step', 0.05)),
+              'k_max': float(QR_CFG.get('k_max', 3.0)),
+              'nmin_regime': int(QR_CFG.get('pool_nmin_regime', 12))}
+        try:
+            QR['apply_horizons'] = set(int(x) for x in (QR_CFG.get('apply_horizons') or list(range(1, 9))))
+        except Exception:
+            QR['apply_horizons'] = set(range(1, 9))
         ph_disabled = set(int(x) for x in (PH_CFG.get('disabled_horizons') or []))
         ph_cal_fac = float(PH_CFG.get('calm_q95_max_factor', 1.5))
         ph_out_fac = float(PH_CFG.get('outbreak_q95_max_factor', 2.0))
@@ -394,6 +407,9 @@ def main():
             u['pred_post'] = pred_post
 
         # ---- Camada B: conformal CQR delta-only por fold (pool por esquema) ----
+        # EXP-Q0: histórico por fold (bandas pré/pós-reshape) p/ suavização e clamps
+        _qr_pc: dict = {}
+        _qr_pub: dict = {}
         all_blocks = {float(t): [] for t in QUANTILES}
         for fid in sorted(units.keys(), key=int):
             u = units[fid]
@@ -447,6 +463,112 @@ def main():
                             if np.isfinite(d):
                                 logs[i] += d
                 preds_cal[t] = np.clip(np.expm1(logs), 0.0, None)
+            # snapshot pré-reshape (pós-conformal/Camada A) p/ histórico de suavização
+            _med_l_pc = np.log1p(np.clip(preds_cal[0.50], 0.0, None))
+            _q05_l_pc = np.log1p(np.clip(preds_cal[0.05], 0.0, None))
+            _q95_l_pc = np.log1p(np.clip(preds_cal[0.95], 0.0, None))
+            _qr_pc[int(fid)] = {'med': _med_l_pc, 'q05': _q05_l_pc, 'q95': _q95_l_pc}
+            # ---- EXP-Q0 (v8.1): re-forma da banda 90% em torno da mediana ----
+            # Larguras em log1p medidas pós-conformal; trailing rollN GLOBAL (ordem
+            # SE dos folds anteriores — só passado publicado); re-centragem:
+            # q95' = med + w_hi*, q05' = med − w_lo*; clamps K(h×regime) calibrados
+            # expanding no pool de bandas PUBLICADAS dos folds anteriores (menor K
+            # da grade com miss do lado ≤ miss_raw + tol_pp/100 — no pior caso
+            # degrada a cobertura em tol_pp p.p.). Mediana intocada ⇒ MAE intocado.
+            # fold0 (sem pool): sem clamp (só suavização) — honesto expanding.
+            qr_meta = None
+            if QR_ENABLED and int(h) in QR['apply_horizons']:
+                try:
+                    _regime_of = (lambda _se: regime_hook(int(h), _se)) if regime_hook is not None else (lambda _se: 'global')
+                    # widths pré-reshape dos folds anteriores + fold atual eixo SE
+                    _hist_conf = []
+                    for _kf in sorted(_qr_pc.keys(), key=int):
+                        if int(_kf) >= int(fid):
+                            break
+                        _e = _qr_pc[_kf]
+                        _u = units[str(_kf)]
+                        for _j, _se in enumerate(_u['ses']):
+                            _hist_conf.append((float(_e['q95'][_j] - _e['med'][_j]),
+                                               float(_e['med'][_j] - _e['q05'][_j])))
+                    _n_hist = len(_hist_conf)
+                    _wh_all = pd.Series([t[0] for t in _hist_conf] + [float(v) for v in (_q95_l_pc - _med_l_pc)])
+                    _wl_all = pd.Series([t[1] for t in _hist_conf] + [float(v) for v in (_med_l_pc - _q05_l_pc)])
+                    _roll = int(QR['roll'])
+                    _minp = min(2, _roll)
+                    whi_s = _wh_all.rolling(_roll, min_periods=_minp).mean().iloc[_n_hist:].to_numpy()
+                    wlo_s = _wl_all.rolling(_roll, min_periods=_minp).mean().iloc[_n_hist:].to_numpy()
+                    whi_s = np.where(np.isfinite(whi_s), whi_s, np.maximum(_q95_l_pc - _med_l_pc, 0.0))
+                    wlo_s = np.where(np.isfinite(wlo_s), wlo_s, np.maximum(_med_l_pc - _q05_l_pc, 0.0))
+                    # caps expanding no pool de bandas PUBLISHED dos folds anteriores
+                    pool_pub = []
+                    for _kf in sorted(_qr_pub.keys(), key=int):
+                        if int(_kf) >= int(fid):
+                            break
+                        _p = _qr_pub[_kf]
+                        _u = units[str(_kf)]
+                        for _j, _se in enumerate(_u['ses']):
+                            _se = str(_se).zfill(6)
+                            _yl = float(_u['y_log'][_j])
+                            if not np.isfinite(_yl):
+                                continue
+                            pool_pub.append((_regime_of(_se), _yl, float(_p['med'][_j]),
+                                             float(_p['wh'][_j]), float(_p['wl'][_j])))
+                    caps = {}
+                    if pool_pub:
+                        _grid = np.arange(QR['grid_step'], QR['k_max'] + 1e-9, QR['grid_step'])
+                        _tol = float(QR['tol_pp']) / 100.0
+
+                        def _cap_for(_sel, _side):
+                            _yl = np.array([pool_pub[i][1] for i in _sel])
+                            _ml = np.array([pool_pub[i][2] for i in _sel])
+                            if _side == 'hi':
+                                _wv = np.array([pool_pub[i][3] for i in _sel])
+                                _raw_miss = float(np.mean(_yl > _ml + _wv))
+                            else:
+                                _wv = np.array([pool_pub[i][4] for i in _sel])
+                                _raw_miss = float(np.mean(_yl < _ml - _wv))
+                            _lim = _raw_miss + _tol
+                            for _K in _grid:
+                                _wK = np.minimum(_wv, float(_K))
+                                _miss = float(np.mean(_yl > _ml + _wK)) if _side == 'hi' \
+                                    else float(np.mean(_yl < _ml - _wK))
+                                if _miss <= _lim:
+                                    return float(_K)
+                            return None
+
+                        _reg_counts = {}
+                        for _t in pool_pub:
+                            _reg_counts[_t[0]] = _reg_counts.get(_t[0], 0) + 1
+                        for _r in ('high', 'mid', 'low'):
+                            _sel = [i for i, _t in enumerate(pool_pub) if _t[0] == _r]
+                            if len(_sel) >= QR['nmin_regime']:
+                                caps[_r] = (_cap_for(_sel, 'hi'), _cap_for(_sel, 'lo'))
+                        if not any(caps.get(_r) for _r in ('high', 'mid', 'low')):
+                            _all = list(range(len(pool_pub)))
+                            caps['global'] = (_cap_for(_all, 'hi'), _cap_for(_all, 'lo'))
+                    # aplicação: re-centragem dos bordos em torno da mediana
+                    _n_hi = _n_lo = 0
+                    for i in range(len(u['ses'])):
+                        _rg = _regime_of(str(u['ses'][i]).zfill(6))
+                        _K = caps.get(_rg) if caps.get(_rg) else caps.get('global')
+                        w_hi_i = float(whi_s[i])
+                        w_lo_i = float(wlo_s[i])
+                        if _K:
+                            if _K[0] is not None and w_hi_i > _K[0]:
+                                w_hi_i = _K[0]
+                                _n_hi += 1
+                            if _K[1] is not None and w_lo_i > _K[1]:
+                                w_lo_i = _K[1]
+                                _n_lo += 1
+                        preds_cal[0.95][i] = np.clip(np.expm1(_med_l_pc[i] + w_hi_i), 0.0, None)
+                        preds_cal[0.05][i] = np.clip(np.expm1(_med_l_pc[i] - w_lo_i), 0.0, None)
+                    qr_meta = {'enabled': True, 'roll': _roll, 'n_hi_clamped': int(_n_hi),
+                               'n_lo_clamped': int(_n_lo)}
+                    if caps:
+                        qr_meta['caps'] = {r: [None if v is None else round(float(v), 3)
+                                               for v in _t] for r, _t in caps.items()}
+                except Exception as e:
+                    print(f"AVISO: quantile_reshape fold {fid} falhou ({e})")
             # ---- Camada C: paridade do phantom gating (cap q95 por regime do mês-alvo) ----
             ph_n = 0
             if phantom_parity and int(h) not in ph_disabled and conf_all is not None:
@@ -491,6 +613,11 @@ def main():
                         for i, t in enumerate(QUANTILES):
                             preds_cal[t][w] = s_vals[i]
             m = compute_all_metrics(u['y_true'], preds_cal) if QC_ENABLED else dict(u['m_raw'])
+            if QR_ENABLED:
+                _ml_p = np.log1p(np.clip(preds_cal[0.50], 0.0, None))
+                _q05_p = np.log1p(np.clip(preds_cal[0.05], 0.0, None))
+                _q95_p = np.log1p(np.clip(preds_cal[0.95], 0.0, None))
+                _qr_pub[int(fid)] = {'med': _ml_p, 'wh': (_q95_p - _ml_p), 'wl': (_ml_p - _q05_p)}
             scheme = 'expanding_cqr_delta_only' if APPLY_SCHEME != 'loo' else 'loo_cqr_delta_only'
             if phantom_parity and int(h) not in ph_disabled:
                 scheme += '+phantom'
@@ -504,6 +631,8 @@ def main():
                 scheme += '+baseline_combo'
             if nc_protect_median:
                 scheme += '+ncmed'
+            if qr_meta:
+                scheme += '+qreshape'
             m['raw_uncalibrated'] = {k: u['m_raw'].get(k) for k in
                                      ('mae', 'rmse', 'bias', 'wape', 'wis_total', 'wis_50', 'wis_90',
                                       'width_50', 'width_90', 'coverage_50', 'coverage_90')}
@@ -520,6 +649,8 @@ def main():
                                          'phantom_parity': bool(phantom_parity),
                                          'nc_protect_median': bool(nc_protect_median),
                                          **{k: v for k, v in u['pm'].items()}}}
+            if qr_meta:
+                m['calibration']['qreshape'] = dict(qr_meta)
             m.update(baseline_metrics(u['y_true'], u['b_rows']))
             # Ganho vs baseline (skill): por fold, razão direta
             m['skill_mae'] = skill_score(m.get('mae'), m.get('baseline_mae'))

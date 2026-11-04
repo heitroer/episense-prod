@@ -402,6 +402,26 @@ postprocessing:
   # EXP-NC (v7.2, Adendo 8): repair pós-conformal median-protetor — o clip em
   # torno da mediana pós-camada A evita que deltas de BANDA reatribuam o slot
   # q50 pelo sort (vazamento banda->mediana; MAE volta a medir só o nível).
+  quantile_reshape:
+    # EXP-Q0 (v8.1, Adendo 10): re-forma da banda 90% em torno da mediana
+    # (pós-camada A/CQR, pré-NC) — q95' = expm1(log1p(q50) + w_hi*), q05' =
+    # expm1(log1p(q50) - w_lo*), mediana intocada (MAE/gate inalterados).
+    # w* = roll trailing (smooth_roll4_weeks) das larguras em log1p, histórico
+    # por SE ordenada (só passado publicado). Caps K = min largura com miss
+    # do lado <= miss_raw + tol_pp: clamp calibrado expanding no pool de bandas
+    # PUBLICADAS dos folds anteriores (por regime-base; fallback global).
+    # fold0 (sem pool): suavização sem clamp — honesto expanding.
+    # Critérios do experimento: cov90 >= 0.85 global e pior queda por fold
+    # <= 0.03; cov50 ±0.02; dWIS <= 0; W90/W50 h6-h8 6.1 -> <= 4.0;
+    # corr(q05, med) >= 0.5.
+    enabled: false
+    apply_horizons: [4, 5, 6, 7, 8]
+    smooth_roll4_weeks: 4
+    target_cov90: 0.90
+    miss_tol_pp: 1.0
+    grid_step: 0.05
+    k_max: 3.0
+    pool_nmin_regime: 12
 residual_stage2:
   # EXP-R2 (nov/2026): booster de resíduos stage-2 por horizonte, fitado SÓ com os
   # folds ANTERIORES (expanding — mesma honestidade do conformal). LGBM l2 r̂=f(X)

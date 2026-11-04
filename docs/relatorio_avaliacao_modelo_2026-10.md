@@ -888,3 +888,99 @@ Follow-ups registrados (não executados):
    com verificação de fan-out API/dashboard;
 4. smoke mode (`EPISENSE_QUICK=1`) segue quebrando em h≠1
    (`data/features.py` target_h1 hard-coded) — usar h=1.
+
+## Adendo 10 — EXP-Q0: re-forma dos quantis em torno da mediana — REPROVADO, canônico intacto (nov/2026)
+
+**Motivação.** As bandas de h4 em diante são fortemente assimétricas: W90/W50
+cresce de 3.0× (h1) para 4.3×/6.1× (h6/h8), com q05 colado no piso (~21–42
+casos constantes) e q95 varrendo até 4–12× a mediana (consequência da pinball
+independente por τ treinada no histórico todo — o q95 aprende o envelope da
+pior temporada e o q05 o piso da calmaria). Decisão do usuário: atacar pelo
+caminho barato primeiro (Q0, re-forma pós-modelo, zero retreino), deixando Q1
+(re-forma estrutural: retreinar as caudas como modelos de largura em torno da
+mediana) como passo seguinte.
+
+**Especificação.** Pós-modelo, entre o conformal CQR e o non-crossing (config
+`postprocessing.quantile_reshape`, default `enabled: false`, escopo
+`apply_horizons: [4,5,6,7,8]`): larguras em `log1p` medidas pré-reshape
+(`w_hi = log1p(q95)−log1p(q50)`, `w_lo = log1p(q50)−log1p(q05)`), suavização
+roll trailing global (`smooth_roll4_weeks: 4`; só passado publicado),
+re-centragem em torno da mediana intocada (`q95' = expm1(log1p(q50)+w_hi*`,
+`q05' = expm1(log1p(q50)−w_lo*`; non-crossing por construção; MAE intocado),
+e caps `K(h×regime-base)` calibrados **expanding** no pool de bandas
+PUBLICADAS dos folds anteriores — menor K da grade (step 0.05, máx 3.0) com
+`miss ≤ miss_raw + tol_pp/100`; fold 2022 (sem pool) fica sem clamp
+(só suavização) — honesto expanding.
+
+**Implementação.** `scripts/recompute_metrics.py`: knobs `QR_CFG`/`QR`,
+snapshots por fold (`_qr_pc` pós-camadas A/B p/ suavização; `_qr_pub` pós-NC
+p/ pool de caps), bloco reshape com calibração expanding por
+horizonte×regime (fallback global quando pool por regime < `pool_nmin_regime`),
+metadata em `m['calibration']['qreshape']` e `scheme += '+qreshape'`.
+Dois defeitos encontrados no smoke e corrigidos: KeyError int/str nos acessos
+a `units` (chaves de fold em `_qr_pc`/`_qr_pub` viram int) e
+`min_periods > rolling window` quando `smooth_roll4_weeks = 1`.
+
+**Teste NOOP (flag off): PASS** — byte-parity
+`models/validation_results.json` == `logs/metrics_v8.json` intacta.
+
+**Resultado Q0 (roll4, nmin 12): REPROVADO** (evidência
+`logs/metrics_exp_Q0.json`). Critérios pactuados vs observado:
+
+| critério | limiar | observado | veredicto |
+|---|---|---|---|
+| cov90 global | ≥ 0.85 | h4 0.82, h6 0.78, h7 0.76 | ✗ |
+| pior queda cov90 por fold | ≤ 0.03 | fold3: h4 −0.19, h6 −0.21, h7 −0.33, h8 −0.22 | ✗ |
+| cov50 | ± 0.02 | inalterada (0.47/0.38/0.43/0.37/0.39) | ✓ |
+| dWIS médio | ≤ 0 | h4 −0.46, h5 −0.42 ✓; h6 +0.32, h7 +0.32, h8 +0.06 | ✗ h6–h8 |
+| W90/W50 h6–h8 | ≤ 4.0 | h6 4.27, h7 4.12, h8 5.94 (basically raw) | ✗ |
+
+h1–h3 intocados por escopo (sanidade ✓). Mediana intocada ⇒ MAE/gate
+inalterados, como previsto.
+
+**Variação Q0b (roll=1 — sem suavização — e pool_nmin 10): também
+REPROVADA** (`logs/metrics_exp_Q0b.json`), com valor diagnóstico decisivo:
+fold0 fica **bit-idêntico** ao canônico (sem pool, sem suavização ⇒ reshape
+não atua), e o fold3 **colapsa igual** (h7 f3 0.60→0.29). A suavização não
+era a causa principal do colapso de cobertura — a re-centragem em si é.
+
+**Diagnóstico honesto (por que reprovou).**
+
+1. **Re-centrar em torno da mediana desloca os misses para o lado alto
+   exatamente onde a mediana subestima rampas.** A banda bruta assimétrica
+   é o que cobre o overshoot de pico (q95 até 12.5× med no fold3):
+   verificado no fold 2025, bias da mediana −53.9 em h8. Quando `q95' =
+   med×e^k`, o q05 sai do piso (ganho visual), mas o excedente que o
+   envelope bruto absorvia não existe mais — nos ramos de rampa o real
+   estoura `q95'`.
+2. **O contrato de calibração dos caps preserva o perfil de miss, não
+   encolhe largura.** Calibrar K com tolerância de +1 p.p. de miss no pool
+   não pode reduzir sistematicamente W90 — por construção ele guarda a
+   largura média necessária para ~90% no pool. Por isso W90/W50 fica
+   ~inalterado em h6–h8 e o reshape apenas recoloca a mesma largura ao redor
+   da mediana (o que quebra exatamente os regimes em que a assimetria era
+   carregada).
+3. **Shift de regime entre pool e fold-teste mata o contrato expanding.**
+   Fold3 (temporada 2025-26) perde cobertura mesmo com caps calibrados nos
+   folds 0–2 — a distribuição de miss/med do teste não é a do pool.
+
+**Veredicto final: EXP-Q0 e Q0b reprovados sob os critérios pactuados.
+Restore executado** (flag default off, knobs roll4/nmin12): recompute canônico
+com byte-parity confirmada (`fc27dd7649c716f00d5093edb525ffca`; CSV
+`f53dba6165e49796468fd98e2c8c3f65`), idêntica ao estado pré-experimento.
+O código e o bloco de config **permanecem no repo com default `enabled:
+false`** (mesmo precedente das camadas experimentais dos adendos anteriores:
+flag ativada só para rodar o experimento, código/estrutura permanecentes),
+prontos para reavaliação. Incremento único permanente: os snapshots
+`_qr_pc`/`_qr_pub` e metadata no recompute (só-de-leitura).
+
+**Caminhos seguintes para "quantis estáveis perto da mediana"** (decisão do
+usuário pendente): (a) **Q1 estrutural** — retreinar as caudas como modelos
+de largura condicional `u = log1p(y) − log1p(med)` (q95 = med + u₉₅; banda
+matematicamente "forma da mediana"; ~25 min de retreino, autorizado); (b)
+**conformal-width** para h4–h8 — substituir `w` pelo quantil de miss do pool
+por (h×regime) (dirigido à largura-objeto, mais agressivo que o clamp
+tolerância, mesmo risco expanding do fold3); (c) reduzir W90/W50 naturalmente
+via Q2 (regularização específica das caudas τ=0.05/0.95 no retreino do
+ciclo v8.3). Recomendação: isolar o Q1 como próximo experimento — é o único
+que muda o mecanismo em vez de re-arranjar o resultado.
