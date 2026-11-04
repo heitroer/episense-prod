@@ -857,8 +857,16 @@ regressão de fold + gate PASS + vitória expressiva no horizonte-alvo.
   (826, 699) idêntica à de treino; features ausentes **ZERO** nos subsets
   h1/h2/h4/h8 (fase presente em h2, Rt em h4/h8); `predict()` emite os 8
   horizontes com non-crossing e conformal/phantom intocados.
-- **Restart dos containers pendente** (dashboard/API carregam pkls no
-  boot; caminho live re-deriva features com o config v8).
+- **Restart dos containers executado em 03/11** (`docker restart
+  episense-prod-api episense-dashboard`; ambos volume-mountam `models/` e
+  `config/`). Verificação pós-restart: logs do engineer live com
+  `expand_phase` carregado e ausência de paridade de features (os warnings
+  de clima — `casos_rate`/`tempmin` — são pré-existentes, datados de
+  01/11, degradação de dados live sem relação com a promoção);
+  `/api/forecast?origin_se=202643` e `/health`/respondem 200.
+  **Procedimento permanente**: toda alteração de artefatos/config em
+  `models/` ou `config/` exige restart dos dois containers + verificação
+  (health 200, flags novos nos logs, endpoints de predição).
 
 ### Estado v8 (canônico) e follow-ups
 
