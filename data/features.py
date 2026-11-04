@@ -64,6 +64,7 @@ class EpisenseFeatureEngineer:
         self.expand_outbreak = bool(self.config.get('features', {}).get('expand_outbreak', False))
         self.expand_regime_conditional = bool(self.config.get('features', {}).get('expand_regime_conditional', False))
         self.expand_peak_timing = bool(self.config.get('features', {}).get('expand_peak_timing', False))
+        self.expand_phase = bool(self.config.get('features', {}).get('expand_phase', False))
         self.expand_rt = bool(self.config.get('features', {}).get('expand_rt', False))
         self.outbreak_threshold = self.config.get('metrics', {}).get('classification_thresholds', {}).get('outbreak_threshold', 50)
         self.outbreak_thresholds = [self.outbreak_threshold, self.outbreak_threshold * 2, self.outbreak_threshold * 4]
@@ -748,6 +749,53 @@ class EpisenseFeatureEngineer:
         return df
 
     # ------------------------------------------------------------------
+    # NOVO v8: fase do ciclo MULTI-ANUAL (escala de temporada agregada)
+    # ------------------------------------------------------------------
+    def create_phase_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """EXP-F1 (v8): fase do ciclo multi-anual — sinais de ESCALA DE TEMPORADA.
+
+        Espaço não coberto pelas famílias existentes: YoY/YTD/peak-timing
+        avaliam a SEMANA corrente (ou o ano corrente à evento intra-temporada);
+        os agregados aqui medem "a temporada INTEIRA está quantas vezes maior
+        que as anteriores" — pin do ciclo de 2-4 anos da dengue (EXP-F0:
+        amp separa fold0 +16.4 vs fold3 −26.0; corr(resid) fold0 0.30 h4).
+
+        Todas as features derivam de somas em log1p com alinhamento por
+        SHIFT de linhas SE (mesma convenção 52/104/156 da climatologia) e
+        ganham shift(1) no bloco (só passado explícito).
+        """
+        df = df.copy()
+        if 'log_casos' not in df.columns:
+            return df
+
+        # casos_ytd por ano epidemiológico (mesma construção da família
+        # expand_seasonal: cumsum por parte-ano do SE)
+        if 'casos' in df.columns and ('casos_ytd' not in df.columns):
+            _ano = df['SE'].astype(str).str[:4]
+            df['casos_ytd'] = df.groupby(_ano)['casos'].cumsum()
+
+        # YTD em log + climatologia do YTD (mesma semana do ciclo, 3 anos)
+        df['phase_ytd_log'] = np.log1p(df['casos_ytd'].clip(lower=0.0)) if 'casos_ytd' in df.columns else np.nan
+        clim_cols = [df['phase_ytd_log'].shift(k) for k in (52, 104, 156) if len(df) > k]
+        if clim_cols:
+            df['phase_ytd_ratio_clim'] = df['phase_ytd_log'] - pd.concat(clim_cols, axis=1).mean(axis=1)
+
+        # Run-rate anual (soma 52w) vs baseline 3 anos (somas 52w dos anos -1/-2/-3)
+        c52 = df['log_casos'].rolling(52, min_periods=26).sum()
+        df['phase_amp_annual'] = c52 - pd.concat(
+            [c52.shift(k) for k in (52, 104, 156) if len(df) > k], axis=1).mean(axis=1)
+        # z da amplitude (dispersão desses 3 anos como escala)
+        c52_stack = pd.concat([c52.shift(k) for k in (52, 104, 156) if len(df) > k], axis=1)
+        df['phase_amp_annual_z'] = df['phase_amp_annual'] / (c52_stack.std(axis=1) + 0.5)
+        # suavização 4 semanas (impulso de semana única fora)
+        df['phase_amp_annual_roll4'] = df['phase_amp_annual'].rolling(4, min_periods=2).mean()
+
+        phase_cols = [c for c in df.columns if c.startswith('phase_')]
+        df[phase_cols] = df[phase_cols].shift(1)  # honestidade: só passado
+        logger.info(f"expand_phase: {len(phase_cols)} features de fase multi-anual adicionadas")
+        return df
+
+    # ------------------------------------------------------------------
     def select_features(self, df: pd.DataFrame, target_col: str = 'target',
                         exclude_cols: List[str] = None, all_horizons: List[int] = None) -> Tuple[pd.DataFrame, List[str]]:
         df = df.copy()
@@ -925,6 +973,11 @@ class EpisenseFeatureEngineer:
         # ============================================================
         if self.expand_rt:
             df = self.create_rt_features(df)
+        # ============================================================
+        # EXPANSAO 10 (expand_phase - v8): fase do ciclo multi-anual
+        # ============================================================
+        if self.expand_phase:
+            df = self.create_phase_features(df)
 
         if legacy_mode or convention == 'legacy':
             logger.warning("legacy_mode nao suportado no modo EXP (use convention='advanced')")

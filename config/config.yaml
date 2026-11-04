@@ -94,6 +94,9 @@ features:
   expand_outbreak: true
   expand_regime_conditional: true
   expand_peak_timing: true
+  expand_phase: true
+  # EXP-F1 (v8): fase do ciclo multi-anual (run-rate anual vs 3 anos, YTD vs
+  # climatologia do YTD). Honestidade: shift(1) no bloco (só passado).
 targets:
   horizons:
   - 1
@@ -190,6 +193,13 @@ training:
       - trend_vs_clim_8          # tendência vs climatologia 8 semanas
       - log_casos_vs_ewma_8      # posição vs EWMA 8s (proxy R efetiva)
       - casos_ytd_rate           # ritmo de acumulação (semana do ano)
+      # EXP-F1 (v8, Adendo): fase multi-anual — correm risco de não entrar pelo
+      # top-K de ganho (colineares com yoy/clim); guardadas para o teste do sinal.
+      - phase_ytd_log
+      - phase_ytd_ratio_clim
+      - phase_amp_annual
+      - phase_amp_annual_z
+      - phase_amp_annual_roll4
     expand_extra: false
     threshold_per_quantile:
       0.05: 0.005
@@ -234,6 +244,16 @@ training:
       "5": ["rt_", "p_rt1_"]
       "6": ["rt_", "p_rt1_"]
       "7": ["rt_", "p_rt1_"]
+      # EXP-F1c (v8): fase multi-anual só onde transferiu — h2 uníssono nos 4
+      # folds (−16.3/−4.2/−0.5/−0.7); h4 regressa em todos (ban), h3 só no
+      # fold0, h1/h5–h8 neutros (ban p/ minimizar divergência do canônico).
+      "1": ["phase_"]
+      "3": ["phase_"]
+      "4": ["phase_"]
+      "5": ["rt_", "p_rt1_", "phase_"]
+      "6": ["rt_", "p_rt1_", "phase_"]
+      "7": ["rt_", "p_rt1_", "phase_"]
+      "8": ["phase_"]
   temporal_weighting:
     enabled: true
     half_life_years: 3.5

@@ -726,3 +726,157 @@ regressão quantílica por fase temporária, e live-path da camada A.
 
 **MAE médio 69.56 → 69.03; skill médio +48.3% → +48.7%.** Gate de deployment
 intocado (P7 é retreino; sem retreino nesta fase).
+
+---
+
+## Adendo 9 — v8: features de fase multi-anual, bug de white-list e promoção do retreino F1c (nov/2026)
+
+Caminho estrutural declarado no Adendo 8 ("caminho = v8: features de fase").
+ executado em 02–03/nov/2026: um experimento exploratório (F0), 4 retreinos
+completos (F1, F1b, F1b2, F1c — 8 horizontes × 2 seeds × 5 quantis cada) e
+promoção do F1c à produção. Um bug pré-existente no caminho de features foi
+descoberto e corrigido no percurso.
+
+### EXP-F0 — existência do sinal (sem treino)
+
+Correlação entre agregados de escala de temporada e o resíduo do canônico
+v7.2, por fold: o preditor "run-rate anual (soma 52w) vs climatologia 3
+anos" separa as temporadas com força (fold0 **+16.4** vs fold3 **−26.0**
+em unidades de log) e correlaciona com o resíduo do fold0 (r=0.30 em h4;
+r=0.70 no fold3). O sinal de "temporada recorde do ciclo" não era
+representável pelo espaço existente: YoY/YTD/peak-timing/climatologia-3y
+avaliam a semana corrente ou o ano corrente — nenhum mede a temporada
+INTEIRA contra o ciclo de 2–4 anos da dengue.
+
+### Implementação — EXPANSAO 10 (`expand_phase`)
+
+`data/features.py`: `create_phase_features` — 5 features, todas
+`shift(1)` no bloco (só passado explícito), alinhadas pela convenção
+52/104/156 já usada na climatologia:
+
+- `phase_ytd_log` — log do acumulado do ano epidemiológico corrente;
+- `phase_ytd_ratio_clim` — log(YTD) − média do log(YTD) da mesma semana do ciclo nos 3 anos anteriores;
+- `phase_amp_annual` — soma móvel 52w − média das 3 somas defasadas (run-rate anual vs baseline 3 anos);
+- `phase_amp_annual_z` — idem normalizado pela dispersão dos 3 anos;
+- `phase_amp_annual_roll4` — suavização 4 semanas.
+
+Verificação de honestidade: construção refeita a partir dos dados
+brutos numa semana do fim da série — diferença **0.000000** vs a feature
+produzida pelo engineer. Matriz de treino (825, 694) → (825, 699);
+684 → 689 features. Config: `features.expand_phase` (default `false`;
+`true` no treino v8/promovido).
+
+### Bug descoberto — white-list descartava flags novas (EXP-F1 e EXP-F1b INVÁLIDOS)
+
+`scripts/train.py::prepare_data` montava o dict de flags de feature
+engineering por **white-list hard-coded** (`expand_extra`…`expand_rt`).
+Qualquer flag nova era descartada **silenciosamente**: F1 e F1b rodaram
+com a matriz do v6d (694 colunas) e **zero** splits de `phase_*` em todos
+os 200 boosters de cada run (verificado por `feature_importance`). Os
+ΔMAE medidos nesses dois runs (±3 no agregado) são ruído de retreino
+não-bitwise do LGBM (mesmo subset+seed ⇒ mesmo modelo; a diferença vem
+da realocação de ranking do pool de importância). Arquivados como
+referência de ruído: `logs/metrics_exp_F1.json` (F1b nem chegou ao
+recompute — descartado no scan de ganho).
+
+**FIX** (`scripts/train.py`): pass-through dinâmico de todas as chaves
+`features.expand_*` do config (com o caso especial `expand_extra` de
+`training.feature_selection` preservado) + log do conjunto de flags no
+início do treino. Qualquer flag futura passa a funcionar sem editar o
+train.py.
+
+**O MESMO white-list existia no caminho live** (`models/inference.py::
+prepare_inference_features`) — e já omitia `expand_rt`: o caminho
+histórico do dashboard vinha preenchendo as 10 features Rt com 0
+(silencioso: o fallback só falha acima de 50% de features ausentes).
+Corrigido com o mesmo pass-through dinâmico. Sem este fix, o F1c
+promovido deixaria o h2 histórico também com as 5 features de fase em 0.
+
+### EXP-F1b2 — fase em todos os horizontes (diagnóstico)
+
+Com o fix, features de fase dividem em todos os horizontes (~3–6% de
+ganho por booster, todos os 125 com splits). Resultado global: MAE médio
+69.91 (pior que v7.2), WIS 23.91 — mas o recorte por horizonte é
+cirúrgico:
+
+- **h2 melhora unissonamente nos 4 folds**: 49.87 (−5.43); fold0
+  108.7 → 92.4 (−16.3, bias −93 → −75), fold1 −4.2, fold2 −0.5, fold3 −0.7;
+- **h4 piora sistematicamente** nos 4 folds (+2.4/+7.3/+3.6/+2.7);
+- h3 piora só no fold0 (+20.9, bias −112); h1/h5–h8 ~neutros.
+
+Interpretação honesta: o sinal de fase é sequencial (2 semanas) e
+transferível; sua leitura em horizontes ≥3 depende do pool de calibração
+que o fold0 não tem (Adendo 8). Precedente já estabelecido no repositório
+(Adendo 4, família Rt): ban seletivo por horizonte.
+
+### EXP-F1c — fase somente no h2 (APROVADO)
+
+`banned_features_per_horizon` v8: `"1"/"3"/"4"/"8": ["phase_"]`;
+`"5"/"6"/"7": ["rt_", "p_rt1_", "phase_"]` (h2 mantém o ban Rt
+existente). As 5 permanecem em `always_keep` (sobrevivem ao corte top-K
+por ganho, que as descartaria — experimentado em F1).
+
+Tabela canônica (MAE; as-is v6d / v7.2 / F1c):
+
+| h | as-is | v7.2 | F1c | Δ vs v7.2 |
+|---|---|---|---|---|
+| 1 | 37.97 | 38.10 | 37.26 | −0.84 |
+| 2 | 54.79 | 55.29 | **49.87** | **−5.43** |
+| 3 | 60.66 | 58.99 | 60.07 | +1.08 |
+| 4 | 66.47 | 64.34 | 64.85 | +0.50 |
+| 5 | 74.43 | 73.37 | 71.20 | −2.17 |
+| 6 | 79.66 | 79.66 | 79.90 | +0.24 |
+| 7 | 89.83 | 89.83 | 85.64 | −4.19 |
+| 8 | 92.69 | 92.69 | 95.80 | +3.11 |
+
+**MAE médio 69.56 → 69.03 → 68.07; skill médio 48.3% → 48.7% → 49.5%;
+WIS 23.58 → 23.53.** Gate PASS (pior razão fold/baseline 0.88 em h7,
+limite 1.35). Por fold: f0 **133.26 → 130.07 (−3.19)**, f1 −0.28, f2
+−0.01, f3 −0.62 — todos os folds melhoram, nenhum paga. Fold0: h2
+−16.3, h7 −14.2 (cov50 0.13 → 0.21), h1 −4.9, h4 −6.1.
+
+Honestidade: nos horizontes 1, 3–8 a fase está banida — os Δ desses
+horizontes são de **realocação de ranking** do pool de importância (efeito
+do retreino, não das features). h2 do F1c é bit-idêntico ao do F1b2
+(same subset+seed ⇒ mesmo modelo). Critério de aceitação: nenhuma
+regressão de fold + gate PASS + vitória expressiva no horizonte-alvo.
+
+### Promoção à produção (03/11/2026)
+
+- `models_v8phase4/` → `models/` copiado integralmente (200 pkls +
+  `feature_list.json`, `normalization_params.json`, `quantile_conformal.json`,
+  `deployment_gate.json`, `validation_predictions.json`,
+  `validation_results.json`; md5 conferido em amostras). Backup v6d
+  intacto em `models/_backup_stable/` (210 artefatos). Restos inertes do
+  v6d (`quantile_recalibration*.json` — `enabled: false`,
+  `fold_surto_summary.json` — sem leitor no código) permanecem em paz.
+- Recompute canônico regenerado com as predições validadas do F1c:
+  **`models/validation_results.json` com byte-parity contra
+  `logs/metrics_v8.json`** (nova referência canônica).
+- Smoke de paridade live (com o fix do `inference.py`): matriz
+  (826, 699) idêntica à de treino; features ausentes **ZERO** nos subsets
+  h1/h2/h4/h8 (fase presente em h2, Rt em h4/h8); `predict()` emite os 8
+  horizontes com non-crossing e conformal/phantom intocados.
+- **Restart dos containers pendente** (dashboard/API carregam pkls no
+  boot; caminho live re-deriva features com o config v8).
+
+### Estado v8 (canônico) e follow-ups
+
+Artefatos de evidência: `logs/metrics_v8.json` (canônico),
+`logs/metrics_v72base.json` (v7.2 anterior),
+`logs/metrics_exp_{F1,F1b2,F1c}.json`, logs de treino
+`logs/exp_F1*_train_20261102.log`, gate em `models/deployment_gate.json`.
+
+Follow-ups registrados (não executados):
+
+1. **fold 2022-23 residual**: bias da mediana −50..−155 em h3–h6 mantém
+   (sem pool de calibração expanding); candidatos: floor do q05
+   espelhando o cap do phantom, live-path da camada A (Adendo 8);
+2. **fase em h3** requer mecanismo de pool por fase (v8.3; sem pool, o
+   sinal anda a favor e contra — ver F1b2);
+3. **`protect_median` live**: método implementado em
+   `models/inference.py::_apply_non_crossing` (config-gated via
+   `non_crossing.method`, default continua `post_process`); flip live só
+   com verificação de fan-out API/dashboard;
+4. smoke mode (`EPISENSE_QUICK=1`) segue quebrando em h≠1
+   (`data/features.py` target_h1 hard-coded) — usar h=1.

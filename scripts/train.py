@@ -291,19 +291,19 @@ class EpisenseTrainer:
     # ------------------------------------------------------------------
     def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         logger.info("Running feature engineering...")
+        # v8 FIX (EXP-F1/F1b): o fe_cfg era white-list hard-coded — qualquer flag
+        # nova (ex.: expand_phase) era silenciosamente descartada, e o treino
+        # rodava com a matriz antiga sem erro aparente. Agora todas as chaves
+        # features.expand_* do config passam dinâmico; expand_extra mantém o
+        # case especial (lido de training.feature_selection.expand_extra).
+        _feat_cfg = self.config.get('features', {}) or {}
         fe_cfg = {
             'features': {
+                **{k: bool(v) for k, v in _feat_cfg.items() if str(k).startswith('expand_')},
                 'expand_extra': bool(self.config.get('training', {}).get('feature_selection', {}).get('expand_extra', False)),
-                'expand_seasonal': bool(self.config.get('features', {}).get('expand_seasonal', True)),
-                'expand_weather_long': bool(self.config.get('features', {}).get('expand_weather_long', True)),
-                'expand_climatology': bool(self.config.get('features', {}).get('expand_climatology', True)),
-                'expand_trend': bool(self.config.get('features', {}).get('expand_trend', True)),
-                'expand_outbreak': bool(self.config.get('features', {}).get('expand_outbreak', True)),
-                'expand_regime_conditional': bool(self.config.get('features', {}).get('expand_regime_conditional', True)),
-                'expand_peak_timing': bool(self.config.get('features', {}).get('expand_peak_timing', True)),
-                'expand_rt': bool(self.config.get('features', {}).get('expand_rt', False)),
             }
         }
+        logger.info(f"Feature flags: {fe_cfg['features']}")
         fe = EpisenseFeatureEngineer(fe_cfg)
         df_featured = fe.run_full_feature_engineering(
             df, convention='advanced', target_horizons=self.target_horizons, legacy_mode=False

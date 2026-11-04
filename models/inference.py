@@ -254,21 +254,17 @@ class EpisenseInference:
                 return df
     
             # Run full feature engineering with the SAME config as training
-            # Training uses: expand_extra=False, expand_seasonal=True, expand_weather_long=True,
-            # expand_climatology=True, expand_trend=True, expand_outbreak=True, legacy_mode=False
             # CRITICAL: Must use ALL target_horizons (1-8) to match training feature engineering,
             # since training creates horizon-specific features for ALL horizons before selection.
+            # v8 FIX: fe_cfg era white-list hard-coded (sem expand_rt/expand_phase) - features
+            # ausentes eram preenchidas com 0 em _select_horizon_features (degradação silenciosa
+            # do caminho histórico). Pass-through dinâmico idêntico ao fix do train.py.
             from data.features import EpisenseFeatureEngineer
+            _feat_cfg = self.config.get('features', {}) or {}
             fe_cfg = {
                 'features': {
+                    **{k: bool(v) for k, v in _feat_cfg.items() if str(k).startswith('expand_')},
                     'expand_extra': self.config.get('training', {}).get('feature_selection', {}).get('expand_extra', False),
-                    'expand_seasonal': self.config.get('features', {}).get('expand_seasonal', True),
-                    'expand_weather_long': self.config.get('features', {}).get('expand_weather_long', True),
-                    'expand_climatology': self.config.get('features', {}).get('expand_climatology', True),
-                    'expand_trend': self.config.get('features', {}).get('expand_trend', True),
-                    'expand_outbreak': self.config.get('features', {}).get('expand_outbreak', True),
-                    'expand_regime_conditional': self.config.get('features', {}).get('expand_regime_conditional', True),
-                    'expand_peak_timing': self.config.get('features', {}).get('expand_peak_timing', True),
                 }
             }
             fe = EpisenseFeatureEngineer(fe_cfg)
@@ -780,7 +776,7 @@ class EpisenseInference:
 
     def _apply_non_crossing(self, predictions: Dict[int, Dict[float, np.ndarray]]) -> Dict[int, Dict[float, np.ndarray]]:
         """Apply non-crossing constraint to quantile predictions.
-        
+
         Ensures Q0.05 <= Q0.50 <= Q0.95 for all horizons and samples.
         Uses np.sort along quantile axis for strict monotonicity.
         """
@@ -798,6 +794,30 @@ class EpisenseInference:
                 # Write back
                 for i, tau in enumerate(sorted_taus):
                     predictions[horizon][tau] = q_preds[:, i]
+        elif self.non_crossing_method == 'protect_median':
+            # EXP-NC (v7.2, Adendo 8): clip da banda em torno da mediana.
+            # Garante monotonicidade SEM reatribuir o slot q50 pelo sort —
+            # deltas de banda (recal) nunca reescrevem a mediana. Option-in
+            # via config non_crossing.method (default continua 'post_process').
+            for horizon in list(predictions.keys()):
+                sorted_taus = sorted(self.quantiles)
+                if any(tau not in predictions[horizon] or predictions[horizon][tau] is None or getattr(predictions[horizon][tau], 'size', 0) == 0 for tau in sorted_taus):
+                    logger.warning(f"h{horizon}: pulando non-crossing (protect_median) - algum quantil vazio")
+                    continue
+                med = np.asarray(predictions[horizon][0.50], dtype=float).copy()
+                q05 = np.asarray(predictions[horizon][0.05], dtype=float)
+                q25 = np.asarray(predictions[horizon][0.25], dtype=float)
+                q75 = np.asarray(predictions[horizon][0.75], dtype=float)
+                q95 = np.asarray(predictions[horizon][0.95], dtype=float)
+                q25 = np.minimum(q25, med)
+                q05 = np.minimum(np.minimum(q05, q25), med)
+                q75 = np.maximum(q75, med)
+                q95 = np.maximum(np.maximum(q95, q75), med)
+                predictions[horizon][0.05] = q05
+                predictions[horizon][0.25] = q25
+                predictions[horizon][0.75] = q75
+                predictions[horizon][0.95] = q95
+                predictions[horizon][0.50] = med
         return predictions
 
     def predict_single_row(self, row: pd.Series) -> Dict[int, float]:
