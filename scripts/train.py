@@ -262,6 +262,12 @@ class EpisenseTrainer:
         self.ensemble_seeds = config.get('model', {}).get('ensemble', {}).get('seeds', [42, 123, 456, 789, 999])
         self.target_horizons = config.get('targets', {}).get('horizons', [1, 2, 3, 4, 5, 6, 7, 8])
         self.quantiles = config.get('quantiles', [0.05, 0.50, 0.95])
+        # EXP-Q1: caudas como modelos de largura ao redor da mediana (default absolute)
+        _qw_cfg = config.get('quantile_width', {}) if isinstance(config.get('quantile_width', {}), dict) else {}
+        self.width_mode = str(_qw_cfg.get('mode', 'absolute') or 'absolute')
+        self.width_inner = _qw_cfg.get('inner', {}) if isinstance(_qw_cfg.get('inner', {}), dict) else {}
+        self.width_min_pool = int(_qw_cfg.get('min_pool_rows', 60))
+        self.width_clip = float(_qw_cfg.get('clip_u', 5.0))
         self.wf_config = config.get('training', {}).get('walk_forward', {})
         self.epi_periods = config.get('epidemiological_periods', {
             'outbreak_months': [10, 11, 12, 1, 2, 3, 4, 5],
@@ -946,6 +952,212 @@ class EpisenseTrainer:
                     'se_train_all': se_train_all,
                 }
 
+        # ------------------------------------------------------------------
+        # Q1 (quantile_width.mode = 'around_median'): caudas como modelos de
+        # largura em torno da mediana. u = log1p(y) − log1p(med_ref_s).
+        # Pool honesto expanding por fold: inner-holdout histórico + semanas
+        # validadas dos folds anteriores (cutoff do walk preservado).
+        # ------------------------------------------------------------------
+        width_active = self.width_mode == 'around_median'
+        width_pieces: Dict[int, List[Dict[str, Any]]] = {}
+        fold_se_map: Dict[int, Dict[str, int]] = {}
+        fold_frame_meta: Dict[int, Dict[str, Any]] = {}
+        _inner_cache: Dict[Any, Any] = {}
+        inner_rows_ready = False
+        if width_active:
+            for fold_idx, prep in fold_prep.items():
+                _se_k = [str(s).zfill(6) for s in np.concatenate([prep['se_tr_base'], prep['se_val']])]
+                _Xt_k = pd.concat([prep['X_tr'], prep['X_val']], axis=0, ignore_index=True)
+                _y_k = np.concatenate([np.asarray(prep['y_tr'], dtype=float),
+                                       np.asarray(prep['y_val'], dtype=float)])
+                if len(_Xt_k) != len(_se_k) or len(_y_k) != len(_se_k):
+                    logger.warning(f"  h{horizon} Q1: frame do fold {fold_idx} desalinhado — width OFF "
+                                   f"(X {len(_Xt_k)} | se {len(_se_k)} | y {len(_y_k)} | "
+                                   f"X_tr {len(prep['X_tr'])} | X_val {len(prep['X_val'])} | "
+                                   f"se_tr {len(prep['se_tr_base'])} | se_val {len(prep['se_val'])})")
+                    width_active = False
+                    break
+                fold_frame_meta[fold_idx] = {'X': _Xt_k, 'se': _se_k,
+                                             'y': _y_k,
+                                             'cutoff': max(_se_k)}
+                fold_se_map[fold_idx] = {s: i for i, s in enumerate([str(x).zfill(6) for x in prep['test_se']])}
+        if width_active:
+            # inner-holdout: histórico anterior a todos os folds (med_ref honesto
+            # por modelo-seed treinado até inner.train_max_se)
+            _it_max = str(self.width_inner.get('train_max_se', '202035'))
+            _ho_min = str(self.width_inner.get('holdout_min_se', '202036'))
+            _ho_max = str(self.width_inner.get('holdout_max_se', '202227'))
+            _p0 = fold_frame_meta[0]
+            _inner_train_se = sorted(s for s in _p0['se'] if s <= _it_max)
+            _inner_holdout_se = sorted(s for s in _p0['se'] if _ho_min <= s <= _ho_max)
+            if len(_inner_train_se) < 40 or len(_inner_holdout_se) < 30:
+                logger.warning(f"  h{horizon} Q1: inner split pequeno (train {len(_inner_train_se)}, holdout {len(_inner_holdout_se)}) — width OFF")
+                width_active = False
+            else:
+                inner_rows_ready = True
+                self._q1_inner_split = {'train': _inner_train_se, 'holdout': _inner_holdout_se}
+                for fold_idx, prep in fold_prep.items():
+                    cutoff = fold_frame_meta[fold_idx]['cutoff']
+                    pieces = [{'kind': 'inner', 'fold': None,
+                               'se_list': [s for s in _inner_holdout_se if s <= cutoff],
+                               'med_by_seed': {}}]
+                    for j in sorted(fold_prep.keys()):
+                        if int(j) >= int(fold_idx):
+                            break
+                        _se_j = [str(s).zfill(6) for s in fold_prep[j]['test_se']]
+                        _keep = [s for s in _se_j if s <= cutoff]
+                        if _keep:
+                            pieces.append({'kind': 'vp', 'fold': int(j), 'se_list': _keep, 'med_by_seed': {}})
+                    n_rows = sum(len(p['se_list']) for p in pieces)
+                    logger.info(f"  h{horizon} Q1 fold {fold_idx}: pool {n_rows} linhas (inner {len(pieces[0]['se_list'])} + vp {n_rows - len(pieces[0]['se_list'])})")
+                    if n_rows < self.width_min_pool:
+                        logger.warning(f"  h{horizon} Q1 fold {fold_idx}: pool < min ({n_rows} < {self.width_min_pool}) — caudas absolutas neste fold")
+                        width_pieces[fold_idx] = None
+                    else:
+                        width_pieces[fold_idx] = pieces
+
+        def _pool_frame(fold_idx, wanted_ses):
+            """Linhas do frame de treino do fold_idx na ordem pedida (só as presentes)."""
+            meta = fold_frame_meta[int(fold_idx)]
+            _pos = {s: i for i, s in enumerate(meta['se'])}
+            _idx = [_pos[str(s).zfill(6)] for s in wanted_ses if str(s).zfill(6) in _pos]
+            if not _idx:
+                return None, None, None
+            X_sel = meta['X'].iloc[_idx].copy()
+            y_sel = meta['y'][_idx].copy()
+            se_sel = np.array([meta['se'][i] for i in _idx])
+            return X_sel, y_sel, se_sel
+
+        def _ensure_inner_med(seed):
+            """Mediana de referência para o inner-holdout (out-of-sample por seed)."""
+            if seed in _inner_cache:
+                return _inner_cache[seed]
+            _p0 = fold_prep[0]
+            _cols = _p0['per_tau_cols'][0.5] if (separate_mode and 'per_tau_cols' in _p0) else list(fold_frame_meta[0]['X'].columns)
+            X_it, y_it, se_it = _pool_frame(0, self._q1_inner_split['train'])
+            _n = len(X_it)
+            _v = max(8, int(_n * 0.2))
+            X_tr_i = X_it.iloc[:_n - _v][_cols].reset_index(drop=True)
+            X_val_i = X_it.iloc[_n - _v:][_cols].reset_index(drop=True)
+            y_tr_i = y_it[:_n - _v]
+            y_val_i = y_it[_n - _v:]
+            m_i = self.train_single_model(X_tr_i, pd.Series(y_tr_i), X_val_i, pd.Series(y_val_i),
+                                          seed, horizon, 0.5,
+                                          se_tr=se_it[:_n - _v], se_val=se_it[_n - _v:])
+            X_ho, _, se_ho = _pool_frame(0, self._q1_inner_split['holdout'])
+            _ref = m_i.predict(X_ho[_cols], num_iteration=max(m_i.best_iteration, 1))
+            _map = {str(s).zfill(6): float(v) for s, v in zip(se_ho, _ref)}
+            _inner_cache[seed] = _map
+            return _map
+
+        def _width_pool(fold_idx, seed, pieces, full_mode=False, cutoff=None):
+            """Agrega o pool (X todos os cols, y_log, se, med_ref por linha)."""
+            _ses, _meds = [], []
+            for p in pieces:
+                if p['kind'] == 'vp':
+                    j = int(p['fold'])
+                    if seed not in p['med_by_seed']:
+                        _arr = np.asarray(fold_predictions[j][0.5][seed], dtype=float)
+                        p['med_by_seed'][seed] = np.asarray(
+                            [_arr[fold_se_map[j][str(s).zfill(6)]] for s in p['se_list']], dtype=float)
+                    _ses += list(p['se_list'])
+                    _meds += list(p['med_by_seed'][seed])
+                else:
+                    _m_map = _ensure_inner_med(seed)
+                    _ses += list(p['se_list'])
+                    _meds += [_m_map[str(s).zfill(6)] for s in p['se_list'] if str(s).zfill(6) in _m_map]
+            # mapa se -> med_ref (alinhado após o filtro do _pool_frame)
+            _pairs = list(zip(_ses, _meds))
+            _med_map = {str(s).zfill(6): float(m) for s, m in _pairs if np.isfinite(float(m))}
+            X_pool, y_pool, se_pool = _pool_frame(fold_idx, sorted(_med_map.keys()))
+            if full_mode and cutoff is not None:
+                _m = np.array([str(s).zfill(6) <= cutoff for s in se_pool])
+                X_pool, y_pool, se_pool = X_pool[_m], y_pool[_m], se_pool[_m]
+            _mref = np.array([_med_map[str(s).zfill(6)] for s in se_pool], dtype=float)
+            u_pool = y_pool - _mref
+            _fin = np.isfinite(u_pool) & np.isfinite(_mref)
+            _n_before = len(u_pool)
+            u_pool = np.clip(u_pool[_fin], -self.width_clip, self.width_clip)
+            X_pool, se_pool = X_pool[_fin], se_pool[_fin]
+            if len(u_pool) < self.width_min_pool:
+                return None
+            return {'X': X_pool.reset_index(drop=True), 'u': u_pool, 'se': se_pool,
+                    'dropped': _n_before - len(u_pool)}
+
+        def _fit_width_fold(fold_idx, tau, seed, prep):
+            """Fit do width model no pool do fold; compõe e substitui as preds da cauda."""
+            pieces = width_pieces[fold_idx]
+            pool = _width_pool(fold_idx, seed, pieces)
+            if pool is None or pool['X'].empty:
+                raise RuntimeError(f"pool vazio/pequeno no fold {fold_idx}")
+            # seleção de features: mesmas colunas por-τ da cauda absoluta
+            _cols = prep['per_tau_cols'][tau] if (separate_mode and 'per_tau_cols' in prep) else list(pool['X'].columns)
+            _cols = [c for c in _cols if c in pool['X'].columns]
+            _order = np.array([str(s) for s in pool['se']])
+            _ord_idx = np.argsort(_order)
+            X_s = pool['X'].iloc[_ord_idx][_cols].reset_index(drop=True)
+            u_s = pool['u'][_ord_idx]
+            se_s = pool['se'][_ord_idx]
+            n = len(u_s)
+            v = max(8, int(n * 0.2))
+            m_w = self.train_single_model(X_s.iloc[:n - v], pd.Series(u_s[:n - v]),
+                                          X_s.iloc[n - v:], pd.Series(u_s[n - v:]),
+                                          seed, horizon, tau,
+                                          se_tr=se_s[:n - v], se_val=se_s[n - v:])
+            X_test_tau = prep['X_test_dict'][tau] if (separate_mode and 'X_test_dict' in prep) else prep['X_test']
+            u_pred = np.asarray(m_w.predict(X_test_tau[_cols], num_iteration=max(m_w.best_iteration, 1)), dtype=float)
+            med_s = np.asarray(fold_predictions[fold_idx][0.5][seed], dtype=float)
+            edge = med_s + np.clip(u_pred, -self.width_clip, self.width_clip)
+            # proteção da mediana por construção: clamp p/ FORA (never move med)
+            if tau == 0.95:
+                _ref_hi = np.maximum(
+                    med_s,
+                    np.asarray(fold_predictions[fold_idx].get(0.75, {}).get(seed, med_s), dtype=float))
+                edge = np.maximum(edge, _ref_hi)
+            else:
+                _ref_lo = np.minimum(
+                    med_s,
+                    np.asarray(fold_predictions[fold_idx].get(0.25, {}).get(seed, med_s), dtype=float))
+                edge = np.minimum(edge, _ref_lo)
+            edge = np.clip(edge, 0.0, None)
+            fold_predictions.setdefault(fold_idx, {}).setdefault(tau, {})[seed] = edge
+            logger.info(f"  h{horizon} Q1 fold {fold_idx} q{int(tau*1000):04d} seed {seed}: pool {n}, "
+                        f"u_med {np.mean(edge - med_s):+.3f}, u_p95 {np.quantile(edge - med_s, 0.95):+.3f}")
+            return m_w
+
+        def _train_width_full(seed, tau, n_iters):
+            """FULL width model no universo FULL (X_full_base já com ano transform
+            e colunas = per_tau_full_cols, idênticas às persistidas em
+            feature_names[horizon]). Pool: inner-holdout + TODAS as semanas
+            validadas dos folds (med_ref per-seed out-of-sample; linhas do último
+            fold incluídas — são histórico observado no momento do FULL)."""
+            _med_map = {}
+            _m_map_in = _ensure_inner_med(seed)
+            for s in self._q1_inner_split['holdout']:
+                s = str(s).zfill(6)
+                if s in _m_map_in and np.isfinite(_m_map_in[s]):
+                    _med_map[s] = _m_map_in[s]
+            for j in sorted(fold_prep.keys()):
+                _arr = np.asarray(fold_predictions[j][0.5][seed], dtype=float)
+                for i, s in enumerate([str(x).zfill(6) for x in fold_prep[j]['test_se']]):
+                    if np.isfinite(_arr[i]):
+                        _med_map[s] = float(_arr[i])
+            _se_full = np.array([str(s).zfill(6) for s in se_full_src])
+            _mrow = np.array([s in _med_map for s in _se_full])
+            n_pool = int(_mrow.sum())
+            if n_pool < self.width_min_pool:
+                raise RuntimeError(f"FULL width pool pequeno ({n_pool})")
+            X_pool = X_full_base[_mrow].copy()
+            y_pool = np.asarray(y_full_src, dtype=float)[_mrow]
+            se_pool = _se_full[_mrow]
+            u_pool = np.clip(y_pool - np.array([_med_map[s] for s in se_pool]),
+                             -self.width_clip, self.width_clip)
+            _cols = [c for c in per_tau_full_cols[tau] if c in X_pool.columns]
+            logger.info(f"  h{horizon} Q1 FULL q{int(tau*1000):04d} seed {seed}: pool {n_pool} linhas, cols {len(_cols)}")
+            return self.train_single_model_full(X_pool[_cols], pd.Series(u_pool),
+                                                seed, horizon, tau, n_iters,
+                                                se_full=se_pool)
+
         # Train: for each seed, for each quantile, for each fold.
         models = {tau: {seed: None for seed in self.ensemble_seeds} for tau in self.quantiles}
         fold_predictions: Dict[int, Dict[float, Dict[int, np.ndarray]]] = {}
@@ -953,8 +1165,19 @@ class EpisenseTrainer:
         for seed in self.ensemble_seeds:
             logger.info(f"\n  Training seed {seed}...")
             fold_best_iters: Dict[float, List[int]] = {tau: [] for tau in self.quantiles}
+            # Q1: mediana primeiro (caudas de largura compõem sobre med_s por fold)
+            _tau_iter = (sorted(self.quantiles, key=lambda t: (abs(t - 0.5), t))
+                         if width_active else list(self.quantiles))
             for fold_idx, prep in fold_prep.items():
-                for tau in self.quantiles:
+                for tau in _tau_iter:
+                    if width_active and width_pieces.get(fold_idx) and tau in (0.05, 0.95):
+                        try:
+                            _m_w = _fit_width_fold(fold_idx, tau, seed, prep)
+                            fold_best_iters[tau].append(_m_w.best_iteration)
+                            continue
+                        except Exception as _w_exc:
+                            import traceback as _tb
+                            logger.warning(f"  h{horizon} Q1 fold {fold_idx} q{int(tau*1000):04d} seed {seed} falhou ({_w_exc}) — fallback cauda absoluta\n{_tb.format_exc()}")
                     if separate_mode and 'X_tr_dict' in prep:
                         X_tr_tau = prep['X_tr_dict'][tau]
                         X_val_tau = prep['X_val_dict'][tau]
@@ -1030,6 +1253,13 @@ class EpisenseTrainer:
 
             for tau in self.quantiles:
                 n_iters = int(np.mean(fold_best_iters[tau])) if fold_best_iters[tau] else None
+                if width_active and tau in (0.05, 0.95):
+                    try:
+                        models[tau][seed] = _train_width_full(seed, tau, n_iters)
+                        logger.info(f"  h{horizon} Q1 FULL q{int(tau*1000):04d} seed {seed}: width model (pool agregado)")
+                        continue
+                    except Exception as _wf_exc:
+                        logger.warning(f"  h{horizon} Q1 FULL q{int(tau*1000):04d} seed {seed} falhou ({_wf_exc}) — fallback FULL absoluto")
                 if separate_mode:
                     X_full_tau = X_full_base[per_tau_full_cols[tau]]
                 else:
@@ -1537,6 +1767,20 @@ class EpisenseTrainer:
                     path = models_dir / f"lgbm_h{horizon}_seed{seed}_q{int(tau*1000):04d}.pkl"
                     joblib.dump(model, path)
         logger.info(f"Saved quantile models to {models_dir}")
+
+        # EXP-Q1: contrato de composição das caudas para o inference
+        try:
+            _mode_path = models_dir / "quantile_mode.json"
+            _mode_doc = {
+                'mode': getattr(self, 'width_mode', 'absolute'),
+                'composed_taus': [0.05, 0.95] if getattr(self, 'width_mode', 'absolute') == 'around_median' else [],
+                'inner': getattr(self, 'width_inner', {}) or {},
+            }
+            with open(_mode_path, 'w') as f:
+                json.dump(_mode_doc, f, indent=2, default=str)
+            logger.info(f"Saved quantile_mode.json: mode={_mode_doc['mode']}")
+        except Exception as e:
+            logger.warning(f"quantile_mode.json falhou: {e}")
 
         feature_path = models_dir / "feature_list.json"
         # Handle separate_quantile_features: feature_names[h] may be dict tau->list

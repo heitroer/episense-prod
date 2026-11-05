@@ -57,6 +57,9 @@ models/*.bak
 models/.retrain_lock
 models/.retrain_last_se
 
+# Experimentos (artefatos de treino, nunca comitados - ex: models_q1, models_v8phase2)
+models_*/
+
 # Docker
 .docker/
 

@@ -984,3 +984,89 @@ tolerância, mesmo risco expanding do fold3); (c) reduzir W90/W50 naturalmente
 via Q2 (regularização específica das caudas τ=0.05/0.95 no retreino do
 ciclo v8.3). Recomendação: isolar o Q1 como próximo experimento — é o único
 que muda o mecanismo em vez de re-arranjar o resultado.
+
+## Adendo 11 — EXP-Q1 (estrutural): caudas como modelos de largura em torno da mediana — REPROVADO (forma resolvida; fronteira cobertura×formato provada), canônico intacto (nov/2026)
+
+**Motivação.** Execução do caminho recomendado pelo Adendo 10: em vez de re-arranjar
+o resultado, muda o mecanismo — as caudas τ=0.05/0.95 passam a treinar o desvio
+`u = log1p(y) − log1p(med_ref)` e a banda publicada vira função do nível da
+mediana por construção (`q95' = med_s + u95_s`; `q05' = med_s + u05_s` com
+clamp p/ fora, que nunca move a mediana). Objetivo do usuário: quantis com o
+*desenho* da mediana.
+
+**Design.** `quantile_width.mode` (config-gated; `absolute` canônico):
+- med_ref honesto per-seed: inner-holdout histórico 202036–202227 com mediana
+  surrogada treinada ≤ 202035 (out-of-sample); folds anteriores entram no pool
+  à medida que validam (expanding), cutoff do walk preservado; `min_pool_rows`
+  60; clip |u| ≤ 5.
+- Fold: largura fitada no pool honesto do fold (89–252 linhas, crescendo);
+  FULL/live: largura por seed no pool agregado; `inference.py` lê
+  `quantile_mode.json` (contrato de composição; ausente ⇒ `absolute`).
+- Mediana/q25/q75 intocados (MAE/gate P7); non-crossing por clamp p/ fora.
+- Smoke h1 ok; retreino completo (8h × 5 seeds) sem falhas; gate PASS.
+
+**Resultado (raw do vp, sem camadas — a dança foi isolada abaixo).**
+- **Forma: critério atingido.** corr(q05, med) = **0.87–0.97** por horizonte
+  (v8: 0.53–0.91); W90/W50 raw h6–h8 = 3.4/4.0/4.3 (v8: 4.3/4.3/6.1). O q05
+  deixa de ser piso decorativo e a banda acompanha o nível da mediana.
+- Cobertura raw: global h1–h7 todos ≥ 0.90 ✓; **fold 0 colapsa em h4–h8**
+  (cov 0.62–0.83 vs v8 0.87–0.92) e h8 global 0.81 ✗. Misses do fold 0 são
+  dominados pelo lado alto (h8 f0: 31% das semanas acima do bordo; u95
+  previsto +0.86 contra +1.21 realizado — a temporada 2023 é regime pós-pool:
+  o pool semente de f0 tem só 89–96 semanas e a cauda aprendida é das
+  temporadas 2021–22). Mesma causa-raiz do Adendo 10, agora nos bordos
+  proporcionais.
+- WIS raw: h1 −0.69, h5 −0.22 vs v8; h4 +0.26, h6 +0.21, h7 +0.19 (quase-neutro).
+- A mediana do Q1 é *mais limpa* que a publicada pelo v8 (o slot q50 do vp v8
+  carregava poluição do non-crossing por ordenação; no Q1 o clamp p/ fora
+  mantém o slot limpo): MAE h8 90.6 vs 95.8, mesma estabilidade nos demais.
+
+**Camada B (CQR) reprovada para bandas proporcionais.** A dança canônica
+recalibra *para baixo*: o pool de calibração vê sobrecobertura (0.9–1.0) e
+aplica deltas negativos — folds 1–3 quebram onda pós-onda (raw 0.96–1.00 →
+dançado 0.83–0.98; h5 f3 raw 0.96 → dançado 0.31; h3 f3 raw 1.00 → 0.85).
+O reshape do CQR foi concebido para as bandas decorativas do v8; sobre u
+proporcional ele aperta exatamente onde a expansão expanding era a rede.
+Lição para iterações futuras: com `mode: around_median`, a Camada B das
+caudas deve ser desligada (config-gate) — só q25/q75 continuam dançando.
+
+**Fronteira provada (piso "p/ fora" — a iteração Q1b avaliada antes de
+promover).** Para atingir apenas a pior-queda pactuada (v8−0.03) no fold 0,
+os pisos mínimos de u95 são +1.00/+1.35/+1.60/+1.49/+1.73 (h4→h8), o que leva
+W90/W50 a 3.3/3.9/**4.7/5.0/5.9** — h6–h8 rompem o teto pactuado (≤ 4.0). Com
+pisos quantílicos do pool publicado (p85) nos folds 1–3 o resultado é igual
+(h6 4.1, h7 4.3, h8 5.0 — h2 sobe a 4.9). ⇒ Com caudas 2 (05/95), a tríade
+cov90-global ≥0.85 + pior-queda ≤0.03 + W90/W50 ≤4.0 é **matematicamente
+incompatível** em h6–h8: cobrir fold 0 exige larguras ~5–6×W50. A única via
+que satisfaz cobertura e formato simultaneamente é compor as 4 caudas
+(W50 também proporcional ⇒ ratio esperado ~2.5–3.5) — proposta denominada
+**Q1c**, fora do escopo desta reprovação.
+
+**Veredicto final: EXP-Q1 reprovado sob o pack pactuado (decisão do usuário
+em 4/nov/2026: encerrar sem novo retreino). Restore executado**, canônico
+byte-parity re-verificado em duas corridas do recompute canônico:
+`models/validation_results.json` md5 `fc27dd7649c716f00d5093edb525ffca`
+(estável antes/depois dos experimentos — nunca foi tocado);
+`models/metrics_dataframe.csv` md5 `f53dba6165e49796468fd98e2c8c3f65`
+restaurado. Config `quantile_width.mode: absolute` (bloco mantido com
+código, desabilitado — precedente dos adendos anteriores).
+
+**Incremento permanente encontrado nesta rodada.** O recompute do experimento
+sobrescrevia `models/metrics_dataframe.csv` de produção (gravação hardcoded
+fora do `_VP_DIR`, linha 726). Corrigido: a gravação agora segue `EPISENSE_VP_DIR`
+(paridade re-verificada com o patch aplicado). Além disso os diretórios
+`models_*/` entraram no `.gitignore` (artefatos de treino nunca comitados).
+
+**Evidências** (gitignored, referenciadas): `logs/metrics_exp_Q1.json` (dançado),
+`logs/exp_Q1_raw_folds.json` (raw por fold), `logs/exp_Q1_train_20261104.log`
+e `logs/exp_Q1_smoke_20261104.log` (pools/u por fold), diretórios
+`models_q1/` e `models_q1smoke/` (artefatos do experimento).
+
+**Próximo passo proposto (pendente de decisão, não executado).** Q1c —
+recompor as 4 caudas (u05/u25/u75/u95 ao redor da mediana) com pisos por
+percentil do pool publicável (ex.: 0.85/0.65/0.35/0.15, monotônico por
+construção), Mediana/MAE/gate intocados; critério cov50 re-especificado para
+não-regressão (cov50 ≥ v8 − 0.02) porque a composição muda o 50-par por
+construção; ratio W90/W50 esperado ~2.5–3.5 com folga no pack. Custo: 1
+retreino (~40 min) + dance completa; se falhar, restore byte-parity como
+sempre.

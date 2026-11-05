@@ -92,7 +92,7 @@ class EpisenseInference:
                     else:
                         logger.warning(f"Model not found: {model_path}")
         
-        # Fail-fast: se nenhum modelo carregado, falha explícita (config comenta sem sufixo q e só h1-h4)
+        # Fail-fast: se nenhum modelo carregado, falha explícita
         total = sum(len(seed_dict) for h_dict in self.models.values() for seed_dict in h_dict.values())
         if total == 0:
             raise RuntimeError(
@@ -101,6 +101,18 @@ class EpisenseInference:
                 f"horizontes={self.target_horizons}, quantis={self.quantiles}, seeds={self.ensemble_seeds})"
             )
         logger.info(f"Total de modelos carregados: {total}")
+        # EXP-Q1: contrato de composição das caudas (quantile_mode.json ships com
+        # os modelos; default 'absolute' — mediana/q25/q75 mais caudas diretas).
+        self.width_mode = 'absolute'
+        try:
+            _mode_path = self.model_dir / "quantile_mode.json"
+            if _mode_path.exists():
+                with open(_mode_path) as _mf:
+                    _mode_doc = json.load(_mf) or {}
+                self.width_mode = str(_mode_doc.get('mode', 'absolute'))
+                logger.info(f"Q1 width mode: {self.width_mode} (composed taus: {_mode_doc.get('composed_taus')})")
+        except Exception as e:
+            logger.warning(f"quantile_mode.json ilegível ({e}) — default 'absolute'")
         for h in self.target_horizons:
             for tau in self.quantiles:
                 n = len(self.models.get(h, {}).get(tau, {}))
@@ -449,12 +461,72 @@ class EpisenseInference:
                     logger.warning(f"No models for horizon {horizon}")
                     continue
             
-                for tau in self.quantiles:
+                # EXP-Q1: composição das caudas em torno da mediana por seed
+                med_seed_preds = {}
+                if self.width_mode == 'around_median' and 0.5 in self.models.get(horizon, {}):
+                    try:
+                        _med_model_first = next(iter(self.models[horizon][0.5].values()), None)
+                        _cols_med = list(_med_model_first.feature_name()) if _med_model_first is not None else None
+                    except Exception:
+                        _cols_med = None
+                    X_med = (df_last[_cols_med] if _cols_med else
+                             self._select_horizon_features(df_last, horizon, 0.5))
+                    med_seed_preds = {}
+                    for seed, model in self.models[horizon][0.5].items():
+                        try:
+                            med_seed_preds[seed] = np.asarray(
+                                model.predict(X_med, num_iteration=model.best_iteration if model.best_iteration > 0 else model.num_trees()),
+                                dtype=float)
+                        except Exception as e:
+                            logger.error(f"Q1 med pred error h{horizon} seed {seed}: {e}")
+
+                for tau in sorted(self.quantiles, key=lambda t: (abs(t - 0.5), t)):
                     if tau not in self.models[horizon] or not self.models[horizon][tau]:
                         logger.warning(f"No models for horizon {horizon}, quantile {tau}")
                         predictions[horizon][tau] = np.array([])
                         continue
-                
+
+                    # EXP-Q1: caudas compostas med_s + u_s (por seed, depois média em log)
+                    if self.width_mode == 'around_median' and tau in (0.05, 0.95) and med_seed_preds:
+                        try:
+                            _first_w = next(iter(self.models[horizon][tau].values()), None)
+                            _cols_w = list(_first_w.feature_name()) if _first_w is not None else None
+                            X_w = df_last[_cols_w] if _cols_w else self._select_horizon_features(df_last, horizon, tau)
+                            edge_preds = []
+                            for seed, model in self.models[horizon][tau].items():
+                                if seed not in med_seed_preds:
+                                    continue
+                                try:
+                                    u_pred = np.asarray(
+                                        model.predict(X_w, num_iteration=model.best_iteration if model.best_iteration > 0 else model.num_trees()),
+                                        dtype=float)
+                                    edge_preds.append(med_seed_preds[seed] + u_pred)
+                                except Exception as e:
+                                    logger.error(f"Q1 width pred error h{horizon} tau={tau} seed {seed}: {e}")
+                            if edge_preds:
+                                _tmp = {tau: np.mean(edge_preds, axis=0)}
+                                # clamp para fora: nunca move a mediana
+                                if 0.5 in (self.models[horizon]) and med_seed_preds:
+                                    _med_ens = np.mean(list(med_seed_preds.values()), axis=0)
+                                    _q75_ens = None
+                                    if 0.75 in self.models[horizon]:
+                                        _q75_ens = predictions[horizon].get(0.75)
+                                    _q25_ens = predictions[horizon].get(0.25)
+                                    if tau == 0.95:
+                                        _ref_hi = np.maximum(_med_ens, np.asarray(_q75_ens) if _q75_ens is not None and len(np.asarray(_q75_ens)) == len(_med_ens) else _med_ens)
+                                        _tmp[tau] = np.maximum(_tmp[tau], _ref_hi)
+                                    else:
+                                        _ref_lo = np.minimum(_med_ens, np.asarray(_q25_ens) if _q25_ens is not None and len(np.asarray(_q25_ens)) == len(_med_ens) else _med_ens)
+                                        _tmp[tau] = np.minimum(_tmp[tau], _ref_lo)
+                                _tmp[tau] = np.clip(_tmp[tau], 0.0, None)
+                                predictions[horizon][tau] = _tmp[tau]
+                            else:
+                                predictions[horizon][tau] = np.array([])
+                        except Exception as e:
+                            logger.error(f"Q1 compose error h{horizon} tau={tau}: {e}")
+                            predictions[horizon][tau] = np.array([])
+                        continue
+
                     # Select features for this horizon+tau (separate mode)
                     X = self._select_horizon_features(df_last, horizon, tau)
                 

@@ -422,6 +422,24 @@ postprocessing:
     grid_step: 0.05
     k_max: 3.0
     pool_nmin_regime: 12
+quantile_width:
+  # EXP-Q1 (v9): caudas como modelos de LARGURA em torno da mediana por seed:
+  # u = log1p(y) − log1p(med_ref_s); bandas publicadas q0.95' = med_s + u95_s e
+  # q0.05' = med_s + u05_s (u05 ≤ 0); mediana/q25/q75 intocados ⇒ MAE/gate
+  # inalterado. Pool honesto expanding por fold: inner-holdout histórico
+  # (med_ref por modelo-seed próprio, treinado até inner.train_max_se —
+  # out-of-sample por construção) + semanas validadas dos folds anteriores
+  # (med_ref = mediana per-seed da validação do fold j) até o cutoff do fold
+  # (gap do walk preservado). Produção: FULL width model por seed no pool
+  # agregado; inference compõe med_full_s + u_full_s. Fallback: pool < 
+  # min_pool_rows ⇒ mantém caudas absolutas (pinball raw).
+  mode: absolute            # 'absolute' (v8 canônico) | 'around_median' (EXP-Q1, REPROVADO nov/2026)
+  inner:
+    train_max_se: '202035'  # inner med treina só com o passado
+    holdout_min_se: '202036'
+    holdout_max_se: '202227'
+  min_pool_rows: 60
+  clip_u: 5.0               # |u| máximo (log1p) — guard contra alvos patológicos
 residual_stage2:
   # EXP-R2 (nov/2026): booster de resíduos stage-2 por horizonte, fitado SÓ com os
   # folds ANTERIORES (expanding — mesma honestidade do conformal). LGBM l2 r̂=f(X)

@@ -35,8 +35,13 @@ from models.calibration import compute_conformal  # noqa: E402
 from data.epiweeks import epiweek_to_date, date_to_epiweek  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-VAL_PRED = ROOT / "models/validation_predictions.json"
-VAL_RES = ROOT / "models/validation_results.json"
+# EPISENSE_VP_DIR: override do diretório de predições/results (experimentos sem
+# tocar models/ de produção; artefatos de saída seguem o mesmo diretório).
+_VP_DIR = Path(os.environ.get('EPISENSE_VP_DIR', "models"))
+if not _VP_DIR.is_absolute():
+    _VP_DIR = ROOT / _VP_DIR
+VAL_PRED = _VP_DIR / "validation_predictions.json"
+VAL_RES = _VP_DIR / "validation_results.json"
 BASE = ROOT / "data/processed/episense_base.csv"
 FIRST_TEST_SE = "202236"          # escopo final de avaliação
 FOLD_GAP_WEEKS = 8                # gap do walk-forward (config training.walk_forward)
@@ -718,8 +723,9 @@ def main():
     VAL_RES.write_text(json.dumps(clean_nan(results), indent=2, ensure_ascii=False),
                        encoding="utf-8")
     df = pd.DataFrame(df_rows).set_index('Horizonte')
-    df.to_csv(ROOT / "models" / "metrics_dataframe.csv")
+    df.to_csv(_VP_DIR / "metrics_dataframe.csv")
     print(f"\nSalvo: {VAL_RES.name} (backup: validation_results_legacy.json.bak)")
+    print(f"Salvo: {_VP_DIR / 'metrics_dataframe.csv'}")
     print(f"Salvo: models/metrics_dataframe.csv ({list(df.columns)})")
 
 
