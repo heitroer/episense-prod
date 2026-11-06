@@ -65,6 +65,18 @@ class EpisenseInference:
         self.quantile_conformal_enabled = bool(self.quantile_conformal_config.get('enabled', False)) and not self.quantile_recalibration_enabled
         self.conformal = {}
         self.conformal_outbreak_months = list((self.config.get('epidemiological_periods', {}) or {}).get('outbreak_months', [10, 11, 12, 1, 2, 3, 4, 5]))
+        # EXP-Q2 (nov/2026): re-forma da banda quantílica em torno da mediana
+        # (fan chart). models/band_shape.py — resolve q05 "cola no chão" e
+        # q95-com-pico-aleatório decaoplando do desenho da mediana.
+        _bs_cfg = self.config.get('postprocessing', {}).get('band_shape', {}) if isinstance(self.config.get('postprocessing', {}), dict) else {}
+        self.band_shape_config = _bs_cfg if isinstance(_bs_cfg, dict) else {}
+        self.band_shape_enabled = bool(self.band_shape_config.get('enabled', False))
+        # Correção de viés de mediana para h>=2 (FBias): aplicada a TODOS os
+        # quantis (antes em get_latest_predictions tocava só a mediana ->
+        # q50 != casos_previstos e banda desalinhada da mediana publicada).
+        self.median_bias_factor_horizons = set(int(x) for x in self.config.get('postprocessing', {}).get('median_bias_horizons', [2, 3, 4, 5, 6, 7, 8]) or [])
+        self.median_bias_factor = float(self.config.get('postprocessing', {}).get('median_bias_factor', 1.08))
+        self._median_bias_log = float(np.log1p(self.median_bias_factor - 1.0))
         if self.quantile_conformal_enabled:
             try:
                 from models.calibration import load_json as _load_conformal
@@ -561,6 +573,38 @@ class EpisenseInference:
                 predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
             elif has_recal:
                 logger.info("Quantile recalibration files present but skipped (enabled=false, default) to avoid circular leakage")
+            # Correção de viés de mediana (h>=2, fator 1.08): aplicada em log a
+            # TODOS os quantis ANTES da re-forma — a banda é âncora do nível
+            # final publicado (q50 == casos_previstos).
+            # EXP-Q2: movida de get_latest_predictions para cá e estendida a
+            # todos os quantis (antes tocava só casos_previstos ->
+            # q50 reportado != mediana publicada no fan).
+            try:
+                _mb = self._median_bias_log
+                if _mb != 0.0:
+                    for h in list(predictions.keys()):
+                        if int(h) not in self.median_bias_factor_horizons:
+                            continue
+                        for tau in list(predictions[h].keys()):
+                            arr = predictions[h][tau]
+                            if arr is None or getattr(arr, 'size', 0) == 0:
+                                continue
+                            arr = np.maximum(0.0, np.asarray(arr, dtype=float)) + _mb
+                            predictions[h][tau] = arr
+            except Exception as e:
+                logger.warning(f"median bias factor falhou: {e}")
+            # EXP-Q2: re-forma da banda em torno da mediana (fan chart) —
+            # q* = med × f*[h] (perfil calibrado), deixa o desenho da banda colado
+            # ao desenho da mediana (elimina picos aleatórios de cauda e q05 no chão).
+            # Vem ANTES do conformal: o perfil define a largura base; os deltas
+            # CQR por regime modulam as caudas por cima do perfil.
+            if self.band_shape_enabled:
+                try:
+                    from models.band_shape import reshape_fan_logits
+                    predictions = reshape_fan_logits(
+                        predictions, list(self.target_horizons), self.band_shape_config)
+                except Exception as e:
+                    logger.warning(f"band_shape falhou (sem aplicação): {e}")
             # Calibração conformal v3 (CQR delta-only): substitui o recal legacy.
             # Predições em log1p; regime por intensidade da semana-base (última
             # observada); horizontes apply_horizons (default h1-h3) antes do gating.
@@ -947,8 +991,8 @@ class EpisenseInference:
                 # Correção de viés levemente superestimador para saúde pública (FBias alvo +0.05)
                 # Mediana subestima média em distribuição assimétrica (mean 228 vs median 121, skew 1.77)
                 # Fator 1.08 para h>=2 desloca FBias -0.19→-0.11, -0.33→-0.26 (suavemente conservador, não excessivo)
-                if horizon >= 2:
-                    casos_previstos = int(np.round(casos_previstos * 1.08))
+                # EXP-Q2: MOVIDO para predict() — aplica a TODOS os quantis (log)
+                # para q50 == casos_previstos e banda ancorada no nível publicado.
                 
                 # Calculate alert level
                 alerta = self._calculate_alert(casos_previstos, horizon)

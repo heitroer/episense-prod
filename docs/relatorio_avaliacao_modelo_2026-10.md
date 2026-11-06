@@ -1070,3 +1070,100 @@ não-regressão (cov50 ≥ v8 − 0.02) porque a composição muda o 50-par por
 construção; ratio W90/W50 esperado ~2.5–3.5 com folga no pack. Custo: 1
 retreino (~40 min) + dance completa; se falhar, restore byte-parity como
 sempre.
+
+## Adendo 12 — EXP-Q2: banda quantílica por perfil âncora multiplicativa em produção (nov/2026) — PROMOVIDO
+
+**Motivação.** Reclamação de produção: no fan chart, as bandas quantílicas
+não seguem a forma da mediana — q05 "colado no chão" (fatores q/med
+~0.00–0.05 em semanas calmas; a previsão mínima vira zero) e q95 com picos
+aleatórios de 3–8× a mediana em horizontes isolados. shape_corr walk-forward
+raw: q05×q50 = **0.43** (live 0.78). Causa-raiz dupla: (a) pinball
+independente por τ treinada no histórico todo (a cauda aprende o envelope da
+pior temporada em semanas esparsas — mesma raiz dos Adendos 10–11) e
+(b) `_apply_non_crossing` por ordenação re-inflama o q95 a partir dos picos
+do q75 raw. Diferente de Q0/Q1, Q2 atua APENAS na camada de inferência
+publicada entre o modelo e o dashboard: **zero retreino, mediana
+intocada por construção** — MAE e gate de nível preservados.
+
+**Especificação (perfil âncora `profile`).** Novo módulo
+`models/band_shape.py`, acionado em `predict()` **antes** do conformal:
+banda `q* = expm1(log1p(med) + log f*[tau][h])` com fatores FIXOS por
+horizonte, derivados dos 176 fans do walk-forward 2022-25 (mediana dos
+fatores raw por h, suavização isotônica PAV; f75/f95 ×1.10 — "perfil P2",
+recalibrando cov50 0.43→0.51). O fan é determinístico: **o desenho da banda
+é o desenho da mediana escalada**; ruído de cauda eliminado por construção.
+Caps de segurança: f05 ≥ 0.27 (anti-chão), q25 ≤ 0.80×med, hi ≥ 1.18×med,
+f95 ≤ 4.10×med. Modo alternativo `raw` (fatores por fan + roll-median no
+eixo h + monotonia soft amortecida + caps) implementado no mesmo módulo e
+**REPROVADO no teste live 2026-W44**: o pico nativo do q95 em h1 (4.35×)
+contaminava todo o fan via accumulate — banda colada no cap/floor. Código
+mantido como precedente, config em `mode: profile`.
+
+**Ordem final do pipeline em `predict()`:** raw → `_apply_non_crossing` →
+viés de mediana 1.08 em log aplicado a **TODOS os quantis** para h≥2 (antes
+tocava só `casos_previstos` em `get_latest_predictions`: o q50 publicado
+diferia da mediana do fan; duplicação do 1.08 no endpoint REMOVIDA —
+q50 == `casos_previstos` em todos os horizontes) → `reshape_fan_logits`
+(perfil) → conformal CQR delta-only → phantom gating (caps 1.5×/2.0×
+mantidos; com a banda interna já ordenada, o gating deixou de re-inflamar
+q95) → clamp q05 ≥ 0.
+
+**Conformal recalibrado sobre o perfil.** Os resíduos CQR passaram a medir
+`y_log − log1p(med × perfil × 1.08 p/ h≥2)` — antes, sobre a banda raw.
+`scripts/recompute_conformal_profile.py --write` (dry-run default)
+regenerou `models/quantile_conformal.json` (backup `.bak_prereshape`):
+`production` = pool 4 folds (comportamento live) e `expanding_by_fold`
+(honesto). Aplicações em h1/2/3/5 (`apply_horizons`), regime-base,
+max_abs_delta 1.0 inalterados.
+
+**Validação final (`scripts/validate_final_pipeline.py`, agregado h1–h8):**
+
+| métrica agg | raw | perfil | perfil+conf **(pool=live)** | perfil+conf (expanding) |
+|---|---|---|---|---|
+| cov90 | 0.845 | 0.868 | **0.872** | 0.861 |
+| cov50 | 0.448 | 0.528 | **0.489** | 0.472 |
+| WIS | 114.3 | 112.7 | **109.0 (−4.6%)** | 113.1 |
+| W90 | 366.5 | 390.8 | **330.3 (−9.9%)** | 376.5 |
+| MAE | 67.16 | idem | idem | idem |
+
+Ganhos concentrados onde o conformal atua (h1 WIS 66.2→57.0, h2 84.4→73.4,
+h3 99.4→92.7, h5 130.4→116.2). **A patologia h5 descrita em andamento
+(cov50 0.54→0.36, cov90 0.92→0.79) é EXCLUSIVA da variante expanding**; no
+pool — o comportamento live real — h5 melhora: cov50 0.541→0.507,
+cov90 0.890, WIS −5.8%. Decisão: manter `apply_horizons: [1,2,3,5]` sem
+alteração e sem shrinkage.
+
+**Teste live (`scripts/test_band_shape_live.py`, base local, SE 202643):**
+
+| | ANTES (raw) | DEPOIS (perfil+conf) |
+|---|---|---|
+| q05 h1 / h2 | **0 / 0** | 8 / 11 (sem chão) |
+| f95 h1 | 3.88× | 1.47× |
+| f95 h4–h8 | 2.2–2.8× | 1.73–2.01× estável |
+| shape_corr q05×q50 | 0.782 | **0.937** |
+| shape_corr q95×q50 | 0.939 | **0.992** |
+
+Pós-restart (`docker compose restart`; `models/` e `config/` são mounted
+volumes), `/predict` verificado: banda segue a mediana em todos os
+horizontes, sem chão, sem picos; q50 == `casos_previstos` em todos os h.
+**Histórico do arco**: linhas antigas do
+`data/processed/forecast_archive.json` permanecem como foram publicadas
+(origin 202643 exibe o defeito antigo); origins novas seguem o desenho novo.
+
+**Veredicto: PROMOVIDO** — `postprocessing.band_shape: enabled: true,
+mode: profile` + conformal regenerado. Canônicos intocados (md5
+re-verificados: `validation_results.json`
+`fc27dd7649c716f00d5093edb525ffca`, `metrics_dataframe.csv`
+`f53dba6165e49796468fd98e2c8c3f65` — os mesmos do Adendo 11). Rollback
+documentado: `band_shape.enabled: false` **e** restaurar
+`models/quantile_conformal.json.bak_prereshape` (o conformal atual foi
+recalibrado sobre o perfil; sobre a banda raw ele aplicaria deltas
+deslocados). Vantagem frente a Q1: zero retreino (~40 min guardados) e
+risco contido à camada de publicação.
+
+**Evidências** (gitignored, referenciadas): `logs/validate_exp_Q2_20261106.txt`
+(validação final 4 variantes); scripts
+`analyze_band_shape.py` (derivação do perfil), `recompute_conformal_profile.py`
+(recalibração), `validate_final_pipeline.py`, `test_band_shape_live.py`.
+`scripts/debug_band_h1.py` (debug ad-hoc da iteração) removido.
+

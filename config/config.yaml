@@ -371,8 +371,7 @@ quantile_conformal:
     high: 100.0   # casos na semana-base => cluster 'high' (surto instalado)
     mid: 20.0     # 20-100 => 'mid'; <20 => 'low' (endemia baixa)
 postprocessing:
-  # Experimentos v7 (nov/2026) — pós-processamento no recompute (sem retreino).
-  # conformal_all_horizons: CQR delta-only em TODOS os horizontes (antes [1,2,3,5]).
+  # Experimentos v7 (nov/2026) — pós-processamento no recompute (sem retreino).  # conformal_all_horizons: CQR delta-only em TODOS os horizontes (antes [1,2,3,5]).
   # level_slope_correction: anti "regressão à média" — y_log ~ a + b·pred_log com
   #   (a,b) fitados nos folds ANTERIORES (expanding); banda recentrada no nível.
   # baseline_combination: mistura log-space mediana modelo+baseline com λ por
@@ -422,6 +421,53 @@ postprocessing:
     grid_step: 0.05
     k_max: 3.0
     pool_nmin_regime: 12
+  band_shape:
+    # EXP-Q2 (nov/2026): re-forma da banda quantílica EM PRODUÇÃO (live),
+    # ANTES do conformal — resolve o desenho dessincronizado do fan:
+    # q05 "cola no chão" (fatores q/med ~0.05) e q95 3-8× mediana em semanas
+    # aleatórias (shape_corr q05×q50 = 0.43 no walk-forward; 0.78 live).
+    # Âncora multiplicativa: q* = med × f*[h] (cases); mediana NUNCA alterada
+    # (MAE/gate de nível preservados). Modos:
+    #   profile (default): fatores FIXOS por horizonte calibrados no
+    #     walk-forward (mediana dos fatores raw por h, suavizados isotônico
+    #     PAV, f75/f95 ×1.10 p/ recalibrar cov50 0.43→0.51). Fan determinístico:
+    #     o desenho da banda É o desenho da mediana escalado; ruído de cauda
+    #     eliminado por construção. O conformal CQR (regime-base) modula as
+    #     caudas por cima do perfil.
+    #   raw: fatores por fan (pós-camadas de nível) + suavização roll-median no
+    #     eixo h + monotonia soft damped + caps (REPROVADO no teste live
+    #     2026-W44: pico nato do q95 h1 4.35× infecta o fan via accumulate —
+    #     banda colada no cap/lo_min).
+    # Walk-forward 2022-25, perfil-P2 (176 fans, scripts/analyze_band_shape.py):
+    # cov90 0.835→0.876 (+4.2pp, nominal 0.90 antes do conformal), cov50
+    # 0.428→0.509 (nominal 0.50), WIS −2.1% (MELHOR), MAE inalterado.
+    # Validação REAL do pipeline live completo (scripts/validate_final_pipeline.py,
+    # perfil + conformal recalibrado sobre o perfil, pool=live):
+    # cov90 0.872, cov50 0.489, WIS −4.6% vs raw, w90 −9.9%, MAE idêntico.
+    # A patologia h5 (cov50 0.36/cov90 0.79) é EXCLUSIVA da variante
+    # expanding-by-fold; no pool (live) h5 melhora (0.507/0.890, WIS −5.8%).
+    # Evidência: logs/validate_exp_Q2_20261106.txt
+    enabled: true
+    mode: profile
+    profile:
+      '0.05': [0.58, 0.547, 0.38, 0.288, 0.288, 0.288, 0.288, 0.27]
+      '0.25': [0.82, 0.785, 0.732, 0.693, 0.693, 0.693, 0.693, 0.693]
+      '0.75': [1.389, 1.444, 1.444, 1.444, 1.47, 1.47, 1.47, 1.47]
+      '0.95': [1.902, 2.189, 2.207, 2.275, 3.14, 3.14, 3.14, 3.14]
+    smooth_window: 3     # (raw mode)
+    monotone: soft       # 'soft' | 'hard' | false (raw mode)
+    monotone_damp: 0.85  # propagação amortecida da monotonia (raw mode)
+    lo_min: 0.27    # banda inferior nunca abaixo de 27% da mediana (anti "chão")
+    lo_max: 0.80    # q25 nunca acima de 0.80×med
+    hi_min: 1.18    # q75/q95 sempre acima da mediana
+    hi_max: 4.10    # cap anti-pico fantasma
+    median_eps_cases: 0.5
+    apply_horizons: [1, 2, 3, 4, 5, 6, 7, 8]
+  # Correção de viés de mediana (FBias alvo +0.05) — movida de
+  # get_latest_predictions para predict() e aplicada a TODOS os quantis
+  # (antes tocava só casos_previstos: q50 != mediana publicada no fan).
+  median_bias_factor: 1.08
+  median_bias_horizons: [2, 3, 4, 5, 6, 7, 8]
 quantile_width:
   # EXP-Q1 (v9): caudas como modelos de LARGURA em torno da mediana por seed:
   # u = log1p(y) − log1p(med_ref_s); bandas publicadas q0.95' = med_s + u95_s e

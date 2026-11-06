@@ -14,6 +14,7 @@ from functools import lru_cache
 import time
 import threading
 from threading import Lock
+from typing import Dict
 import logging
 from datetime import datetime, timedelta
 try:
@@ -164,6 +165,82 @@ def _calibrate_qvals(h_int: int, target_se: str, qvals: dict):
                 out[t_orig] = val
     return out, True
 
+def _shape_history_points(h_int: int, points: dict):
+    """EXP-Q2: replica na timeline a ORDEM completa do live (predict()):
+    viés 1.08 (h≥2, todos os taus) → band_shape (perfil âncora) → conformal CQR
+    pool (deltas sobre a banda perfilada) → phantom gating (cap q95 pelo mês da
+    semana-ALVO, igual live) → clamp ≥0 + non-crossing.
+
+    Antes, a timeline exibia os slots CRUS da validação com apenas o conformal
+    por cima — forma dessincronizada do fan (q05 no chão, q95 com picos) —
+    enquanto as linhas do archive re-projetado saíam com o pipeline completo.
+    'true' nunca é alterado (tema de auditoria, não de exibição)."""
+    inf = get_inference()
+    if inf is None or not points:
+        return
+    from models.band_shape import reshape_fan_logits
+    from data.epiweeks import epiweek_to_date
+    fields = {0.05: 'q05', 0.25: 'q25', 0.50: 'pred', 0.75: 'q75', 0.95: 'q95'}
+    ses = sorted(points.keys())
+    # ---- 1) viés de mediana em log (todos os taus, h≥2) — igual predict() ----
+    mb_log = float(getattr(inf, '_median_bias_log', 0.0))
+    mb_hs = getattr(inf, 'median_bias_factor_horizons', set()) or set()
+    base_log = {}
+    for tau, f in fields.items():
+        case_arr = np.array([max(float(points[se][f]), 0.0)
+                             if points[se].get(f) is not None else 0.0 for se in ses])
+        lg = np.log1p(case_arr)
+        if h_int in mb_hs:
+            lg = lg + mb_log
+        base_log[tau] = lg
+    preds = {h_int: dict(base_log)}
+    for hh in range(1, 9):
+        if hh == h_int:
+            continue
+        # dummy: reshape exige ≥2 horizontes; linhas dummy são ignoradas na leitura
+        preds[hh] = dict(base_log)
+    # ---- 2) band_shape (perfil âncora) em batch [H, N] ----
+    bs = ((getattr(inf, 'config', None) or {}).get('postprocessing') or {}).get('band_shape') or {}
+    try:
+        reshaped = reshape_fan_logits(preds, list(range(1, 9)), bs)
+        prof = reshaped.get(h_int, preds[h_int])
+    except Exception as e:
+        logger.warning(f"band_shape history falhou (sem perfil): {e}")
+        prof = preds[h_int]
+    # ---- 3) conformal sobre a banda perfilada + 4) gating + 5) clamp/ordenação ----
+    pg_cfg = inf.phantom_gating_config or {}
+    pg_on = bool(getattr(inf, 'phantom_gating_enabled', False))
+    pg_dis = getattr(inf, 'phantom_gating_disabled_horizons', set())
+    pg_out = float(pg_cfg.get('outbreak_q95_max_factor', 2.0))
+    pg_calm = float(pg_cfg.get('calm_q95_max_factor', 1.5))
+    outbreak_months = set(int(x) for x in ((inf.config.get('epidemiological_periods') or {}).get('outbreak_months') or [10, 11, 12, 1, 2, 3, 4, 5]))
+    ordered_taus = sorted(fields)
+    for i, se in enumerate(ses):
+        pv = points[se]
+        if all(pv.get(f) is None for f in fields.values()):
+            continue
+        taus = {f'{t:.2f}': (float(np.expm1(max(float(prof[t][i]), 0.0))) if pv.get(f) is not None else None)
+                for t, f in fields.items()}
+        cal, applied = _calibrate_qvals(h_int, se, taus)
+        v = {t: (cal.get(f'{t:.2f}') if applied else taus[f'{t:.2f}']) for t in fields}
+        med = float(v[0.50] or 0.0)
+        if pg_on and h_int not in pg_dis:
+            try:
+                se_z = str(se).zfill(6)
+                fut_month = epiweek_to_date(int(se_z[:4]), int(se_z[4:])).month
+                fac = pg_out if fut_month in outbreak_months else pg_calm
+                cap = max(med * fac, med + 5.0)
+                if v[0.95] is not None and float(v[0.95]) > cap:
+                    v[0.95] = cap
+            except Exception:
+                pass
+        pairs = sorted(((t, 0.0 if v[t] is None else max(float(v[t]), 0.0)) for t in fields),
+                       key=lambda x: x[1])
+        for t, (_, val) in zip(ordered_taus, pairs):
+            pv[fields[t]] = float(val)
+        pv['pred_low'] = pv['q05']
+        pv['pred_high'] = pv['q95']
+
 def _load_df_base():
     global df_base, _df_base_mtime
     try:
@@ -251,6 +328,7 @@ _feat_cache_lock = Lock()
 FORECAST_ARCHIVE = ROOT / "data/processed/forecast_archive.json"
 _last_refresh_check = 0
 _refresh_lock = Lock()
+_reproject_lock = Lock()
 _refresh_cooldown = 60  # seconds between checks
 _last_fetch = 0
 _fetch_cooldown = 900  # 15 min between external API fetches (infodengue+openmeteo)
@@ -343,6 +421,27 @@ def _reload_df_base():
     except Exception as e:
         logger.error(f"_reload_df_base failed: {e}")
 
+def _forecast_list_from_preds(origin_se: str, preds: Dict[int, Dict[float, 'np.ndarray']]):
+    """Converte o output de inf.predict (log) no forecast publicado por origin: [{h,target_se,q05..q95}]."""
+    forecast = []
+    for hh in range(1, 9):
+        if hh not in preds:
+            continue
+        fut_se = add_epiweeks(origin_se, hh)
+        q05 = q25 = q50 = q75 = q95 = None
+        for tau, arr in preds[hh].items():
+            if len(arr) == 0:
+                continue
+            val = float(arr[-1])
+            casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
+            if abs(tau - 0.05) < 0.01: q05 = casos
+            elif abs(tau - 0.25) < 0.01: q25 = casos
+            elif abs(tau - 0.50) < 0.01: q50 = casos
+            elif abs(tau - 0.75) < 0.01: q75 = casos
+            elif abs(tau - 0.95) < 0.01: q95 = casos
+        forecast.append({"h": hh, "target_se": str(fut_se), "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95})
+    return forecast
+
 def _archive_forecast(origin_se: str):
     """Persist live forecast for origin_se to forecast_archive.json if not already stored."""
     try:
@@ -377,23 +476,7 @@ def _archive_forecast(origin_se: str):
         else:
             df_feat = inf.prepare_inference_features(df_full)
         preds = inf.predict(df_feat)
-        forecast = []
-        for hh in range(1,9):
-            if hh not in preds:
-                continue
-            fut_se = add_epiweeks(origin_se, hh)
-            q05=q25=q50=q75=q95=None
-            for tau, arr in preds[hh].items():
-                if len(arr)==0:
-                    continue
-                val = float(arr[-1])
-                casos = int(round(float(np.expm1(val)))) if not np.isnan(val) else None
-                if abs(tau-0.05)<0.01: q05=casos
-                elif abs(tau-0.25)<0.01: q25=casos
-                elif abs(tau-0.50)<0.01: q50=casos
-                elif abs(tau-0.75)<0.01: q75=casos
-                elif abs(tau-0.95)<0.01: q95=casos
-            forecast.append({"h": hh, "target_se": str(fut_se), "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95})
+        forecast = _forecast_list_from_preds(origin_se, preds)
         entry = {"origin_se": origin_se, "origin_date": se_to_date(origin_se), "generated_at": datetime.now().isoformat(), "forecast": forecast, "base_max_at_gen": _get_base_max_se()}
         data.append(entry)
         # keep sorted and limit to last 200
@@ -405,6 +488,90 @@ def _archive_forecast(origin_se: str):
         logger.info(f"Archived forecast for origin {origin_se} -> {forecast[0] if forecast else 'empty'}")
     except Exception as e:
         logger.warning(f"_archive_forecast {origin_se} failed: {e}")
+        import traceback; traceback.print_exc()
+
+def _reproject_archive_forecasts(force: bool = False):
+    """EXP-Q2b — Re-projeta o HISTÓRICO do forecast_archive com os modelos vigentes.
+
+    A cada retreino (ou promoção — qualquer troca de lgbm_*.pkl em models/), as
+    entradas já arquivadas são regeneradas com o engine ATUAL: para cada origin,
+    usa somente os dados conhecidos NA ÉPOCA da origin (df cortado SE<=origin_se,
+    honesto por construção). A versão publicada na época fica preservada em
+    published_forecast (*published_at) na 1ª re-projeção — auditoria do que
+    realmente foi exibido. Idempotente: uma entrada é pulada quando seu
+    reprojected_model_mtime já cobre o mtime vigente dos modelos (epoch).
+    Gatilhos: startup do dashboard (cobre retreinos feitos com ele parado)
+    e o fim de cada auto-retreino. force=True ignora o filtro (usado pós-retrain).
+    """
+    try:
+        if not FORECAST_ARCHIVE.exists():
+            return
+        try:
+            data = json.loads(FORECAST_ARCHIVE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, list) or not data:
+            return
+        inf = get_inference()
+        if inf is None:
+            return
+        try:
+            model_mtime = max(p.stat().st_mtime for p in (ROOT / "models").glob("lgbm_*.pkl"))
+        except Exception:
+            return
+        if not force:
+            if not _reproject_lock.acquire(blocking=False):
+                return
+            try:
+                if all(float(e.get("reprojected_model_mtime") or 0) >= model_mtime for e in data):
+                    return  # nada a re-projetar
+            finally:
+                _reproject_lock.release()
+        if not _reproject_lock.acquire(blocking=False):
+            return
+        try:
+            feat_full = _get_feat_full()
+            n_done = 0
+            for entry in data:
+                origin_se = str(entry.get("origin_se")).zfill(6)
+                if float(entry.get("reprojected_model_mtime") or 0) >= model_mtime:
+                    continue  # já vigente
+                try:
+                    df_full = _get_df_full()
+                    df_sl = df_full[df_full["SE"].astype(str).str.zfill(6) <= origin_se].copy().sort_values("SE")
+                    if len(df_sl) == 0:
+                        continue
+                    if feat_full is not None and "SE" in feat_full.columns:
+                        df_feat = feat_full[feat_full["SE"].astype(str).str.zfill(6) <= origin_se].copy()
+                    else:
+                        df_feat = inf.prepare_inference_features(df_sl)
+                    preds = inf.predict(df_feat)
+                    new_f = _forecast_list_from_preds(origin_se, preds)
+                    if not new_f:
+                        continue
+                    if not entry.get("published_forecast") and entry.get("forecast"):
+                        entry["published_forecast"] = entry["forecast"]
+                        entry["published_at"] = entry.get("generated_at")
+                    entry["forecast"] = new_f
+                    entry["generated_at"] = datetime.now().isoformat()
+                    entry["reprojected_at"] = datetime.now().isoformat()
+                    entry["reprojected_model_mtime"] = model_mtime
+                    n_done += 1
+                    old = (entry.get("published_forecast") or [{}])[0]
+                    logger.info(f"[reproject] origin {origin_se} re-projetada (h1 {new_f[0].get('q05')}/{new_f[0].get('q50')}/{new_f[0].get('q95')} — publicado na época: {old.get('q05')}/{old.get('q50')}/{old.get('q95')})")
+                except Exception as e:
+                    logger.warning(f"[reproject] origin {origin_se} falhou: {e}")
+            if n_done:
+                tmp = FORECAST_ARCHIVE.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(FORECAST_ARCHIVE)
+                logger.info(f"[reproject] concluído: {n_done}/{len(data)} origins re-projetadas no archive")
+            else:
+                logger.info("[reproject] nada a re-projetar (histórico já vigente)")
+        finally:
+            _reproject_lock.release()
+    except Exception as e:
+        logger.warning(f"[reproject] falhou: {e}")
         import traceback; traceback.print_exc()
 
 def _backfill_archive_quantiles():
@@ -1025,6 +1192,9 @@ def _ensure_fresh_data():
                                     except Exception as e2:
                                         logger.warning(f"marker .retrain_last_se não gravado: {e2}")
                                     logger.info("Auto-retreino concluído e caches invalidados")
+                                    # EXP-Q2b: o passado também acompanha o retreino —
+                                    # re-projeta o archive com os modelos recém-treinados
+                                    _reproject_archive_forecasts(force=True)
                                 except Exception as e:
                                     logger.warning(f"Auto-retreino falhou: {e}")
                                     import traceback; traceback.print_exc()
@@ -1133,6 +1303,12 @@ async def dashboard_startup():
         threading.Thread(target=_backfill_archive_quantiles, daemon=True).start()
     except Exception as e:
         logger.warning(f"backfill q25/q75 não agendado: {e}")
+    # EXP-Q2b: re-projeção do histórico do archive com os modelos vigentes
+    # (a cada retreino/promoção — cobre também retreinos feitos com o dashboard parado).
+    try:
+        threading.Thread(target=_reproject_archive_forecasts, daemon=True).start()
+    except Exception as e:
+        logger.warning(f"reproject do histórico não agendado: {e}")
 
 @app.on_event("shutdown")
 async def dashboard_shutdown():
@@ -1288,22 +1464,14 @@ def api_history(horizon: str = "1", window: int = 52):
     # publicado — coerente com o fan do /api/forecast e com as linhas live do
     # archive (que já saem calibradas da inferência). h fora de apply_horizons
     # permanecem raw.
+    # EXP-Q2: post-processing completo do live (viés 1.08 → perfil → conformal
+    # pool → phantom gating → clamp) sobre os slots CRUS da validação — a
+    # timeline exibe a mesma forma do fan publicado (coerente com o archive
+    # re-projetado). h fora de apply_horizons/Δ config: mesmo comportamento live.
     try:
-        for se, pv in points.items():
-            taus = {"0.05": pv.get("q05"), "0.25": pv.get("q25"), "0.5": pv.get("pred"),
-                    "0.75": pv.get("q75"), "0.95": pv.get("q95")}
-            cal, applied = _calibrate_qvals(int(h), str(se).zfill(6), taus)
-            if not applied:
-                continue
-            pv["pred"] = cal.get("0.5")
-            pv["pred_low"] = cal.get("0.05")
-            pv["pred_high"] = cal.get("0.95")
-            pv["q05"] = cal.get("0.05")
-            pv["q25"] = cal.get("0.25")
-            pv["q75"] = cal.get("0.75")
-            pv["q95"] = cal.get("0.95")
+        _shape_history_points(int(h), points)
     except Exception as e:
-        logger.warning(f"calibração history falhou (mantendo raw): {e}")
+        logger.warning(f"shape/calibração history falhou (mantendo cru): {e}")
 
     # Real deve ser live (mesma lógica API 8001 com nowcast), não CSV defasado
     try:
@@ -1417,9 +1585,23 @@ def api_history(horizon: str = "1", window: int = 52):
         p_q75 = pv.get("q75")
         stitched = False
         stitch_meta = None
+        # EXP-Q2b: archive re-projetado VENCE onde cobrir — o timeline mostra o
+        # que o modelo vigente (retreinado) diria para esta origin, no mesmo
+        # desenho do fan atual. A série walk-forward fica só onde não há archive
+        # (2022–202617 e origins ausentes). 5 quantis já vêm do reproject
+        # (q25/q75 completos); non-crossing abaixo reordena por segurança.
+        am = archive_map.get(se)
+        arch_full = am is not None and am.get("q05") is not None and am.get("q50") is not None and am.get("q95") is not None
+        if arch_full:
+            p_low = am.get("q05", p_low)
+            p_q25 = am.get("q25", p_q25)
+            p_med = am.get("q50", p_med)
+            p_q75 = am.get("q75", p_q75)
+            p_high = am.get("q95", p_high)
+            stitched = True
+            stitch_meta = am
         # Se gap honesto (sem validacao), preenche com archive live mais recente para esse horizonte
-        if (p_med is None or p_low is None or p_high is None) and se in archive_map:
-            am = archive_map[se]
+        elif (p_med is None or p_low is None or p_high is None) and am is not None:
             # só usa se archive tem os 3 quantis completos (q05/q50/q95)
             if am.get("q05") is not None and am.get("q50") is not None and am.get("q95") is not None:
                 p_low = am.get("q05", p_low)
