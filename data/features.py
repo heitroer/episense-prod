@@ -273,9 +273,24 @@ class EpisenseFeatureEngineer:
 
         # YTD do ano passado (mesmo ponto do ciclo) + razao - alinhado por semana (respeita 53 semanas)
         if 'casos_ytd' in df.columns:
-            df['casos_ytd_prev_year'] = df.groupby('semana')['casos_ytd'].shift(1)
+            if self.config.get("features", {}).get("align_ytd_by_epi_year", False):
+                from data.epiweeks import weeks_in_year
+
+                year = df["ano"].astype(int)
+                week = df["semana"].astype(int)
+                previous_year = year - 1
+                last_week = previous_year.map({y: weeks_in_year(y) for y in previous_year.unique()})
+                # Na SE 53, um ano anterior de 52 semanas contribui com seu acumulado final.
+                keys = pd.MultiIndex.from_arrays([previous_year, week.clip(upper=last_week)])
+                totals = pd.Series(df["casos_ytd"].to_numpy(), index=pd.MultiIndex.from_arrays([year, week]))
+                df["casos_ytd_prev_year"] = totals.reindex(keys).to_numpy()
+                previous = df["casos_ytd_prev_year"]
+            else:
+                # Compatibilidade com versões já treinadas.
+                df["casos_ytd_prev_year"] = df.groupby("semana")["casos_ytd"].shift(1)
+                previous = df["casos_ytd_prev_year"].fillna(0)
             df['ytd_share_prev_year'] = df['casos_ytd'] / (df['casos_ytd_prev_year'] + 1e-6)
-            df['log_ytd_ratio'] = np.log1p(df['casos_ytd']) - np.log1p(df['casos_ytd_prev_year'].fillna(0))
+            df['log_ytd_ratio'] = np.log1p(df['casos_ytd']) - np.log1p(previous)
             # razao YTD suavizada
             df['ytd_ratio_roll4'] = df['ytd_share_prev_year'].rolling(4, min_periods=1).mean()
 
@@ -846,15 +861,27 @@ class EpisenseFeatureEngineer:
             else:
                 raise ValueError("Neither 'log_casos' nor 'casos' found in dataframe")
 
-        for h in target_horizons:
-            df[f'target_h{h}'] = df['log_casos'].shift(-h)
-        df['target'] = df['target_h1']
+        if self.config.get("features", {}).get("expand_wolbachia_campo_grande", False):
+            # First full epiweek after each contemporaneous PAHO announcement.
+            # The ordinal stage records program history, not measured prevalence.
+            week = pd.to_numeric(df["SE"], errors="raise")
+            df["wolbachia_cg_stage"] = (
+                (week >= 202051).astype("int64") + (week >= 202430).astype("int64")
+            )
+
+        df = create_target_variables(df, target_horizons)
 
         # CASE RATE (per 100k pop)
-        if 'pop' in df.columns and df['pop'].notna().any():
-            pop = df['pop'].iloc[0] if df['pop'].notna().any() else 906092
-            df['casos_rate'] = df['casos'] / pop * 100000
-            df['log_casos_rate'] = np.log1p(df['casos_rate'])
+        weekly_population = self.config.get("features", {}).get("weekly_population", False)
+        if "pop" in df and (weekly_population or df["pop"].notna().any()):
+            if weekly_population:
+                population = pd.to_numeric(df["pop"], errors="coerce")
+                population = population.where(np.isfinite(population) & (population > 0))
+            else:
+                # Replay de modelos treinados com o denominador da primeira semana.
+                population = df["pop"].iloc[0]
+            df["casos_rate"] = 100000 * (df["casos"] / population)
+            df["log_casos_rate"] = np.log1p(df["casos_rate"])
 
         # Lags avancados: log_lagN = shift(N) - NUNCA shift(0) para lag1
         df = self.create_lag_features(df, 'log_casos', max_lag=12, convention=convention)
@@ -996,8 +1023,10 @@ class EpisenseFeatureEngineer:
 def create_target_variables(df: pd.DataFrame, horizons: List[int] = [1, 2, 3, 4],
                            target_col: str = 'log_casos') -> pd.DataFrame:
     df = df.copy()
+    from data.observations import observed_values
+    outcomes = observed_values(df, target_col)
     for h in horizons:
-        df[f'target_h{h}'] = df[target_col].shift(-h)
+        df[f'target_h{h}'] = outcomes.shift(-h)
     df['target'] = df['target_h1']
     return df
 

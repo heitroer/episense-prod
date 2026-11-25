@@ -94,6 +94,10 @@ def process_infodengue_data(df: pd.DataFrame) -> pd.DataFrame:
     
     # Keep ONLY the required columns from InfoDengue
     keep_cols = ['SE', 'casos', 'casos_est']
+    if str(GEOCODE) == "5003702":
+        if "municipio_nome" not in df or not df["municipio_nome"].str.strip().eq("Dourados").all():
+            raise ValueError("Resposta InfoDengue incompatível com Dourados")
+        keep_cols = list(df.columns)
     available_cols = [c for c in keep_cols if c in df.columns]
     df = df[available_cols].copy()
     
@@ -126,7 +130,7 @@ def process_infodengue_data(df: pd.DataFrame) -> pd.DataFrame:
     
     # Ensure casos is numeric
     if 'casos' in df.columns:
-        df['casos'] = pd.to_numeric(df['casos'], errors='coerce').fillna(0).astype(int)
+        df['casos'] = pd.to_numeric(df['casos'], errors='coerce').astype('Int64')
     
     # Sort by SE
     df = df.sort_values('SE').reset_index(drop=True)
@@ -161,8 +165,15 @@ def update_full_history(df_new: pd.DataFrame, full_path: Path) -> pd.DataFrame:
     return df_merged
 
 
+def archive_first_weekly_counts(df: pd.DataFrame) -> Path:
+    """Preserve the first collection seen for each new latest API week."""
+    from data.archive_weekly_cases import save_counts
+    return save_counts(df[["SE", "casos"]].astype(object).fillna("").to_dict("records"), DATA_RAW_DIR / "first_seen")
+
+
 def save_infodengue_data(df: pd.DataFrame) -> Path:
     """Save processed InfoDengue data with timestamp."""
+    archive_first_weekly_counts(df)
     timestamp = datetime.now().strftime("%Y%m%d")
     filename = f"infodengue_cg_{timestamp}.csv"
     filepath = DATA_RAW_DIR / filename

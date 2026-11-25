@@ -33,6 +33,8 @@ data_sources:
     - relative_humidity_2m_mean
     - wind_speed_10m_max
 features:
+  align_ytd_by_epi_year: true
+  weekly_population: true  # Denominador da incidência observado em cada SE.
   target_transform: log1p
   legacy_convention:
     log_lag1_shift: 0
@@ -90,7 +92,7 @@ features:
   expand_extra: false
   expand_climatology: true
   expand_trend: true
-  expand_rt: true
+  expand_rt: false  # Indicadores revisáveis excluídos do treino em todos os horizontes.
   expand_outbreak: true
   expand_regime_conditional: true
   expand_peak_timing: true
@@ -148,6 +150,7 @@ model:
 training:
   start_year: 2014
   walk_forward:
+    label_maturity_weeks: 16  # aproximação quando não há vintages históricos
     n_splits: 4
     test_size_weeks: 52
     gap_weeks: 8
@@ -234,25 +237,16 @@ training:
       "6": {"0.95": 10}
       "7": {"0.95": 10}
       "8": {"0.95": 10}
-    # v6 (Rt, Codeço et al. 2018 via InfoDengue): a família rt_*/p_rt1_* ganha em
-    # h1 (WIS -0.4%, w90 -7%), h3 (MAE -6.7%), h4 (MAE -0.9%/WIS -2.7%) e h8
-    # (MAE -8.9%) — mas regride de forma DETERMINÍSTICA em h2 (MAE +12.3%) e
-    # h5 (MAE +8.2%/WIS +7.1%), e é neutra-sem-ganho em h6/h7. Ban por
-    # horizonte: Rt entra só nos horizontes vencedores (prefixo/startswith).
     banned_features_per_horizon:
-      "2": ["rt_", "p_rt1_"]
-      "5": ["rt_", "p_rt1_"]
-      "6": ["rt_", "p_rt1_"]
-      "7": ["rt_", "p_rt1_"]
       # EXP-F1c (v8): fase multi-anual só onde transferiu — h2 uníssono nos 4
       # folds (−16.3/−4.2/−0.5/−0.7); h4 regressa em todos (ban), h3 só no
       # fold0, h1/h5–h8 neutros (ban p/ minimizar divergência do canônico).
       "1": ["phase_"]
       "3": ["phase_"]
       "4": ["phase_"]
-      "5": ["rt_", "p_rt1_", "phase_"]
-      "6": ["rt_", "p_rt1_", "phase_"]
-      "7": ["rt_", "p_rt1_", "phase_"]
+      "5": ["phase_"]
+      "6": ["phase_"]
+      "7": ["phase_"]
       "8": ["phase_"]
   temporal_weighting:
     enabled: true
@@ -260,9 +254,10 @@ training:
     half_life_years_long: 10.0  # 6.0->10 h5-8 preserva 2019 para h8 ETP, mas q95 sem peak_weight compensa
   peak_weighting:
     enabled: true
-    weight_200: 1.3
-    weight_500: 1.4  # 1.8->1.4 reduz peso excessivo de picos medios (evita 4x peso combinado)
-    weight_1000: 1.8  # 2.2->1.8 reduz peso de picos extremos
+    weight_200: 1.6
+    weight_500: 2.1
+    weight_1000: 2.8
+    long_interval: {weight_200: 1.0, weight_500: 1.0, weight_1000: 1.0}
   transition_weighting:
     # EXP-R1 (nov/2026): peso extra p/ amostras cujo ALVO (SE+horizon) desvia da
     # climatologia da própria semana-alvo (|y_log − mediana_log(semana)| > thresh):
@@ -441,12 +436,6 @@ postprocessing:
     # Walk-forward 2022-25, perfil-P2 (176 fans, scripts/analyze_band_shape.py):
     # cov90 0.835→0.876 (+4.2pp, nominal 0.90 antes do conformal), cov50
     # 0.428→0.509 (nominal 0.50), WIS −2.1% (MELHOR), MAE inalterado.
-    # Validação REAL do pipeline live completo (scripts/validate_final_pipeline.py,
-    # perfil + conformal recalibrado sobre o perfil, pool=live):
-    # cov90 0.872, cov50 0.489, WIS −4.6% vs raw, w90 −9.9%, MAE idêntico.
-    # A patologia h5 (cov50 0.36/cov90 0.79) é EXCLUSIVA da variante
-    # expanding-by-fold; no pool (live) h5 melhora (0.507/0.890, WIS −5.8%).
-    # Evidência: logs/validate_exp_Q2_20261106.txt
     enabled: true
     mode: profile
     profile:
@@ -477,8 +466,8 @@ quantile_width:
   # out-of-sample por construção) + semanas validadas dos folds anteriores
   # (med_ref = mediana per-seed da validação do fold j) até o cutoff do fold
   # (gap do walk preservado). Produção: FULL width model por seed no pool
-  # agregado; inference compõe med_full_s + u_full_s. Fallback: pool < 
-  # min_pool_rows ⇒ mantém caudas absolutas (pinball raw).
+  # agregado; inference compõe med_full_s + u_full_s. Nos folds, pool <
+  # min_pool_rows usa caudas absolutas; falha no ajuste final impede a publicação.
   mode: absolute            # 'absolute' (v8 canônico) | 'around_median' (EXP-Q1, REPROVADO nov/2026)
   inner:
     train_max_se: '202035'  # inner med treina só com o passado
@@ -691,3 +680,13 @@ metrics:
       spl_075: 0.85
       spl_095: 1.2
       etp: 9
+
+# Orçamentos de regressão retrospectiva de engenharia. Os critérios de utilidade
+# do futuro piloto precisam ser definidos com os usuários operacionais.
+promotion_policy:
+  min_paired_weeks: 104
+  min_peak_weeks: 3
+  coverage_90_floor: 0.70
+  max_coverage_error_increase: 0.02
+  max_ratio: {mae: 1.02, wis_total: 1.02, width_90: 1.10, peak_mae: 1.10}
+  max_mae_persistence_ratio: {1: 1.10, 2: 1.10, 3: 1.30, 4: 1.00, 5: 1.00, 6: 1.00, 7: 1.00, 8: 1.00}

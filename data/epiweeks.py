@@ -47,3 +47,14 @@ def date_to_epiweek(d) -> str:
         w1 = _w1_sunday(y)
     week = (d - w1).days // 7 + 1
     return f"{y}{week:02d}"
+
+
+def add_epiweeks(se: str, weeks: int) -> str:
+    """Desloca uma semana epidemiológica válida pelo calendário brasileiro."""
+    se = str(se)
+    if len(se) != 6 or not se.isdigit():
+        raise ValueError(f"Semana epidemiológica inválida: {se}")
+    year, week = int(se[:4]), int(se[4:])
+    if not 1 <= week <= weeks_in_year(year):
+        raise ValueError(f"Semana epidemiológica inválida: {se}")
+    return date_to_epiweek(epiweek_to_date(year, week) + pd.Timedelta(weeks=weeks))

@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))       # project root (data.epiweeks)
 import yaml
 
+from data.observations import observed_values
 from data.epiweeks import weeks_in_year, epiweek_to_date
 
 logging.basicConfig(level=logging.INFO)
@@ -146,7 +147,7 @@ class EpisenseDataProcessor:
         
         # Flag semanas imputadas (fabricadas) antes do fillna
         if 'casos' in merged.columns:
-            merged['is_imputed'] = merged['casos'].isna()
+            merged['is_imputed'] = observed_values(merged).isna()
             n_imputed = int(merged['is_imputed'].sum())
             if n_imputed > 0:
                 logger.warning(f"Semanas imputadas (fabricadas): {n_imputed} semanas com casos ausente preenchidas com 0")
@@ -241,7 +242,17 @@ class EpisenseDataProcessor:
     def save_processed(self, df: pd.DataFrame, filename: str = "episense_base.csv") -> Path:
         """Save processed data."""
         output_path = self.data_processed_dir / filename
-        df.to_csv(output_path, index=False)
+        from tempfile import NamedTemporaryFile
+
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=output_path.parent,
+                                delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            df.to_csv(temp_path, index=False)
+            temp_path.chmod(0o644)
+            temp_path.replace(output_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
         logger.info(f"Saved processed data to {output_path} ({df.shape})")
         return output_path
     

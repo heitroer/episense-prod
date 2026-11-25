@@ -104,7 +104,7 @@ def reshape_fan_logits(preds: Dict[int, Dict[float, np.ndarray]],
     apply_hs = set(int(x) for x in cfg.get('apply_horizons', horizons) or horizons)
 
     hs = [h for h in horizons if h in preds]
-    if len(hs) < 2:
+    if not hs or (len(hs) < 2 and mode != 'profile'):
         return preds
 
     # ---- empilha cases + mediana [H, N] ----
@@ -147,10 +147,10 @@ def reshape_fan_logits(preds: Dict[int, Dict[float, np.ndarray]],
             continue
         if mode == 'profile':
             prof = profile.get(f'{tau:.2f}') or profile.get(str(tau))
-            if prof is None or len(prof) < len(hs):
+            if prof is None or len(prof) < max(hs):
                 logger.warning(f"band_shape profile ausente/incompleto para tau={tau} — tau pulado")
                 continue
-            f = np.tile(np.asarray(prof, dtype=float)[len(prof) - len(hs):][:, None], (1, n))
+            f = np.tile(np.asarray(prof, dtype=float)[np.asarray(hs) - 1][:, None], (1, n))
         else:
             q = _cases_matrix(tau)
             f = _safe_div(q, med)

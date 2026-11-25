@@ -1,0 +1,16 @@
+{
+  "campo_grande": {
+    "mature": 1588,
+    "n_folds": 4,
+    "horizons": 8,
+    "reproduced_predictions": 1672,
+    "peak_inside_90": 8
+  },
+  "dourados": {
+    "mature": 1588,
+    "n_folds": 4,
+    "horizons": 8,
+    "reproduced_predictions": 1672,
+    "peak_inside_90": 8
+  }
+}

@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 class EpisenseInference:
     """Inference engine for trained Episense models."""
     
-    def __init__(self, model_dir: str = "models", config: Dict = None):
+    def __init__(self, model_dir: str = "models", config: Dict = None, *, load_models: bool = True):
         self.model_dir = Path(model_dir)
+        saved_config = self.model_dir / "training_config.yaml"
+        if load_models and saved_config.is_file():
+            from config.config import load_config
+            config = load_config(str(saved_config))
         self.config = config or {}
         
         self.models = {}  # {horizon: {quantile: {seed: model}}}
@@ -56,10 +60,11 @@ class EpisenseInference:
             self.phantom_gating_disabled_horizons = {1, 2, 3, 4}
         self._gated_info: Dict[int, bool] = {}
         
-        self._load_models()
-        self._load_metadata()
-        self._load_normalization_params()
-        self._load_quantile_recalibration()
+        if load_models:
+            self._load_models()
+            self._load_metadata()
+            self._load_normalization_params()
+            self._load_quantile_recalibration()
         # ---- Calibração conformal v2 (CQR + median shift) — substitui recal legacy ----
         self.quantile_conformal_config = self.config.get('quantile_conformal', {}) if isinstance(self.config.get('quantile_conformal', {}), dict) else {}
         self.quantile_conformal_enabled = bool(self.quantile_conformal_config.get('enabled', False)) and not self.quantile_recalibration_enabled
@@ -77,7 +82,7 @@ class EpisenseInference:
         self.median_bias_factor_horizons = set(int(x) for x in self.config.get('postprocessing', {}).get('median_bias_horizons', [2, 3, 4, 5, 6, 7, 8]) or [])
         self.median_bias_factor = float(self.config.get('postprocessing', {}).get('median_bias_factor', 1.08))
         self._median_bias_log = float(np.log1p(self.median_bias_factor - 1.0))
-        if self.quantile_conformal_enabled:
+        if load_models and self.quantile_conformal_enabled:
             try:
                 from models.calibration import load_json as _load_conformal
                 self.conformal = _load_conformal(self.model_dir / "quantile_conformal.json")
@@ -116,15 +121,15 @@ class EpisenseInference:
         # EXP-Q1: contrato de composição das caudas (quantile_mode.json ships com
         # os modelos; default 'absolute' — mediana/q25/q75 mais caudas diretas).
         self.width_mode = 'absolute'
-        try:
-            _mode_path = self.model_dir / "quantile_mode.json"
-            if _mode_path.exists():
-                with open(_mode_path) as _mf:
-                    _mode_doc = json.load(_mf) or {}
-                self.width_mode = str(_mode_doc.get('mode', 'absolute'))
-                logger.info(f"Q1 width mode: {self.width_mode} (composed taus: {_mode_doc.get('composed_taus')})")
-        except Exception as e:
-            logger.warning(f"quantile_mode.json ilegível ({e}) — default 'absolute'")
+        mode_path = self.model_dir / "quantile_mode.json"
+        if mode_path.exists():
+            mode_doc = json.loads(mode_path.read_text())
+            self.width_mode = mode_doc["mode"]
+            expected = {"absolute": [], "around_median": [0.05, 0.95]}
+            if self.width_mode not in expected or sorted(mode_doc["composed_taus"]) != expected[self.width_mode]:
+                raise ValueError(f"Contrato de caudas inválido em {mode_path}")
+        elif (self.config.get("quantile_width") or {}).get("mode") == "around_median":
+            raise ValueError(f"Modelo de largura sem manifesto em {mode_path}")
         for h in self.target_horizons:
             for tau in self.quantiles:
                 n = len(self.models.get(h, {}).get(tau, {}))
@@ -288,6 +293,8 @@ class EpisenseInference:
             fe_cfg = {
                 'features': {
                     **{k: bool(v) for k, v in _feat_cfg.items() if str(k).startswith('expand_')},
+                    "weekly_population": _feat_cfg.get("weekly_population", False),
+                    "align_ytd_by_epi_year": _feat_cfg.get("align_ytd_by_epi_year", False),
                     'expand_extra': self.config.get('training', {}).get('feature_selection', {}).get('expand_extra', False),
                 }
             }
@@ -476,13 +483,7 @@ class EpisenseInference:
                 # EXP-Q1: composição das caudas em torno da mediana por seed
                 med_seed_preds = {}
                 if self.width_mode == 'around_median' and 0.5 in self.models.get(horizon, {}):
-                    try:
-                        _med_model_first = next(iter(self.models[horizon][0.5].values()), None)
-                        _cols_med = list(_med_model_first.feature_name()) if _med_model_first is not None else None
-                    except Exception:
-                        _cols_med = None
-                    X_med = (df_last[_cols_med] if _cols_med else
-                             self._select_horizon_features(df_last, horizon, 0.5))
+                    X_med = self._select_horizon_features(df_last, horizon, 0.5)
                     med_seed_preds = {}
                     for seed, model in self.models[horizon][0.5].items():
                         try:
@@ -499,11 +500,9 @@ class EpisenseInference:
                         continue
 
                     # EXP-Q1: caudas compostas med_s + u_s (por seed, depois média em log)
-                    if self.width_mode == 'around_median' and tau in (0.05, 0.95) and med_seed_preds:
+                    if self.width_mode == 'around_median' and tau in (0.05, 0.95):
                         try:
-                            _first_w = next(iter(self.models[horizon][tau].values()), None)
-                            _cols_w = list(_first_w.feature_name()) if _first_w is not None else None
-                            X_w = df_last[_cols_w] if _cols_w else self._select_horizon_features(df_last, horizon, tau)
+                            X_w = self._select_horizon_features(df_last, horizon, tau)
                             edge_preds = []
                             for seed, model in self.models[horizon][tau].items():
                                 if seed not in med_seed_preds:
@@ -556,107 +555,44 @@ class EpisenseInference:
                     else:
                         predictions[horizon][tau] = np.array([])
         
-            # Apply non-crossing constraint if enabled
-            if self.non_crossing:
-                predictions = self._apply_non_crossing(predictions)
-        
-            # BUGFIX Bug1 - quantile recalibration opt-in (disabled by default to avoid circular leakage)
-            # Only apply if quantile_recalibration.enabled==true in config; otherwise skip even if files exist.
-            # When enabled, _apply_quantile_recalibration logs WARNING per horizon (not silent).
-            has_recal = bool(self.quantile_recalibration or getattr(self, 'quantile_recalibration_regime', {}))
-            if getattr(self, 'quantile_recalibration_enabled', False) and has_recal:
-                try:
-                    last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
-                except Exception:
-                    last_se = None
-                logger.warning("Applying quantile recalibration (opt-in enabled=true) - deltas in log-scale; ensure FULL excluded calibration folds else circular leakage")
-                predictions = self._apply_quantile_recalibration(predictions, last_se=last_se)
-            elif has_recal:
-                logger.info("Quantile recalibration files present but skipped (enabled=false, default) to avoid circular leakage")
-            # Correção de viés de mediana (h>=2, fator 1.08): aplicada em log a
-            # TODOS os quantis ANTES da re-forma — a banda é âncora do nível
-            # final publicado (q50 == casos_previstos).
-            # EXP-Q2: movida de get_latest_predictions para cá e estendida a
-            # todos os quantis (antes tocava só casos_previstos ->
-            # q50 reportado != mediana publicada no fan).
-            try:
-                _mb = self._median_bias_log
-                if _mb != 0.0:
-                    for h in list(predictions.keys()):
-                        if int(h) not in self.median_bias_factor_horizons:
-                            continue
-                        for tau in list(predictions[h].keys()):
-                            arr = predictions[h][tau]
-                            if arr is None or getattr(arr, 'size', 0) == 0:
-                                continue
-                            arr = np.maximum(0.0, np.asarray(arr, dtype=float)) + _mb
-                            predictions[h][tau] = arr
-            except Exception as e:
-                logger.warning(f"median bias factor falhou: {e}")
-            # EXP-Q2: re-forma da banda em torno da mediana (fan chart) —
-            # q* = med × f*[h] (perfil calibrado), deixa o desenho da banda colado
-            # ao desenho da mediana (elimina picos aleatórios de cauda e q05 no chão).
-            # Vem ANTES do conformal: o perfil define a largura base; os deltas
-            # CQR por regime modulam as caudas por cima do perfil.
-            if self.band_shape_enabled:
-                try:
-                    from models.band_shape import reshape_fan_logits
-                    predictions = reshape_fan_logits(
-                        predictions, list(self.target_horizons), self.band_shape_config)
-                except Exception as e:
-                    logger.warning(f"band_shape falhou (sem aplicação): {e}")
-            # Calibração conformal v3 (CQR delta-only): substitui o recal legacy.
-            # Predições em log1p; regime por intensidade da semana-base (última
-            # observada); horizontes apply_horizons (default h1-h3) antes do gating.
-            if getattr(self, 'quantile_conformal_enabled', False) and getattr(self, 'conformal', None):
-                try:
-                    try:
-                        _last_se_conf = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in getattr(df_last, 'columns', []) and len(df_last) > 0 else None
-                    except Exception:
-                        _last_se_conf = None
-                    try:
-                        _casos_conf = float(df['casos'].iloc[-1]) if 'casos' in getattr(df, 'columns', []) and len(df) > 0 else None
-                    except Exception:
-                        _casos_conf = None
-                    predictions = self._apply_conformal(predictions, last_se=_last_se_conf,
-                                                        casos_base=_casos_conf)
-                except Exception as e:
-                    logger.warning(f"conformal apply falhou: {e}")
-            # BUGFIX Bug9 - phantom gating opt-in per horizon, disabled by default
-            # Gating clamps q95 to median*3.5 in calm (Jun-Set) which hides early outbreak; now:
-            # * disabled by default (phantom_gating.enabled=false) - matches _load default
-            # * when enabled, H1-H4 disabled by default (disabled_horizons=[1,2,3,4]) to preserve short-horizon outbreak signal
-            # * logs WARNING when clamp occurs and exposes gated flag in API (get_latest_predictions)
-            if getattr(self, 'phantom_gating_enabled', False):
-                try:
-                    last_se = str(df_last['SE'].iloc[0]).zfill(6) if 'SE' in df_last.columns and len(df_last)>0 else None
-                except Exception:
-                    last_se = None
-                predictions = self._apply_phantom_gating(predictions, last_se=last_se)
-            else:
-                # clear gated info when disabled
-                self._gated_info = {h: False for h in predictions.keys()}
-            # FIX q05 negativo: clamp todos quantis para casos >=0 (nunca prever -1)
-            # Aplica após recal + gating + non_crossing, em escala casos e volta para log
-            try:
-                for h in list(predictions.keys()):
-                    for tau in list(predictions[h].keys()):
-                        log_arr = predictions[h][tau]
-                        # log pode ser negativo (ex: -0.2 -> casos -0.18) após delta -0.64
-                        cases = np.expm1(log_arr)
-                        cases = np.maximum(0, cases)  # nunca negativo
-                        # também garante que q05 <= q50 <= q95 após clamp (reaplica non_crossing se necessário)
-                        predictions[h][tau] = np.log1p(cases)
-                if self.non_crossing:
-                    predictions = self._apply_non_crossing(predictions)
-                # segunda passada de clamp caso non_crossing tenha reintroduzido negativo por sort (improvável)
-                for h in list(predictions.keys()):
-                    for tau in list(predictions[h].keys()):
-                        predictions[h][tau] = np.maximum(0, predictions[h][tau])  # log >=0 => casos 0
-            except Exception as e:
-                logger.warning(f"clamp q05 negativo falhou: {e}")
-        
-            return predictions
+            origin = str(df_last["SE"].iloc[0]).zfill(6) if "SE" in df_last else None
+            cases = float(df["casos"].iloc[-1]) if "casos" in df else None
+            return self.postprocess_predictions(predictions, origin, cases)
+
+    def shape_predictions(self, predictions, origin=None):
+        """Aplica as etapas anteriores à calibração conformal."""
+        if self.non_crossing:
+            predictions = self._apply_non_crossing(predictions)
+        if self.quantile_recalibration_enabled and (
+            self.quantile_recalibration or self.quantile_recalibration_regime
+        ):
+            predictions = self._apply_quantile_recalibration(predictions, last_se=origin)
+        if self._median_bias_log:
+            for h, quantiles in predictions.items():
+                if int(h) in self.median_bias_factor_horizons:
+                    for tau, values in quantiles.items():
+                        if values is not None and len(values):
+                            quantiles[tau] = np.maximum(0.0, values) + self._median_bias_log
+        if self.band_shape_enabled:
+            from models.band_shape import reshape_fan_logits
+            predictions = reshape_fan_logits(predictions, list(self.target_horizons), self.band_shape_config)
+        return predictions
+
+    def postprocess_predictions(self, predictions, origin, cases):
+        """Transformação usada na publicação e na avaliação temporal."""
+        predictions = self.shape_predictions(predictions, origin)
+        if self.quantile_conformal_enabled and self.conformal:
+            predictions = self._apply_conformal(predictions, last_se=origin, casos_base=cases)
+        if self.phantom_gating_enabled:
+            predictions = self._apply_phantom_gating(predictions, last_se=origin)
+        else:
+            self._gated_info = {h: False for h in predictions}
+        for quantiles in predictions.values():
+            for tau, values in quantiles.items():
+                quantiles[tau] = np.maximum(0.0, values)
+        if self.non_crossing:
+            predictions = self._apply_non_crossing(predictions)
+        return predictions
 
     def _apply_conformal(self, predictions: Dict[int, Dict[float, 'np.ndarray']], last_se: str = None,
                          casos_base: float = None) -> Dict[int, Dict[float, 'np.ndarray']]:
@@ -1069,13 +1005,11 @@ class EpisenseInference:
         `week > 52` wrap returned the wrong SE in years with 53 weeks.
         Accepts int/float/str SEs (CSVs are often read with numeric dtypes).
         """
-        from data.epiweeks import epiweek_to_date, date_to_epiweek
-        se_str = str(current_se).strip()
-        if '.' in se_str:
-            se_str = se_str.split('.')[0]
-        se_str = se_str.zfill(6)
-        start = epiweek_to_date(int(se_str[:4]), int(se_str[4:]))
-        return date_to_epiweek(start + pd.Timedelta(weeks=horizon))
+        from data.epiweeks import add_epiweeks
+
+        se = str(current_se).strip().split(".")[0].zfill(6)
+        return add_epiweeks(se, horizon)
+
 
 
 def load_latest_data(config: Dict = None) -> pd.DataFrame:

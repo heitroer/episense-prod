@@ -104,19 +104,15 @@ def make_regime_hook(casos_by_se: Dict[str, float],
 
     thresholds: {'high': 100.0, 'mid': 20.0} — clusters absolutos (invariantes
     à estação). base_se = semana em que a previsão é feita; casos observados
-    até ela decidem o regime. Retorna callable (h, target_se) -> 'high'|'mid'|'low'
+    até ela decidem o regime. Retorna callable (h, origin_se) -> 'high'|'mid'|'low'
     (ou 'global' quando o valor da base é desconhecido).
     """
     th = dict(thresholds or {})
     high = float(th.get('high', 100.0))
     mid = float(th.get('mid', 20.0))
 
-    def hook(h: int, target_se: str) -> str:
-        try:
-            base = add_epiweeks(str(target_se), -int(h))
-        except Exception:
-            return 'global'
-        c = casos_by_se.get(str(base).zfill(6), None)
+    def hook(h: int, origin_se: str) -> str:
+        c = casos_by_se.get(str(origin_se).zfill(6))
         try:
             c = float(c)
         except Exception:
@@ -141,12 +137,14 @@ def compute_conformal(fold_series: Dict, regime_hook: Callable,
     """CQR (delta por τ de banda, opcional median shift) por horizonte/regime.
 
     fold_series: {h: {tau: [{'fold', 'test_se', 'y_test_casos', 'y_pred_casos'}]}}
-    regime_hook: callable(h, target_se) -> chave de regime (decidível no base time).
+    regime_hook: callable(h, origin_se) -> chave de regime (decidível no base time).
     exclude_folds: remove folds do pool (LOO); para 'expanding' o chamador passa
       o fold_series apenas com os folds anteriores.
     Retorna {str(h): {regime_key: {'deltas', 'median_shift', 'n_cal', 'w_sum'}}}
     + meta {'ref_se', 'half_life_years', 'excluded_folds', 'n_folds_calibration'}.
     """
+    from models.validation_calendar import origin_weeks, target_weeks
+
     if not fold_series:
         return {}
     fs_norm: Dict[int, Dict[float, list]] = {}
@@ -158,7 +156,7 @@ def compute_conformal(fold_series: Dict, regime_hook: Callable,
     if not fs_norm:
         return {}
     ref_se = max(str(s).zfill(6) for td in fs_norm.values()
-                 for b in td.get(0.5, []) for s in b.get('test_se', []))
+                 for b in td.get(0.5, []) for s in origin_weeks(b))
     out: Dict = {'ref_se': ref_se, 'half_life_years': half_life_years,
                  'excluded_folds': sorted(int(f) for f in (exclude_folds or set())),
                  'n_folds_calibration': None}
@@ -177,7 +175,8 @@ def compute_conformal(fold_series: Dict, regime_hook: Callable,
         rows_pred: Dict[float, List[float]] = {t: [] for t in BAND_TAUS}
         for f_idx in fold_list:
             b50 = tau_dict[0.5][f_idx]
-            f_ses = [str(s).zfill(6) for s in b50['test_se']]
+            target_weeks(b50, h)
+            f_ses = origin_weeks(b50)
             rows_se += f_ses
             rows_y.append(np.asarray([float(v) for v in b50['y_test_casos']], float))
             for tau in BAND_TAUS:
@@ -186,7 +185,7 @@ def compute_conformal(fold_series: Dict, regime_hook: Callable,
                     rows_pred[tau] += [float('nan')] * len(f_ses)
                     continue
                 b = blocks[f_idx]
-                m = {str(s).zfill(6): float(p) for s, p in zip(b['test_se'], b['y_pred_casos'])}
+                m = {str(s).zfill(6): float(p) for s, p in zip(origin_weeks(b), b['y_pred_casos'])}
                 rows_pred[tau] += [m.get(s, float('nan')) for s in f_ses]
         if len(rows_se) < 5:
             continue

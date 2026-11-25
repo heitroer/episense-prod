@@ -10,15 +10,15 @@ mediana com delta −0.27 no regime low). Esta passada regenera os deltas CQR
 resíduos da BANDA PERFILADA espelhando o pipeline live:
     band_cases = med × profile[h] × (1.08 se h>=2)      # viés FBias +0.05
     delta_τ    = Quantil_w(τ; log1p(y) − log1p(band_cases))
-Gera production (pool 4 folds, convenção atual do arquivo) + expanding_by_fold
-(fold f calibrado só com folds < f — honesto).
+Gera production (alvos maduros, convenção atual do arquivo) + expanding_by_fold
+(fold f calibrado com desfechos maduros de folds anteriores).
 
 Uso:  .venv/bin/python scripts/recompute_conformal_profile.py [--write]
 Sem --write: só imprime (dry-run).
 """
 import sys
-import copy
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -35,79 +35,57 @@ from models.calibration import (compute_conformal, make_regime_hook,  # noqa
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 BAND_TAUS = (0.05, 0.25, 0.75, 0.95)
 
-SRC = ROOT / 'models/validation_predictions.json'
+MODEL_DIR = ROOT / os.environ.get('EPISENSE_MODELS_DIR', 'models')
+SRC = MODEL_DIR / 'validation_predictions.json'
 
 
-def load_blocks(h, tau):
-    with open(SRC) as f:
-        src = json.load(f)
-    d = src[str(h)]
-    key = f"{tau:.2f}" if f"{tau:.2f}" in d else str(tau)
-    return d[key]
+def calibrate_profile(vp, cfg, base):
+    from data.epiweeks import add_epiweeks
+    from models.validation_calendar import mature_calibration_series, origin_weeks
 
+    from models.validation_calendar import check_observed_targets
+    check_observed_targets(vp, base)
+    post = cfg["postprocessing"]
+    profile = {float(k): v for k, v in post["band_shape"]["profile"].items()}
+    qc = cfg["quantile_conformal"]
+    maturity = cfg["training"]["walk_forward"]["label_maturity_weeks"]
+    cases = dict(zip(base["SE"].astype(str).str.zfill(6), base["casos"]))
+    hook = make_regime_hook(cases, qc.get("regime_thresholds"))
+    cutoffs = {}
+    series = {}
+    for key, table in vp.items():
+        h = int(key)
+        medians = next(blocks for tau, blocks in table.items() if float(tau) == 0.5)
+        for block in medians:
+            fold = int(block["fold"])
+            start = min(origin_weeks(block))
+            cutoffs[fold] = min(start, cutoffs.get(fold, start))
+        if h not in qc["apply_horizons"]:
+            continue
+        series[h] = {0.5: medians}
+        bias = post.get("median_bias_factor", 1.08) if h in post.get("median_bias_horizons", range(2, 9)) else 1.
+        for tau in BAND_TAUS:
+            scale = profile[tau][h - 1] * bias
+            series[h][tau] = [
+                {**b, "y_pred_casos": np.maximum(0., np.asarray(b["y_pred_casos"]) * scale).tolist()}
+                for b in medians
+            ]
 
-def profile_blocks(h, tau_quant, profile, mb_factor, mb_hs):
-    """Blocos {fold,test_se,y_test_casos,y_pred_casos} com a banda reformulada:
-    q*_cases = med × profile[h-1] × (1.08 se h in mb_hs) — espelho do live."""
-    idx = h - 1
-    pf = profile[tau_quant][idx]
-    blocks = copy.deepcopy(load_blocks(h, 0.50))
-    for b in blocks:
-        p50 = np.asarray(b['y_pred_casos'], dtype=float)
-        scale = pf * (mb_factor if int(h) in mb_hs else 1.0)
-        b['y_pred_casos'] = list(np.clip(p50 * scale, 0.0, None))
-    return blocks
+    def fit(cutoff, before_fold=None):
+        pool = mature_calibration_series(series, cutoff, maturity, before_fold)
+        return compute_conformal(pool, hook, half_life_years=qc.get("half_life_years", 2.5),
+                                 max_delta=qc.get("max_abs_delta", 1.), use_median_shift=False)
+
+    expanding = {str(f): fit(start, f) for f, start in cutoffs.items()}
+    return fit(add_epiweeks(max(cases), 1)), expanding
 
 
 def main(write=False):
-    cfg = yaml.safe_load(open(ROOT / 'config/config.yaml'))
-    bs_cfg = cfg.get('postprocessing', {}).get('band_shape', {}) or {}
-    profile = {float(k): [float(x) for x in v] for k, v in (bs_cfg.get('profile') or {}).items()}
-    mb_factor = float(cfg.get('postprocessing', {}).get('median_bias_factor', 1.08))
-    mb_hs = set(int(x) for x in cfg.get('postprocessing', {}).get('median_bias_horizons', range(2, 9)) or [])
-    qc_cfg = cfg.get('quantile_conformal', {}) or {}
-    half_life = float(qc_cfg.get('half_life_years', 2.5))
-    max_delta = float(qc_cfg.get('max_abs_delta', 1.0))
-    apply_hs = sorted(int(x) for x in qc_cfg.get('apply_horizons', [1, 2, 3, 5]))
-
-    base = pd.read_csv(ROOT / 'data/processed/episense_base.csv')
-    base['SE'] = base['SE'].astype(str).str.replace('.0', '', regex=False).str.zfill(6)
-    casos_by_se = {str(s).zfill(6): float(v) for s, v in zip(base['SE'], base['casos'])
-                   if np.isfinite(float(v))}
-    hook = make_regime_hook(casos_by_se, (qc_cfg.get('regime_thresholds') or None))
-
-    print("== Recalibração conformal sobre banda perfilada ==")
-    print(f"   apply_horizons={apply_hs} half_life={half_life}a max_delta={max_delta}")
-
-    fold_series = {}
-    for h in apply_hs:
-        fs_h = {0.50: load_blocks(h, 0.50)}
-        fs_h.update({tau: profile_blocks(h, tau, profile, mb_factor, mb_hs)
-                     for tau in BAND_TAUS})
-        fold_series[h] = fs_h
-
-    prod = compute_conformal(fold_series, hook,
-                             half_life_years=half_life, max_delta=max_delta,
-                             use_median_shift=False)
-
-    n_folds = len(load_blocks(1, 0.50))
-    expanding_by_fold = {}
-    for f in range(n_folds):
-        fs = {}
-        for h in apply_hs:
-            fs_h = {0.50: [b for b in load_blocks(h, 0.50) if int(b.get('fold', f)) < f]}
-            fs_h.update({tau: [b for b in fold_series[h][tau]
-                               if int(b.get('fold', f)) < f] for tau in BAND_TAUS})
-            fs[h] = fs_h
-        n_rows = sum(len(fs[h][tau]) for h in apply_hs for tau in (0.50, *BAND_TAUS))
-        if n_rows == 0:
-            expanding_by_fold[str(f)] = {}
-            continue
-        expanding_by_fold[str(f)] = compute_conformal(
-            fs, hook, half_life_years=half_life, max_delta=max_delta,
-            use_median_shift=False)
-
-    print("\n== deltas PRODUÇÃO (pool 4 folds) ==")
+    cfg = yaml.safe_load((ROOT / "config/config.yaml").read_text())
+    base = pd.read_csv(ROOT / os.environ.get("EPISENSE_TRAINING_BASE", "data/processed/episense_base.csv"))
+    prod, expanding_by_fold = calibrate_profile(json.loads(SRC.read_text()), cfg, base)
+    apply_hs = cfg["quantile_conformal"]["apply_horizons"]
+    print("\n== deltas PRODUÇÃO (alvos maduros) ==")
     for h in apply_hs:
         e = prod.get(str(h), {})
         for g in ['high', 'mid', 'low', 'global']:
@@ -118,7 +96,7 @@ def main(write=False):
 
     print("\n== deltas EXPANDING (honesto) ==")
     for h in apply_hs:
-        for f in range(n_folds):
+        for f in expanding_by_fold:
             e = expanding_by_fold.get(str(f), {}).get(str(h), {})
             for g in ['high', 'mid', 'low', 'global']:
                 if g in e:
@@ -126,9 +104,9 @@ def main(write=False):
                     print(f"  fold{f} h{h} {g:>7}: " + "  ".join(f"{k}={v:+.3f}" for k, v in sorted(ents.items())))
 
     if write:
-        target = ROOT / 'models/quantile_conformal.json'
+        target = MODEL_DIR / 'quantile_conformal.json'
         bak = target.with_suffix('.json.bak_prereshape')
-        if not bak.exists():
+        if target.exists() and not bak.exists():
             bak.write_text(target.read_text(encoding='utf-8'), encoding='utf-8')
             print(f"\nbackup: {bak}")
         save_json(target, prod, expanding_by_fold)

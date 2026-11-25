@@ -4,7 +4,7 @@ walk-forward JÁ SALVAS em models/validation_predictions.json — sem retreino.
 
 Escopo idêntico ao validação final: folds 2022-2025 (SE >= 202236; fold legado
 2021 descartado), ensemble = média das seeds (já persistida nas previsões).
-ensemble_avg primário = média dos folds completos (52 semanas, 2022-2024);
+ensemble_avg primário = métricas das linhas reunidas dos folds completos (52 semanas, 2022-2024);
 full_4folds_avg = referência com os 4 folds.
 
 Removidos na spec 2026-10: MASE (e agregados), ETP, SPL, MAPE, CRPS,
@@ -12,7 +12,7 @@ quantile_crossed, fbias.
 Métricas: mae, rmse, bias, wape, wis_total, wis_50, wis_90,
 width_50, width_90, coverage_50, coverage_90 (+ baseline_wis/baseline_mae/
 baseline_coverage_90 como referência sazonal e skill_mae/skill_wis = ganho
-vs baseline, razão das médias na agregação).
+vs baseline, calculado sobre as linhas reunidas).
 
 Uso:  ./.venv/bin/python3 scripts/recompute_metrics.py
 """
@@ -30,9 +30,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.metrics import compute_all_metrics, QUANTILES, PAIR_50, PAIR_90, pinball_mean, skill_score  # noqa: E402
+from models.metrics import compute_all_metrics, QUANTILES, pooled_fold_metrics, skill_score  # noqa: E402
 from models.calibration import compute_conformal  # noqa: E402
-from data.epiweeks import epiweek_to_date, date_to_epiweek  # noqa: E402
+from models.validation_calendar import label_available_week, mature_calibration_series, origin_weeks, target_weeks
+from data.epiweeks import add_epiweeks, epiweek_to_date, date_to_epiweek  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 # EPISENSE_VP_DIR: override do diretório de predições/results (experimentos sem
@@ -42,17 +43,14 @@ if not _VP_DIR.is_absolute():
     _VP_DIR = ROOT / _VP_DIR
 VAL_PRED = _VP_DIR / "validation_predictions.json"
 VAL_RES = _VP_DIR / "validation_results.json"
-BASE = ROOT / "data/processed/episense_base.csv"
+BASE = ROOT / os.environ.get("EPISENSE_TRAINING_BASE", "data/processed/episense_base.csv")
 FIRST_TEST_SE = "202236"          # escopo final de avaliação
-FOLD_GAP_WEEKS = 8                # gap do walk-forward (config training.walk_forward)
 OUTBREAK_MONTHS = {10, 11, 12, 1, 2, 3, 4, 5}  # spec epidemiológica Out-Mai
 
 
 def se_shift(se: str, weeks: int) -> str:
     """SE + weeks (negativo permitido) via data do calendário epidemiológico."""
-    se = str(se).zfill(6)
-    d = epiweek_to_date(int(se[:4]), int(se[4:]))
-    return str(date_to_epiweek(d + timedelta(days=weeks * 7))).zfill(6)
+    return add_epiweeks(str(se).zfill(6), weeks)
 
 
 def se_to_month(se: str) -> int:
@@ -97,31 +95,22 @@ def build_baseline_preds(pool: pd.DataFrame, test_se: list, min_se: str = "00000
                 except Exception:
                     hist = None
             if hist is None:
-                hist = global_hist if global_hist else [0.0]
+                hist = global_hist
             hist_arr = np.asarray(hist, dtype=float)
             hist_arr = hist_arr[np.isfinite(hist_arr)]
             if len(hist_arr) == 0:
-                hist_arr = np.array([0.0])
+                q_row[tau] = float("nan")
+                continue
             q_row[tau] = float(np.quantile(hist_arr, tau))
         out.append(q_row)
     return out
 
 
 def baseline_metrics(y_true: np.ndarray, base_rows: list) -> dict:
-    pred_med = np.array([r[0.50] for r in base_rows], dtype=float)
-    _m = np.isfinite(y_true) & np.isfinite(pred_med)
-    b_mae = (float(np.mean(np.abs(y_true[_m] - pred_med[_m])))
-             if np.any(_m) else float("nan"))
-    pins = [pinball_mean(y_true, np.array([r[t] for r in base_rows], dtype=float), t)
-            for t in QUANTILES]
-    pins = [v for v in pins if np.isfinite(v)]
-    b_wis = float(np.mean(pins)) if pins else float("nan")
-    lo = np.array([r[min(PAIR_90)] for r in base_rows], dtype=float)
-    hi = np.array([r[max(PAIR_90)] for r in base_rows], dtype=float)
-    mm = np.isfinite(y_true) & np.isfinite(lo) & np.isfinite(hi)
-    b_cov = (float(np.mean((y_true[mm] >= lo[mm]) & (y_true[mm] <= hi[mm])))
-             if np.any(mm) else float("nan"))
-    return {"baseline_wis": b_wis, "baseline_mae": b_mae, "baseline_coverage_90": b_cov}
+    baseline = {t: np.array([row.get(t, np.nan) for row in base_rows]) for t in QUANTILES}
+    values = compute_all_metrics(y_true, baseline)
+    return {"baseline_wis": values["wis_total"], "baseline_mae": values["mae"],
+            "baseline_coverage_90": values["coverage_90"]}
 
 
 def clean_nan(obj):
@@ -134,32 +123,11 @@ def clean_nan(obj):
     return obj
 
 
-def nanmean_dict(dicts: list) -> dict:
-    if not dicts:
-        return {}
-    out = {}
-    for key in dicts[0]:
-        vals = []
-        for d in dicts:
-            v = d.get(key, np.nan)
-            if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
-                continue  # ignora dicts/listas/strings (ex.: 'stratified')
-            vals.append(float(v))
-        arr = np.array(vals, dtype=float) if vals else np.array([], dtype=float)
-        finite = arr[np.isfinite(arr)] if len(arr) else np.array([])
-        if len(finite):
-            out[key] = float(np.mean(finite))
-        elif len(arr):
-            out[key] = float('nan')
-    return out
-
-
 def main():
     if not VAL_PRED.exists():
-        print("validation_predictions.json inexistente — nada a fazer")
-        return
+        raise FileNotFoundError(VAL_PRED)
     vp = json.loads(VAL_PRED.read_text(encoding="utf-8"))
-    with open(ROOT / "config" / "config.yaml") as _f:
+    with open(os.environ.get("EPISENSE_TRAINING_CONFIG", ROOT / "config" / "config.yaml")) as _f:
         cfg = yaml.safe_load(_f)
     start_year = int(cfg.get('training', {}).get('start_year', 2014))
     min_se = f"{start_year}01"
@@ -177,8 +145,25 @@ def main():
     POST_CFG = cfg.get('postprocessing', {}) or {}
     if not isinstance(POST_CFG, dict):
         POST_CFG = {}
-    base = pd.read_csv(BASE, usecols=["SE", "casos"], dtype={"SE": str})
-    base["SE"] = base["SE"].str.replace(".0", "", regex=False)
+    from data.origin_inputs import issued_inputs
+    from scripts.evaluate_walk_forward import read_records
+
+    from models.validation_calendar import check_observed_targets
+    check_observed_targets(vp, pd.read_csv(BASE, dtype={"SE": str}))
+    maturity = cfg["training"]["walk_forward"].get("label_maturity_weeks", 16)
+    records = read_records(vp, maturity)
+    fold_cutoffs = {}
+    for fold, origin, _ in records:
+        fold_cutoffs[fold] = min(origin, fold_cutoffs.get(fold, origin))
+    origins = {origin for _, origin, _ in records}
+    cases_by_origin, histories, snapshots = {}, {}, {}
+    for origin, issued_week, digest, frame, observed in issued_inputs(cfg, origins):
+        cases_by_origin[origin] = float(frame["casos"].iloc[-1])
+        snapshots[origin] = (issued_week, digest)
+        histories[origin] = pd.DataFrame({"SE": frame.loc[observed.index, "SE"], "casos": observed})
+    for (_, origin, _), row in records.items():
+        if origin not in snapshots or snapshots[origin][1] != row["digest"] or snapshots[origin][0] >= row["target"]:
+            raise ValueError(f"Snapshot ausente, divergente ou tardio para {origin}")
 
     old_raw = None
     if VAL_RES.exists():
@@ -195,18 +180,20 @@ def main():
         for tau_key, blocks in hd.items():
             tau = float(tau_key)
             for blk in blocks:
+                target_weeks(blk, int(h))
                 fid = str(blk["fold"])
                 fm = fold_map.setdefault(fid, {})
-                for se, pred in zip(blk["test_se"], blk["y_pred_casos"]):
+                for se, pred in zip(origin_weeks(blk), blk["y_pred_casos"]):
                     se = str(se).zfill(6)
                     if np.isfinite(float(pred)):
                         fm.setdefault(se, {})[tau] = float(pred)
                 if "0.5" not in fm.get("_truth", {}):
                     truth = fm.setdefault("_truth", {})
-                    for se, true_v in zip(blk["test_se"], blk["y_test_casos"]):
+                    for se, true_v in zip(origin_weeks(blk), blk["y_test_casos"]):
                         truth[str(se).zfill(6)] = float(true_v) if np.isfinite(float(true_v)) else float('nan')
 
         per_fold = []
+        metric_rows = {}
         # ==============================================================
         # Pós-processamento v7/v8 (experimentos, config-driven)
         # Camada A (nível): C4 combinação modelo+baseline (λ) e C3/C6/C5
@@ -222,15 +209,15 @@ def main():
         # Todas as flags false + 'expanding' = estado canônico (provado no-op).
         # ==============================================================
         APPLY_SCHEME = str(POST_CFG.get('validation_scheme', 'expanding'))
+        if APPLY_SCHEME != "expanding":
+            raise ValueError("Validação temporal requer calibração expanding")
         apply_horizons_eff = (list(range(1, 9)) if POST_CFG.get('conformal_all_horizons')
                               else sorted(QC['apply_horizons']))
         regime_hook = None
         if QC_ENABLED:
             try:
                 from models.calibration import make_regime_hook, compute_conformal, entry_for_key
-                casos_by_se = {str(se).zfill(6): float(v) for se, v in zip(base['SE'], base['casos'])
-                               if np.isfinite(float(v))}
-                regime_hook = make_regime_hook(casos_by_se, qc_cfg.get('regime_thresholds') or None)
+                regime_hook = make_regime_hook(cases_by_origin, qc_cfg.get('regime_thresholds') or None)
             except Exception as e:
                 print(f"AVISO: regime hook indisponível ({e})")
         # Camada C: paridade do phantom gating (mesmo cfg do inference)
@@ -276,13 +263,15 @@ def main():
                     for i, t in enumerate(QUANTILES):
                         preds[t][w] = s_vals[i]
             m_raw = compute_all_metrics(y_true, preds)
-            # baseline do pool anterior ao teste (gap de 8 semanas)
-            start = ses[0]
-            pool_end = se_shift(start, -FOLD_GAP_WEEKS)
-            pool_b = base[base["SE"].str.zfill(6) < pool_end]
-            b_rows = build_baseline_preds(pool_b, ses, min_se=min_se)
+            latest_mature = se_shift(fold_cutoffs[int(fid)], -(1 + maturity))
+            targets = [se_shift(origin, int(h)) for origin in ses]
+            b_rows = []
+            for origin, target in zip(ses, targets):
+                history = histories[origin]
+                pool = history[history["SE"] <= latest_mature]
+                b_rows.extend(build_baseline_preds(pool, [target], min_se=min_se))
             base_med = np.array([r[0.50] for r in b_rows], dtype=float)
-            units[fid] = {'ses': ses, 'y_true': y_true, 'preds': preds,
+            units[fid] = {'ses': ses, 'targets': targets, 'y_true': y_true, 'preds': preds,
                           'y_log': np.log1p(np.clip(y_true, 0.0, None)),
                           'med_log': np.log1p(np.clip(med, 0.0, None)),
                           'base_log': np.log1p(np.clip(base_med, 0.0, None)),
@@ -291,10 +280,11 @@ def main():
         if not units:
             continue
 
-        def _pool_fids(fid):
-            if APPLY_SCHEME == 'loo':
-                return [x for x in units.keys() if x != fid]
-            return [x for x in units.keys() if int(x) < int(fid)]
+        def mature_pool(fid):
+            cutoff = fold_cutoffs[int(fid)]
+            return [(k, [i for i, target in enumerate(unit["targets"])
+                         if label_available_week(target, maturity) <= cutoff])
+                    for k, unit in units.items() if int(k) < int(fid)]
 
         # ---- Camada A passo 1: λ da combinação (C4) por fold ----
         c4_scope = [int(x) for x in (POST_CFG.get('baseline_combination_horizons') or list(range(1, 9)))]
@@ -303,12 +293,12 @@ def main():
             u['pm'] = pm
             x0 = u['med_log']
             if POST_CFG.get('baseline_combination') and int(h) in c4_scope:
-                _pf = _pool_fids(fid)
+                _pf = mature_pool(fid)
                 lam = 1.0
                 if _pf:
-                    _Yp = np.concatenate([units[k]['y_log'] for k in _pf])
-                    _Mp = np.concatenate([units[k]['med_log'] for k in _pf])
-                    _Bp = np.concatenate([units[k]['base_log'] for k in _pf])
+                    _Yp = np.concatenate([units[k]['y_log'][idx] for k, idx in _pf])
+                    _Mp = np.concatenate([units[k]['med_log'][idx] for k, idx in _pf])
+                    _Bp = np.concatenate([units[k]['base_log'][idx] for k, idx in _pf])
                     _fin = np.isfinite(_Yp) & np.isfinite(_Mp) & np.isfinite(_Bp)
                     if int(_fin.sum()) >= 8:
                         _den = float(np.sum((_Mp[_fin] - _Bp[_fin]) ** 2))
@@ -326,11 +316,11 @@ def main():
         # ---- Camada A passo 2: correções de nível (C3 slope / C6 amp / C5 bins) ----
         for fid, u in units.items():
             pm = u['pm']
-            _pf = _pool_fids(fid)
+            _pf = mature_pool(fid)
             if _pf:
-                _Yp = np.concatenate([units[k]['y_log'] for k in _pf])
-                _Xp = np.concatenate([units[k]['x0'] for k in _pf])
-                _Bp = np.concatenate([units[k]['base_log'] for k in _pf])
+                _Yp = np.concatenate([units[k]['y_log'][idx] for k, idx in _pf])
+                _Xp = np.concatenate([units[k]['x0'][idx] for k, idx in _pf])
+                _Bp = np.concatenate([units[k]['base_log'][idx] for k, idx in _pf])
             else:
                 _Yp = _Xp = _Bp = np.array([], dtype=float)
             _fin = np.isfinite(_Yp) & np.isfinite(_Xp)
@@ -421,20 +411,17 @@ def main():
             for t in QUANTILES:
                 all_blocks[float(t)].append({
                     'fold': int(fid),
-                    'test_se': [str(s).zfill(6) for s in u['ses']],
+                    'origin_se': u['ses'],
+                    'target_se': u['targets'],
                     'y_test_casos': [float(v) if np.isfinite(v) else float('nan') for v in u['y_true']],
                     'y_pred_casos': [float(v) if np.isfinite(v) else float('nan') for v in u['pred_post'][t]],
                 })
         for fid, u in units.items():
             fold_conf = {}
             if QC_ENABLED and regime_hook is not None:
-                _pf = _pool_fids(fid)
-                _pb = {float(t): [dict(b) for b in all_blocks[float(t)] if int(b['fold']) != int(fid)]
-                       if APPLY_SCHEME == 'loo' else
-                       [dict(b) for b in all_blocks[float(t)] if int(b['fold']) < int(fid)]
-                       for t in QUANTILES}
-                if any(_pb.values()):
-                    pool_fs = {int(h): {str(tau): blocks for tau, blocks in _pb.items()}}
+                cutoff = fold_cutoffs[int(fid)]
+                pool_fs = mature_calibration_series({int(h): all_blocks}, cutoff, maturity, int(fid))
+                if pool_fs:
                     try:
                         fold_conf = compute_conformal(
                             pool_fs, regime_hook,
@@ -513,6 +500,8 @@ def main():
                         _u = units[str(_kf)]
                         for _j, _se in enumerate(_u['ses']):
                             _se = str(_se).zfill(6)
+                            if label_available_week(_u['targets'][_j], maturity) > fold_cutoffs[int(fid)]:
+                                continue
                             _yl = float(_u['y_log'][_j])
                             if not np.isfinite(_yl):
                                 continue
@@ -582,7 +571,7 @@ def main():
                         from data.epiweeks import epiweek_to_date as _e2d
                         med_c = np.clip(preds_cal[0.5], 0.0, None)   # casos
                         q95_c = np.clip(preds_cal[0.95], 0.0, None)  # casos
-                        for i, se in enumerate(u['ses']):
+                        for i, se in enumerate(u['targets']):
                             _se = str(se).zfill(6)
                             try:
                                 _mo = _e2d(int(_se[:4]), int(_se[4:])).month
@@ -656,6 +645,8 @@ def main():
                                          **{k: v for k, v in u['pm'].items()}}}
             if qr_meta:
                 m['calibration']['qreshape'] = dict(qr_meta)
+            seasonal = {t: np.array([row[t] for row in u['b_rows']]) for t in QUANTILES}
+            metric_rows[int(fid)] = (u['y_true'], preds_cal if QC_ENABLED else u['preds'], seasonal)
             m.update(baseline_metrics(u['y_true'], u['b_rows']))
             # Ganho vs baseline (skill): por fold, razão direta
             m['skill_mae'] = skill_score(m.get('mae'), m.get('baseline_mae'))
@@ -663,28 +654,13 @@ def main():
             m['fold'] = int(fid)
             m['horizon'] = int(h)
             m['n_weeks'] = len(u['ses'])
-            m['stratified'] = stratified_for_fold(u['y_true'], u['preds'], u['ses'])
+            m['stratified'] = stratified_for_fold(u['y_true'], metric_rows[int(fid)][1], u['ses'])
             per_fold.append(m)
 
         if not per_fold:
             continue
-        complete = [m for m in per_fold if m.get('n_weeks', 0) >= 52]
-        avg = nanmean_dict(complete if complete else per_fold)
-        avg.pop('fold', None)  # identificador do fold não faz sentido em média
-        avg.pop('n_weeks', None)
-        avg['horizon'] = int(h)
-        avg['n_folds'] = len(complete if complete else per_fold)
-        avg['excluded_partial_folds'] = [str(m['fold']) for m in per_fold if m.get('n_weeks', 0) < 52]
-        full = nanmean_dict(per_fold)
-        full.pop('fold', None)
-        full.pop('n_weeks', None)
-        full['horizon'] = int(h)
-        avg['full_4folds_avg'] = full
-        # skills como razão das MÉDIAS (consistente com as médias canônicas);
-        # a média das razões por fold fica em per_fold_ensemble como diagnóstico
-        for _agg in (avg, full):
-            _agg['skill_mae'] = skill_score(_agg.get('mae'), _agg.get('baseline_mae'))
-            _agg['skill_wis'] = skill_score(_agg.get('wis_total'), _agg.get('baseline_wis'))
+        avg = pooled_fold_metrics(metric_rows)
+        avg["horizon"] = avg["full_4folds_avg"]["horizon"] = int(h)
         # referência de seeds do JSON antigo (relatório não recalcula seeds)
         if old_raw and h in old_raw:
             old_avg = old_raw[h].get('ensemble_avg', {})
@@ -694,7 +670,11 @@ def main():
             'quantiles': list(QUANTILES),
             'per_fold_ensemble': per_fold,
             'ensemble_avg': avg,
-            'stratified': aggregate_stratified(per_fold),
+            'stratified': stratified_for_fold(
+                np.concatenate([rows[0] for rows in metric_rows.values()]),
+                {t: np.concatenate([rows[1][t] for rows in metric_rows.values()]) for t in QUANTILES},
+                [se for fid in metric_rows for se in units[str(fid)]["ses"]],
+            ),
         }
 
         def _g(k, d=avg):
@@ -742,26 +722,6 @@ def stratified_for_fold(y_true: np.ndarray, preds: dict, ses: list) -> dict:
                        'mae': m.get('mae', float('nan')),
                        'wis': m.get('wis_total', float('nan'))}
     return out
-
-
-def aggregate_stratified(per_fold: list) -> dict:
-    result = {}
-    for period in ('outbreak', 'calm'):
-        rows = [m['stratified'][period] for m in per_fold
-                if period in m.get('stratified', {})]
-        if not rows:
-            continue
-        n = sum(r['n_samples'] for r in rows)
-
-        def _w(key):
-            vals = np.array([r.get(key, np.nan) for r in rows], dtype=float)
-            w = np.array([r['n_samples'] if np.isfinite(r.get(key, np.nan)) else 0
-                          for r in rows], dtype=float)
-            if np.any(np.isfinite(vals)) and np.sum(w) > 0:
-                return float(np.nansum(vals * w) / (np.sum(w) + 1e-10))
-            return float(np.nanmean(vals)) if np.any(np.isfinite(vals)) else float('nan')
-        result[period] = {'n_samples': n, 'mae': _w('mae'), 'wis': _w('wis')}
-    return result
 
 
 if __name__ == "__main__":
