@@ -1,0 +1,27 @@
+# Never send secrets or local state to the Docker build context.
+.env
+.env.*
+!.env.example
+
+# VCS / local tooling
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.DS_Store
+
+# Logs and experiment artifacts (mounted at runtime when needed)
+logs
+*.log
+models_*
+models/_backup_stable
+models/*.bak*
+
+# Versões de produção ficam no volume montado.
+models/releases
+models/current
+models/.current-*
+cities

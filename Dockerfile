@@ -37,6 +37,7 @@ ARG APSCHEDULER_SHA256=bbeb2ec02d23d3c06a6c07ed7f0f3939ada6680eb121fae809a69bb42
 ARG APSCHEDULER_VERSION=3.11.3
 
 COPY requirements.txt .
+COPY episense_security.py ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api/ ./api/
@@ -44,7 +45,8 @@ COPY config/ ./config/
 COPY data/ ./data/
 COPY models/ ./models/
 
-RUN useradd --create-home --shell /bin/bash appuser && chown -R appuser:appuser /app
+RUN groupadd --gid 1000 appuser && useradd --uid 1000 --gid appuser --create-home --shell /bin/bash appuser && chown -R appuser:appuser /app \
+    && install -d -o root -g appuser -m 2770 /app/auth-state
 USER appuser
 
 EXPOSE 8000

@@ -1,0 +1,199 @@
+:root {
+  --bg:#05070d;
+  --panel:#0b0f19;
+  --panel-2:#101622;
+  --panel-3:#151c2b;
+  --line:#243044;
+  --line-2:#334155;
+  --text:#f4f7fb;
+  --text-2:#cbd5e1;
+  --muted:#a5b5c8;
+  --muted-2:#96a9bf;
+  --accent:#2dd4bf;
+  --forecast:#f59e0b;
+  --section-space:clamp(24px,4vw,52px);
+  --panel-inset:clamp(16px,2.5vw,32px);
+}
+
+body {
+  background-color:var(--bg);
+  background-image:radial-gradient(ellipse at 80% 46%,#12313b80,transparent 52%),
+    linear-gradient(#24304438 1px,transparent 1px),
+    linear-gradient(90deg,#24304438 1px,transparent 1px);
+  background-size:auto,52px 52px,52px 52px;
+  background-attachment:fixed;
+  color:var(--text);
+}
+.page {width:min(1600px,94%);padding:0 0 64px}
+.top {height:auto;min-height:66px;margin:0;padding:14px 0}
+.brand {align-items:center;gap:14px}
+.brand strong {font-size:1.5rem;font-weight:700;letter-spacing:-.035em}
+.municipal-title {padding:clamp(24px,4vw,48px) 0 20px}
+.municipal-title h1 {font-size:clamp(2.5rem,5vw,4.6rem);font-weight:700;line-height:1.02;letter-spacing:-.055em}
+
+.brief,.chart-panel,.metrics,.controls {
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:14px;
+  box-shadow:none;
+}
+.brief {padding:var(--panel-inset);margin-bottom:var(--section-space)}
+.brief h2,.section-intro h2,.metrics-head h3 {
+  font-size:clamp(24px,2.6vw,36px);
+  font-weight:600;
+  line-height:1.15;
+  letter-spacing:-.03em;
+}
+.section-intro {margin-bottom:18px}
+.section-intro small {color:var(--muted);font:600 11px/2 "IBM Plex Mono",monospace;letter-spacing:.1em}
+.insight,.section-intro p,#training-id,#metric-note {
+  margin:8px 0 18px;color:var(--text-2);font-size:15px;line-height:1.55;max-width:72ch;
+}
+.metrics {margin-top:var(--section-space)}
+.metrics-head {padding:var(--panel-inset);background:var(--panel)}
+.metrics-table {font-variant-numeric:tabular-nums}
+.metrics-table td,.metrics-table th {padding-inline:clamp(12px,2vw,24px)}
+.legend {gap:8px 18px;color:var(--text-2)}
+
+.brand a,.statusbar .ghost,.metrics-head .ghost,.metrics-tabs .tab,.horizon .pill {
+  display:inline-flex;align-items:center;justify-content:center;
+  min-height:40px;height:auto;padding:7px 13px;
+  border:1px solid var(--line);border-radius:10px;
+  color:var(--text);background:var(--panel);
+  font:600 13px/1.2 "IBM Plex Sans",system-ui,sans-serif;text-decoration:none;
+}
+.statusbar .ghost[hidden] {display:none}
+.brand a:hover,.ghost:hover,.metrics-tabs .tab:hover,.horizon .pill:hover {
+  color:var(--text);border-color:var(--accent);background:var(--panel-2);
+}
+.metrics-tabs .tab.active,.horizon .pill.active {
+  color:#092520;background:var(--accent);border-color:var(--accent);box-shadow:none;
+}
+a:focus-visible,button:focus-visible,[role="slider"]:focus-visible {
+  outline:2px solid var(--accent);outline-offset:3px;
+}
+
+.overview-plot {position:relative;height:clamp(250px,32vw,390px)}
+#climate-trends {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(12px,2vw,24px)}
+#climate-trends>div {min-width:0;padding:14px 0 0;border-top:1px solid var(--line)}
+#climate-trends span {display:block;color:var(--text-2);font-size:14px}
+#climate-trends strong {font:500 clamp(24px,3vw,38px)/1.45 "IBM Plex Mono",monospace}
+#climate-trends small {display:block;color:var(--muted);font-size:13px;line-height:1.45}
+.climate-plot {position:relative;height:170px;margin-top:12px}
+
+@media(max-width:760px) {
+  .top {flex-direction:row;align-items:center;flex-wrap:wrap}
+  .brand {flex-direction:row;gap:10px}
+  .controls {grid-template-columns:minmax(0,1fr)}
+  #climate-trends {grid-template-columns:1fr;gap:22px}
+  .brand a,.statusbar .ghost,.metrics-head .ghost,.metrics-tabs .tab,.horizon .pill {min-height:44px}
+}
+
+.brand a span {color:var(--accent);font:inherit}
+.workspace{display:grid;grid-template-columns:180px minmax(0,1fr);gap:22px;align-items:start}
+.cities{position:sticky;top:12px;padding-top:18px}
+.cities h2{font-size:15px;margin-bottom:10px}
+.cities nav{display:grid;gap:8px}
+.cities a{display:grid;gap:3px;text-decoration:none;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.cities a[aria-current],.cities a:hover{border-color:var(--accent);background:#102227}
+.cities span{font-size:13px}.cities small{font-size:12px;color:var(--muted)}
+.city-content{min-width:0}.municipal-title{padding:16px 0 12px}.municipal-title h1{font-size:clamp(27px,3vw,38px)}
+.summary-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}
+.brief{min-width:0;padding:16px;margin-bottom:16px}.brief h2,.section-intro h2,.metrics-head h3{font-size:22px}
+.insight{font-size:13px;margin:4px 0 10px}.overview-plot{height:215px}
+#climate-trends{grid-template-columns:1fr;gap:3px}
+#climate-trends>div{display:grid;grid-template-columns:minmax(98px,.8fr) minmax(0,1fr);padding:4px 0;align-items:center}
+#climate-trends span,#climate-trends strong,#climate-trends small{grid-column:1}
+#climate-trends strong{font-size:18px;line-height:1.1}#climate-trends small{font-size:11px}
+.climate-plot{grid-column:2;grid-row:1/4;height:68px;margin:0}
+.section-intro{margin:4px 0 8px}.chart-head:empty{display:none}.chart-panel .plot-wrap{height:clamp(320px,34vw,480px)}.metrics{margin-top:16px}
+@media(max-width:980px){.workspace{grid-template-columns:1fr;gap:6px}.cities{position:static;padding-top:8px}.cities nav{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.summary-grid{grid-template-columns:1fr;gap:0}.cities a{padding:8px}.overview-plot{height:190px}}
+.analysis-grid{display:grid;grid-template-columns:minmax(290px,.85fr) minmax(0,1.65fr);gap:14px;align-items:start}
+.analysis-grid .metrics{margin:0}.history-column{min-width:0}
+.analysis-grid .metrics-table :is(th,td){padding-inline:8px}
+.municipal-title{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+#calendar-week{font:500 13px "IBM Plex Mono",monospace;color:var(--muted)}
+#case-note{white-space:pre-line}
+@media(max-width:850px){.analysis-grid{grid-template-columns:minmax(0,1fr)}.history-column{grid-row:1}}
+#calendar-week{font:inherit;font-size:clamp(27px,3vw,38px);font-weight:700;line-height:1.02;letter-spacing:-.055em}
+.municipal-title{column-gap:16px;row-gap:5px}
+#case-note:has(+ .forecast-change:not([hidden])){margin-bottom:2px}
+.forecast-change{font-size:13px;font-weight:600;margin:0 0 10px;color:var(--text-2)}
+.analysis-grid{gap:14px;margin-top:8px}
+.history-column .grid{margin-top:0!important}
+.analysis-grid :is(.metrics-head,.chart-head){padding:16px 18px}
+.analysis-grid :is(.metrics-head h3,.chart-head h2){font-size:22px;font-weight:600;line-height:1.15;letter-spacing:-.025em}
+#training-id{margin:5px 0 0;font-size:13px}
+#situation .sw.fc,.sw.reported{height:0;border-top:2px dashed var(--series-color,#86efac);border-radius:0;background:none}
+.sw.fc,.sw.real{box-shadow:none;border-radius:0;height:2px}
+#archive-chart-legend .sw.fc{background:var(--series-color,var(--forecast))}
+@media(max-width:420px){#calendar-week{font-size:21px}.analysis-grid :is(.metrics-head,.chart-head){padding:14px}}
+.case-legend{display:flex;flex-wrap:wrap;gap:6px 10px;padding-top:8px;color:var(--text-2);font-size:12px}
+.chart-panel .case-legend{padding:8px 14px 14px}
+.case-legend ul{display:flex;align-items:center;flex-wrap:wrap;gap:5px 12px;list-style:none;margin:0;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
+.case-legend li{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.case-legend i{display:inline-block;width:18px;flex:none}
+.key-line{border-top:2px solid}
+.key-band{height:8px;border:1px solid var(--line-2);border-radius:2px}
+.analysis-grid .metrics-table thead th {
+  background:var(--panel-2);
+  color:var(--text);
+  font:700 13px/1.25 "IBM Plex Sans",system-ui,sans-serif;
+  letter-spacing:0;
+  text-transform:none;
+  padding-block:12px;
+}
+
+/* Municipal workspace: navigation rail, reading hierarchy, and analytical surfaces. */
+.workspace {--gutter:clamp(14px,1.35vw,22px);gap:var(--gutter)}
+.cities {padding:20px 12px 16px 0;border-right:1px solid var(--line)}
+.cities h2 {margin:0 10px 14px;font-size:13px;color:var(--text-2);font-weight:600}
+.cities nav {gap:6px}
+.cities a {position:relative;padding:12px 10px 12px 15px;border-color:transparent;background:transparent}
+.cities a[aria-current] {background:#10232b;border-color:#234148}
+.cities a[aria-current]::before {content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:4px;background:var(--accent)}
+.cities a:hover {background:var(--panel-2)}
+.municipal-title {padding:22px 0 16px}
+#calendar-week {padding-left:14px;border-left:1px solid var(--line-2);color:#a2b4c4}
+.summary-grid,.analysis-grid {gap:var(--gutter)}
+.brief,.analysis-grid :is(.chart-panel,.metrics) {border-color:#283644;background:#0d141e}
+.brief {padding:clamp(15px,1.4vw,22px);margin-bottom:0}
+.analysis-grid {margin-top:var(--gutter)}
+#situation {background:linear-gradient(115deg,#102125 0%,#0d151f 58%)}
+#case-note {line-height:1.7;color:#c2cfd7}
+#case-note strong {font-size:clamp(20px,1.8vw,28px);letter-spacing:-.04em;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+#climate-trends>div {padding:7px 0}
+#climate-trends strong {font-size:21px;letter-spacing:-.045em}
+.case-legend ul {background:transparent;border:0;border-radius:0;padding:3px 0}
+.case-legend ul+ul {border-left:1px solid var(--line-2);padding-left:10px}
+.metrics-tabs {gap:4px;padding:8px 12px;background:#0b111b}
+.metrics-tabs .tab {border-color:transparent;background:transparent}
+.metrics-tabs .tab.active {background:#19373a;color:#8af0db;border-color:#2a5554}
+.analysis-grid .metrics-table tbody td {font-variant-numeric:tabular-nums;padding-block:10px}
+.analysis-grid .metrics-table :is(td,th):not(:first-child) {text-align:right}
+.analysis-grid .metrics-table thead th {background:#13202c}
+@media(max-width:980px){.cities{border-right:0;border-bottom:1px solid var(--line);padding:10px 0}.cities h2{margin:0 0 6px}.municipal-title{padding:13px 0}}
+@media(max-width:680px){.brief{padding:14px}.summary-grid{gap:12px}.metrics-tabs .tab{min-height:44px}.analysis-grid{gap:16px}}
+.cities a {
+  --city-trend:#2dd4bf;
+  --city-surface:#10282a;
+  --city-border:#28605a;
+  background:var(--city-surface);
+  border-color:var(--city-border);
+}
+.cities a[data-trend="up"] {
+  --city-trend:#fb7185;
+  --city-surface:#331b25;
+  --city-border:#874058;
+}
+.cities a[data-trend="stable"] {
+  --city-trend:#f59e0b;
+  --city-surface:#332612;
+  --city-border:#805a26;
+}
+.cities a:is([aria-current],:hover) {
+  background:var(--city-surface);
+  border-color:var(--city-trend);
+}
+.cities a[aria-current]::before {background:var(--city-trend)}

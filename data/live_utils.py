@@ -8,28 +8,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Janela nowcasting InfoDengue: casos_est substitui casos onde > casos apenas nas últimas N SEs
-NOWCAST_WINDOW = 16
-
-
-def apply_nowcast(merged: pd.DataFrame, window: int = NOWCAST_WINDOW) -> pd.DataFrame:
-    """Aplica nowcast InfoDengue nas últimas `window` SEs onde casos_est > casos."""
-    if 'casos_est' not in merged.columns:
-        return merged
-    merged = merged.sort_values('SE').reset_index(drop=True)
-    merged['casos'] = pd.to_numeric(merged['casos'], errors='coerce').fillna(0).astype(float)
-    merged['casos_est'] = pd.to_numeric(merged['casos_est'], errors='coerce').fillna(0).astype(float)
-    try:
-        sorted_ses = sorted(merged['SE'].astype(str).str.zfill(6).unique())
-        threshold_se = sorted_ses[-window] if len(sorted_ses) >= window else sorted_ses[0]
-        mask = (merged['casos_est'] > merged['casos']) & (merged['SE'].astype(str).str.zfill(6) >= threshold_se)
-    except Exception as e:
-        logger.warning(f"Nowcast threshold failed {e}, fallback sem janela")
-        mask = (merged['casos_est'] > merged['casos'])
-    if mask.any():
-        merged.loc[mask, 'casos'] = np.round(merged.loc[mask, 'casos_est']).astype(int)
-        logger.info(f"Nowcast substitution: {int(mask.sum())} weeks updated (janela {window} semanas, thr {threshold_se if 'threshold_se' in locals() else 'fallback'})")
-    return merged
+def apply_nowcast(frame: pd.DataFrame) -> pd.DataFrame:
+    """Usa a estimativa publicada de cada SE, com fallback à notificação."""
+    frame = frame.copy()
+    reported = pd.to_numeric(frame['casos'], errors='coerce')
+    frame['casos_notificados'] = reported
+    estimated = pd.to_numeric(frame.get('casos_est', reported), errors='coerce')
+    frame['casos'] = estimated.where(np.isfinite(estimated) & estimated.ge(0), reported)
+    return frame
 
 
 def anchor_guard_filter(merged: pd.DataFrame, clima_dias: dict) -> pd.DataFrame:

@@ -1,6 +1,8 @@
 # Episense Production
 
-API de previsão de casos de dengue para Campo Grande, MS usando dados em tempo real das APIs InfoDengue e OpenMeteo.
+API de previsão de casos de dengue para Campo Grande, Dourados e Corumbá, MS usando dados em tempo real das APIs InfoDengue e OpenMeteo.
+
+A série de referência do treino e das previsões usa o nowcast semanal do InfoDengue (`casos_est`) em todo o histórico municipal. Quando a estimativa falta ou é inválida, o processamento usa a contagem notificada da própria semana (`casos` na fonte). A base processada guarda a referência em `casos` e a notificação original em `casos_notificados`. O dashboard mostra as duas séries e informa a contagem confirmada (`casconf`) quando disponível. As avaliações com dados históricos revisados podem incorporar revisões posteriores à data de cada previsão.
 
 ## Características
 
@@ -32,13 +34,17 @@ Episense-Prod/
 │   ├── feature_list.json    # 300 features/horizonte
 │   ├── normalization_params.json
 │   └── validation_results.json
+├── dashboard/
+│   └── app.py               # Dashboard FastAPI + frontend estático
 ├── scripts/
 │   ├── train.py             # Script de treinamento principal
 │   └── update_pipeline.py   # Pipeline de atualização (cron)
+├── episense_security.py     # Token de API/dashboard, CORS e rate limit compartilhados
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-├── .env
+├── .env                     # Segredos locais (não versionado)
+├── .env.example             # Modelo de configuração
 ├── .gitignore
 └── README.md
 ```
@@ -46,23 +52,75 @@ Episense-Prod/
 ## Quick Start
 
 ```bash
-# Build e subir
+# 1. Configure os segredos (o .env não é versionado)
+cp .env.example .env
+
+# Gere um valor forte e cole no .env:
+python -c "import secrets; print(secrets.token_hex(32))"  # EPISENSE_API_KEY
+
+# Carregue no shell para os exemplos abaixo
+set -a; . ./.env; set +a
+
+# 2. Build e subir
 docker compose up -d --build
 
-# Health check
+# Health check (público)
 curl http://localhost:8001/health
 
-# Previsão
+# Previsão (autenticada por X-API-Key ou Authorization: Bearer)
 curl -X POST http://localhost:8001/predict \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: $EPISENSE_API_KEY" \
   -d '{"geocode": "5002704"}'
 
-# Métricas
-curl http://localhost:8001/metrics
+# Métricas municipais (também disponível em /metrics/walk-forward e /metadata)
+curl -H "X-API-Key: $EPISENSE_API_KEY" "http://localhost:8001/metrics?geocode=5003207"
 
 # Metadados
-curl http://localhost:8001/metadata
+curl -H "X-API-Key: $EPISENSE_API_KEY" http://localhost:8001/metadata
 ```
+
+O campo `geocode` aceita `5002704` (Campo Grande), `5003702` (Dourados) e `5003207` (Corumbá). Os serviços municipais leem a configuração, a base, os modelos e o histórico de emissões de seus próprios volumes. Para Corumbá, a raiz local desses volumes é `cities/5003207/`. O limiar epidêmico vem do [relatório InfoDengue de Corumbá da SE 202646](https://info.dengue.mat.br/report/MS/5003207/202646).
+
+O dashboard fica em `http://localhost:8501`. Ao abrir, ele pede apenas o
+**token da API** (`EPISENSE_API_KEY`) numa tela própria e o envia como
+`X-API-Key`; não há usuário/senha nem popup do navegador. O token fica no
+`sessionStorage` (somente na aba atual) e pode ser trocado pelo botão
+“Trocar token”.
+
+Em `ENVIRONMENT=production` ambos os serviços **não sobem** sem um
+`EPISENSE_API_KEY` forte. Em `development` a autenticação é opcional, mas
+continua ativa se a variável estiver definida. O Swagger (`/docs`) fica
+disponível apenas em `development` e mostra o botão **Authorize** com os
+esquemas `X-API-Key` e Bearer.
+
+## Segurança e configuração
+
+Todas as variáveis são lidas do ambiente (ou do `.env` local, via
+`python-dotenv`):
+
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `ENVIRONMENT` | `production` | `production` exige token forte e desativa `/docs`. `development` é somente local. |
+| `EPISENSE_API_KEY` | — | Token da API e do dashboard (≥32 chars em produção), via `X-API-Key` ou `Authorization: Bearer`. |
+| `EPISENSE_CORS_ORIGINS` | vazio | Origens exatas separadas por vírgula. `*` é rejeitado; vazio desativa CORS. |
+| `EPISENSE_RATE_LIMIT_PER_MINUTE` | `120` | Limite por IP e por processo (`0` desativa). |
+| `TRUSTED_PROXY_CIDR` | vazio | Redes de proxy autorizadas a enviar `X-Forwarded-For`/`X-Real-IP`. |
+
+Notas:
+
+- O rate limit é em memória e por processo; com `--workers 2` o limite efetivo
+  dobra. Para limite global, use um reverse proxy ou um store compartilhado.
+- Com portas publicadas diretamente pelo Docker, todos os clientes podem
+  aparecer com o IP do gateway; configure `TRUSTED_PROXY_CIDR` apenas se houver
+  um proxy reverso real assinando `X-Forwarded-For`. Caso contrário, deixe vazio.
+- `/health` é público nos dois serviços (necessário para o healthcheck do
+  Compose); as rotas `/api/*` do dashboard exigem o token.
+- Placeholders como `replace-with-...` são rejeitados em produção.
+- O token trafega no header `X-API-Key`; em produção use HTTPS (proxy reverso)
+  para não expô-lo na rede.
+- Nunca comite o `.env`; use o `.env.example` como referência.
+
 
 ## Treinamento (offline)
 
@@ -73,9 +131,11 @@ python scripts/train.py
 
 ## Endpoints
 
+Todos exigem `X-API-Key` (ou `Authorization: Bearer`) exceto `/health`.
+
 | Endpoint | Método | Descrição |
 |----------|--------|-----------|
-| `/health` | GET | Status da API e modelos |
+| `/health` | GET | Status da API e modelos (público) |
 | `/predict` | POST | Previsão h1-h8 (JSON: `{"geocode": "5002704"}`) |
 | `/predict/{geocode}` | GET | Previsão via path param |
 | `/metrics` | GET | Métricas de validação walk-forward |
@@ -114,15 +174,6 @@ python scripts/train.py
 | h4 | ~26-85 | ~0.19-0.24 | 0.93-0.94 | 0.97-0.98 | 0.80-0.89 |
 | h8 | ~150-175 | ~0.45-0.47 | 0.87-0.94 | 0.91 | 0.45-0.65 |
 
-## Cron Job (Atualização Diária)
+## Atualização automática
 
-O script `scripts/update_pipeline.py` pode ser agendado via cron para:
-1. Coletar dados novos do InfoDengue + OpenMeteo
-2. Reprocessar base
-3. Retreinar apenas se a base mudou
-4. Restart da API
-
-```bash
-# Exemplo crontab (06:00 diário)
-0 6 * * * cd /path/to/Episense-Prod && python scripts/update_pipeline.py
-```
+O dashboard de cada município consulta o InfoDengue às **01h15, 07h15, 13h15 e 19h15** (America/Campo_Grande). Ao detectar uma nova semana, registra 16 contagens semanais, coleta o clima, processa a base, treina e emite oito horizontes após a publicação. A API e as páginas consultam a base local entre as coletas. O Docker precisa estar em execução em um host acordado nos horários agendados.

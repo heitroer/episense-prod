@@ -14,7 +14,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from models.metrics import pinball_mean, coverage_interval  # noqa: E402
+from models.metrics import weighted_interval_score, coverage_interval  # noqa: E402
 
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 
@@ -43,7 +43,7 @@ def collect(vp):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--candidate', default='models_q2')
+    ap.add_argument('--candidate', default='logs/experimentos-arquivados/modelos/models_q2')
     ap.add_argument('--baseline', default='models')
     args = ap.parse_args()
 
@@ -67,7 +67,7 @@ def main():
             'mae': float(np.mean(np.abs(ys - q[0.50]))),
             'cov90': coverage_interval(ys, q[0.05], q[0.95]),
             'cov50': coverage_interval(ys, q[0.25], q[0.75]),
-            'wis': sum(pinball_mean(ys, q[t], t) for t in QUANTILES),
+            'wis': weighted_interval_score(ys, q),
             'f95_med': float(np.quantile(q[0.95] / np.maximum(q[0.50], 0.5), 0.5)),
             'q05_zero': float(np.mean(q[0.05] < 0.5)),
         }
@@ -78,7 +78,7 @@ def main():
         ys, q = [], {t: [] for t in QUANTILES}
         sems = set()
         for (f_, se, h_), r in rows_all.items():
-            if f_ != fold or h_ != h:
+            if f_ not in FOLDS or (fold is not None and f_ != fold) or (h is not None and h_ != h):
                 continue
             sems.add(se)
             ys.append(r['y'])
@@ -92,7 +92,7 @@ def main():
             'mae': float(np.mean(np.abs(ys - q[0.50]))),
             'cov90': coverage_interval(ys, q[0.05], q[0.95]),
             'cov50': coverage_interval(ys, q[0.25], q[0.75]),
-            'wis': sum(pinball_mean(ys, q[t], t) for t in QUANTILES),
+            'wis': weighted_interval_score(ys, q),
             'f95_med': float(np.quantile(q[0.95] / np.maximum(q[0.50], 0.5), 0.5)),
             'q05_zero': float(np.mean(q[0.05] < 0.5)),
         }
@@ -100,45 +100,31 @@ def main():
     print(f"{'fold':>4} | {'semanas (SE)':>16} | {'n':>3} | "
           f"{'MAE cand':>8} {'MAE prod':>8} | {'cov90 cand':>10} {'cov90 prod':>10} | "
           f"{'cov50 cand':>10} {'cov50 prod':>10} | {'WIS cand':>8} {'WIS prod':>8}")
-    agg = {k: [] for k in ['mae_c', 'mae_p', 'c90_c', 'c90_p', 'c50_c', 'c50_p', 'wis_c', 'wis_p']}
-    for f in FOLDS:
-        # métrica por fold: média horizontal intra-fold
-        ms_c = [m for m in (row_metrics(cand, f, h) for h in range(1, 9)) if m]
-        ms_p = [m for m in (row_metrics(prod, f, h) for h in range(1, 9)) if m]
-        row = {
-            'mae_c': np.mean([m['mae'] for m in ms_c]), 'mae_p': np.mean([m['mae'] for m in ms_p]),
-            'c90_c': np.mean([m['cov90'] for m in ms_c]), 'c90_p': np.mean([m['cov90'] for m in ms_p]),
-            'c50_c': np.mean([m['cov50'] for m in ms_c]), 'c50_p': np.mean([m['cov50'] for m in ms_p]),
-            'wis_c': np.mean([m['wis'] for m in ms_c]), 'wis_p': np.mean([m['wis'] for m in ms_p]),
-        }
-        for k, w in row.items():
-            agg[k].append(w)
-        print(f"{f:>4} | {ms_c[0]['se_min'][4:]}–{ms_c[0]['se_max'][4:]} {(' (' + str(ms_c[0]['se_min'][:4]) + ')') if ms_c[0]['se_min'][:4] != ms_c[0]['se_max'][:4] else ''} | "
-              f"{ms_c[0]['n']:>3} | "
-              f"{row['mae_c']:8.2f} {row['mae_p']:8.2f} | "
-              f"{row['c90_c']:10.3f} {row['c90_p']:10.3f} | "
-              f"{row['c50_c']:10.3f} {row['c50_p']:10.3f} | "
-              f"{row['wis_c']:8.2f} {row['wis_p']:8.2f}")
-    print(f"{'AGG':>4} | {'':16} | {'':3} | "
-          f"{np.mean(agg['mae_c']):8.2f} {np.mean(agg['mae_p']):8.2f} | "
-          f"{np.mean(agg['c90_c']):10.3f} {np.mean(agg['c90_p']):10.3f} | "
-          f"{np.mean(agg['c50_c']):10.3f} {np.mean(agg['c50_p']):10.3f} | "
-          f"{np.mean(agg['wis_c']):8.2f} {np.mean(agg['wis_p']):8.2f}")
+    for f in [*FOLDS, None]:
+        c = row_metrics(cand, f, None)
+        p = row_metrics(prod, f, None)
+        if c is None or p is None:
+            continue
+        values = " | ".join(f"{c[k]:8.3f} {p[k]:8.3f}" for k in ("mae", "cov90", "cov50", "wis"))
+        label = "AGG" if f is None else str(f)
+        print(f"{label:>4} | {c['se_min']}–{c['se_max']} | {c['n']:3} | {values}")
 
     # por horizonte (mae) — cand vs prod
     print("\nMAE por horizonte (cand → prod):")
     for h in range(1, 9):
-        mc = np.mean([m['mae'] for m in (row_metrics(cand, f, h) for f in FOLDS) if m])
-        mp = np.mean([m['mae'] for m in (row_metrics(prod, f, h) for f in FOLDS) if m])
+        c, p = row_metrics(cand, None, h), row_metrics(prod, None, h)
+        if not c or not p:
+            continue
+        mc, mp = c["mae"], p["mae"]
         print(f"  h{h}: {mc:8.2f} → {mp:8.2f}   ({(mc / mp - 1) * +100:+6.1f}%)")
 
     # sanidade de forma da banda crua (cand): f95 e chão do q05
     print("\nForma da banda crua do candidato (f95 mediano por h; q05<0.5 casos):")
     for h in range(1, 9):
-        rows = [row_metrics(cand, f, h) for f in FOLDS]
-        rows = [r for r in rows if r]
-        f95 = np.mean([r['f95_med'] for r in rows])
-        z = float(np.mean([r['q05_zero'] for r in rows]))
+        summary = row_metrics(cand, None, h)
+        if not summary:
+            continue
+        f95, z = summary["f95_med"], summary["q05_zero"]
         print(f"  h{h}: f95 {f95:5.2f}x | q05 zero {z:5.1%}")
 
 

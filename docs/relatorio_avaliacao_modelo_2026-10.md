@@ -1,5 +1,7 @@
 # Relatório de Avaliação do Modelo — EpiSense CG-MS (out/2026)
 
+> Os caminhos históricos deste relatório foram mantidos. Consulte `logs/experimentos-arquivados/modelos/` para as pastas de modelos experimentais, `logs/experimentos-arquivados/backups/` para os backups e `logs/experimentos-arquivados/rodadas/` para os logs e métricas reagrupados. A rodada preliminar `models_q1smoke/` foi removida.
+
 Ensemble LightGBM quantil (5 seeds), horizontes h1–h8, validação walk-forward
 epi 2022–2025 (gap 8). Métricas: `mae`, `rmse`, `bias`, `wis_total`,
 `wis_50`, `wis_90`, `width_50/90`, `coverage_50/90` (+ baseline sazonal).

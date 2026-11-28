@@ -46,11 +46,15 @@ def epi_year_week(day):
     return year, 1 + (sunday - first).days // 7
 
 
-def fetch_window():
+def fetch_window(geocode=None):
+    if geocode is None:
+        import yaml
+        cfg = Path(__file__).resolve().parents[1] / "config/config.yaml"
+        geocode = yaml.safe_load(cfg.read_text())["project"]["geocode"]
     today = date.today()
     start_year, start_week = epi_year_week(today - timedelta(days=126))
     end_year, end_week = epi_year_week(today)
-    query = urlencode(dict(geocode=5002704, disease="dengue", format="csv", ew_format="SE",
+    query = urlencode(dict(geocode=geocode, disease="dengue", format="csv", ew_format="SE",
                            ew_start=start_week, ey_start=start_year, ew_end=end_week, ey_end=end_year))
     result = subprocess.run(["/usr/bin/curl", "--fail", "--silent", "--show-error", "--location",
                              "--max-time", "60", "--retry", "2",

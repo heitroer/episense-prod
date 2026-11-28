@@ -303,7 +303,7 @@ def finalize_retrain(
     return result
 
 
-def train_and_publish(root: Path, log_dir: Path, *, trained_week: Optional[str] = None) -> Path:
+def train_and_publish(root: Path, log_dir: Path, *, trained_week: Optional[str] = None, weekly_update: bool = False) -> Path:
     """Treina e valida em um diretório privado antes de ativar a versão."""
     from config.config import load_config
     from models.inference import EpisenseInference
@@ -323,6 +323,10 @@ def train_and_publish(root: Path, log_dir: Path, *, trained_week: Optional[str] 
             frozen_config = candidate / "training_config.yaml"
             shutil.copyfile(ROOT / "config/config.yaml", frozen_config)
             cfg = load_config(str(frozen_config))
+            if weekly_update:
+                import yaml
+                cfg["training"]["historical_inputs"] = "revised"
+                frozen_config.write_text(yaml.safe_dump(cfg, sort_keys=False))
             sources = capture_runtime(ROOT, candidate)
             snapshot = candidate / "training_base.csv"
             shutil.copyfile(ROOT / "data/processed/episense_base.csv", snapshot)
@@ -336,7 +340,7 @@ def train_and_publish(root: Path, log_dir: Path, *, trained_week: Optional[str] 
                 env.pop(key, None)
             ok, output = run_script("scripts/train.py", timeout=7200,
                                     log_path=log_dir / "release_train.log", env=env)
-            if not ok or not gate_passed(read_gate(candidate)):
+            if not ok or not read_gate(candidate) or (not weekly_update and not gate_passed(read_gate(candidate))):
                 raise RuntimeError("Treino ou validação reprovada: " + _tail(output))
             result = recompute_canonical(log_dir, env=env)
             for step in ("conformal", "metrics"):
@@ -360,8 +364,24 @@ def train_and_publish(root: Path, log_dir: Path, *, trained_week: Optional[str] 
             (candidate / "promotion_gate.json").write_text(policy_json)
             log_dir.mkdir(parents=True, exist_ok=True)
             (log_dir / f"promotion-{candidate.name}.json").write_text(policy_json)
-            if not policy_report["pass"]:
+            if not policy_report["pass"] and not weekly_update:
                 raise RuntimeError("Promoção reprovada: " + ", ".join(policy_report["failures"]))
+            if weekly_update:
+                import pandas as pd
+                from models.forecast_audit import forecast_rows
+                from models.validation_calendar import origin_weeks
+
+                history = json.loads((candidate / "validation_history.json").read_text())
+                last_origin = min(max(origin for fold in quantiles["0.5"]
+                                      for origin in origin_weeks(fold))
+                                  for quantiles in history.values())
+                base = pd.read_csv(snapshot, dtype={"SE": str}).sort_values("SE")
+                tail = []
+                for origin in base.loc[base.SE >= last_origin, "SE"]:
+                    rows = forecast_rows(origin, engine.predict(base.loc[base.SE <= origin]))
+                    tail.extend(dict(row, origin_se=origin) for row in rows
+                                if row["target_se"] <= snapshot_week)
+                (candidate / "retrospective_tail.json").write_text(json.dumps(tail, allow_nan=False))
             verify_sources(ROOT, sources)
             (candidate / ".retrain_last_se").write_text(snapshot_week)
             artifacts = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()

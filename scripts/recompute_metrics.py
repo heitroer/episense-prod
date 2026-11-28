@@ -145,19 +145,20 @@ def main():
     POST_CFG = cfg.get('postprocessing', {}) or {}
     if not isinstance(POST_CFG, dict):
         POST_CFG = {}
-    from data.origin_inputs import issued_inputs
+    from data.origin_inputs import evaluation_inputs
     from scripts.evaluate_walk_forward import read_records
 
     from models.validation_calendar import check_observed_targets
-    check_observed_targets(vp, pd.read_csv(BASE, dtype={"SE": str}))
+    base = pd.read_csv(BASE, dtype={"SE": str})
+    check_observed_targets(vp, base)
     maturity = cfg["training"]["walk_forward"].get("label_maturity_weeks", 16)
-    records = read_records(vp, maturity)
+    records = read_records(vp, maturity, revised=cfg["training"].get("historical_inputs") == "revised")
     fold_cutoffs = {}
     for fold, origin, _ in records:
         fold_cutoffs[fold] = min(origin, fold_cutoffs.get(fold, origin))
     origins = {origin for _, origin, _ in records}
     cases_by_origin, histories, snapshots = {}, {}, {}
-    for origin, issued_week, digest, frame, observed in issued_inputs(cfg, origins):
+    for origin, issued_week, digest, frame, observed in evaluation_inputs(cfg, origins, base):
         cases_by_origin[origin] = float(frame["casos"].iloc[-1])
         snapshots[origin] = (issued_week, digest)
         histories[origin] = pd.DataFrame({"SE": frame.loc[observed.index, "SE"], "casos": observed})

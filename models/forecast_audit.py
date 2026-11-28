@@ -111,6 +111,7 @@ def official_forecast(archive, origin):
             payload = {key: entry[key] for key in (
                 "issuance_id", "origin_se", "generated_at", "forecast", "source"
             )}
+            payload["model_release"] = (entry.get("audit") or {}).get("release")
             payload["persistence_shadow"] = entry.get("persistence_shadow", [])
             return payload
     return None

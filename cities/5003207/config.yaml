@@ -1,0 +1,694 @@
+project:
+  name: Episense
+  location: Corumbá, MS
+  geocode: '5003207'
+  disease: dengue
+  target_variable: casos
+  se_format: YYYYWW
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  models: city-models
+  logs: logs
+  api: api
+data_sources:
+  infodengue:
+    base_url: https://info.dengue.mat.br/api/alertcity
+    geocode: '5003207'
+    disease: dengue
+    format: csv
+    ew_format: SE
+  openmeteo:
+    base_url: https://archive-api.open-meteo.com/v1/archive
+    latitude: -19.009
+    longitude: -57.651
+    timezone: America/Campo_Grande
+    daily_variables:
+    - temperature_2m_max
+    - temperature_2m_min
+    - temperature_2m_mean
+    - precipitation_sum
+    - relative_humidity_2m_mean
+    - wind_speed_10m_max
+features:
+  align_ytd_by_epi_year: true
+  weekly_population: true  # Denominador da incidência observado em cada SE.
+  target_transform: log1p
+  legacy_convention:
+    log_lag1_shift: 0
+    log_lagn_shift: 1
+    temp_lag2_shift: 1
+    temp_lag4_shift: 3
+    p_rt1_rt_nivel_lag1_shift: 2
+  advanced_convention:
+    log_lag1_shift: 1
+    log_lagn_shift: 1
+  lags:
+    cases:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    temperature:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    precipitation:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    humidity:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+  rolling_windows:
+  - 3
+  - 4
+  - 8
+  - 12
+  seasonal_features: true
+  interaction_features: true
+  horizon_features: true
+  expand_seasonal: true
+  expand_weather_long: true
+  expand_extra: false
+  expand_climatology: true
+  expand_trend: true
+  expand_rt: false  # Indicadores revisáveis excluídos do treino em todos os horizontes.
+  expand_outbreak: true
+  expand_regime_conditional: true
+  expand_peak_timing: true
+  expand_phase: true
+  # EXP-F1 (v8): fase do ciclo multi-anual (run-rate anual vs 3 anos, YTD vs
+  # climatologia do YTD). Honestidade: shift(1) no bloco (só passado).
+targets:
+  horizons:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  target_cols:
+  - target_h1
+  - target_h2
+  - target_h3
+  - target_h4
+  target_transform: log1p
+model:
+  type: LightGBM
+  ensemble:
+    n_seeds: 5
+    seeds:
+    - 42
+    - 123
+    - 456
+    - 789
+    - 999
+    aggregation: mean
+  hyperparameters:
+    objective: tweedie
+    tweedie_variance_power: 1.5
+    metric: rmse
+    boosting_type: gbdt
+    num_leaves: 63  # 127->63 regularizacao: reduz complexidade da arvore p/ evitar overfit
+    max_depth: 8  # 10->8 limita profundidade
+    learning_rate: 0.03
+    n_estimators: 3000
+    subsample: 0.85
+    colsample_bytree: 0.85
+    reg_alpha: 0.3  # 0.05->0.3 L1 maior penalidade
+    reg_lambda: 0.3  # 0.05->0.3 L2 maior penalidade
+    min_child_samples: 20  # 15->20 folha precisa mais amostras
+    random_state: 42
+    verbosity: -1
+    early_stopping_rounds: 150
+    feature_fraction: 0.85
+    bagging_fraction: 0.85
+    bagging_freq: 3
+    min_gain_to_split: 0.05  # 0.01->0.05 exige ganho minimo maior p/ split
+training:
+  historical_inputs: revised
+  start_year: 2014
+  walk_forward:
+    label_maturity_weeks: 16  # aproximação quando não há vintages históricos
+    n_splits: 4
+    test_size_weeks: 52
+    gap_weeks: 8
+    expanding_window: true
+    min_train_weeks: 100
+    test_years:
+    - 2022
+    - 2023
+    - 2024
+    - 2025
+    epidemiological_folds: true
+    fold_start_month: 9
+    fold_end_month: 8
+  validation:
+    gap_weeks: 4
+    expanding: true
+  feature_selection:
+    # Dimensionalidade reduzida 380->120 (max_features) e per-quantile 250/380->80/120
+    # threshold 0.001->0.005 filtra features de baixa importancia (ruido) e reduz overfit/variancia
+    method: importance
+    threshold: 0.005
+    max_features: 120
+    per_quantile: true
+    separate_quantile_features: true  # mantido true mas com limites menores (80/120) p/ caudas
+    # always_keep: features de regime GARANTIDAS na seleção (sobrevivem ao corte por ganho).
+    # Nominações filtradas por existência em runtime; omitem-se nomes que a engenharia não gera.
+    # Motivo (relatório out/2026, P1/P3/P4): sinais de regime (YTD-ratio, YoY, growth,
+    # slopes, anomalias) são os que permitem antecipar picos/quedas rápidas.
+    always_keep:
+      - log_casos_ytd            # fase da temporada corrente (cumulativo log)
+      - ytd_share_prev_year      # razão YTD corrente vs ano anterior (regime!)
+      - log_ytd_ratio            # log-razão YTD (versão simétrica)
+      - ytd_ratio_roll4          # razão YTD suavizada 4 semanas
+      - log_casos_yoy52          # YoY semana igual ano anterior
+      - log_casos_yoy52_gated    # YoY com gating anti-phantom
+      - log_casos_yoy53          # YoY ano-53
+      - log_casos_growth_ratio_4 # crescimento 4 semanas (razão)
+      - log_casos_growth_ratio_1 # crescimento 1 semana (razão)
+      - log_casos_momentum_4     # momentum 4 semanas
+      - log_casos_slope_accel_4  # aceleração da tendência curta
+      - log_casos_accel_8        # aceleração 8 semanas
+      - log_casos_anomaly_clim   # anomalia vs climatologia de casos
+      - trend_vs_clim_8          # tendência vs climatologia 8 semanas
+      - log_casos_vs_ewma_8      # posição vs EWMA 8s (proxy R efetiva)
+      - casos_ytd_rate           # ritmo de acumulação (semana do ano)
+      # EXP-F1 (v8, Adendo): fase multi-anual — correm risco de não entrar pelo
+      # top-K de ganho (colineares com yoy/clim); guardadas para o teste do sinal.
+      - phase_ytd_log
+      - phase_ytd_ratio_clim
+      - phase_amp_annual
+      - phase_amp_annual_z
+      - phase_amp_annual_roll4
+    expand_extra: false
+    threshold_per_quantile:
+      0.05: 0.005
+      0.25: 0.005
+      0.5: 0.005
+      0.75: 0.005
+      # q95: limiar relaxado 0.035->0.01 e teto 10->40 (out/2026): a cauda anterior
+      # ficava com ~22 feats e não condicionava a largura ao regime (banda 29x a
+      # mediana em semanas calmas; y>q95 ~0-4% vs 5% nominal). Correção da Fase 2
+      # -- grid do cap do conformal (1.0/1.3/1.5) foi neutro/negativo no expanding
+      # e foi rejeitado.
+      0.95: 0.01
+    max_features_per_quantile:
+      0.05: 80
+      0.25: 80
+      0.5: 120
+      0.75: 80
+      0.95: 40
+    # Overrides por horizonte (v4, out/2026): em h6-h8 a cauda condicionada de 40
+    # feats ficou ESTREITA demais no surto (cov90 raw 0.94->0.72-0.81) e o conformal
+    # nesses horizontes degrada WIS (+12-22%); restaura-se a cauda fina original
+    # (thr 0.035 / mf 10, cov90 0.89-0.94, largura grande) apenas para h6-h8.
+    # v5: h5 incluída no override — no retreino v4, h5 condicionada ficou pior em
+    # AMBOS os critérios (cov90 0.88->0.76 E WIS 27.1->29.4 vs cauda fina).
+    threshold_per_quantile_per_horizon:
+      "5": {"0.95": 0.035}
+      "6": {"0.95": 0.035}
+      "7": {"0.95": 0.035}
+      "8": {"0.95": 0.035}
+    max_features_per_quantile_per_horizon:
+      "5": {"0.95": 10}
+      "6": {"0.95": 10}
+      "7": {"0.95": 10}
+      "8": {"0.95": 10}
+    banned_features_per_horizon:
+      # EXP-F1c (v8): fase multi-anual só onde transferiu — h2 uníssono nos 4
+      # folds (−16.3/−4.2/−0.5/−0.7); h4 regressa em todos (ban), h3 só no
+      # fold0, h1/h5–h8 neutros (ban p/ minimizar divergência do canônico).
+      "1": ["phase_"]
+      "3": ["phase_"]
+      "4": ["phase_"]
+      "5": ["phase_"]
+      "6": ["phase_"]
+      "7": ["phase_"]
+      "8": ["phase_"]
+  temporal_weighting:
+    enabled: true
+    half_life_years: 3.5
+    half_life_years_long: 10.0  # 6.0->10 h5-8 preserva 2019 para h8 ETP, mas q95 sem peak_weight compensa
+  peak_weighting:
+    enabled: true
+    weight_200: 1.6
+    weight_500: 2.1
+    weight_1000: 2.8
+    long_interval: {weight_200: 1.0, weight_500: 1.0, weight_1000: 1.0}
+  transition_weighting:
+    # EXP-R1 (nov/2026): peso extra p/ amostras cujo ALVO (SE+horizon) desvia da
+    # climatologia da própria semana-alvo (|y_log − mediana_log(semana)| > thresh):
+    # transições de regime (subidas/quedas fortes) viram hard-examples.
+    enabled: false
+    weight: 1.5
+    momentum_thresh: 0.6
+  gap_per_horizon: true
+  parallel_horizons:
+    enabled: true
+    n_jobs: 3
+    backend: loky
+    worker_threads: 1
+  quantile_hparams:
+    # Regularização leve para caudas: corrige hiperinflação q95 sem underfit (n_tr 360-480)
+    # 0.05/0.95: leaves 31/depth 6/min_child 30/lambda 1.5 vs mediana 63/8/20/0.3
+    0.05:
+      num_leaves: 31
+      max_depth: 6
+      min_child_samples: 30
+      learning_rate: 0.025
+      reg_alpha: 0.8
+      reg_lambda: 1.5
+      min_gain_to_split: 0.02
+      feature_fraction: 0.75
+      bagging_fraction: 0.75
+      bagging_freq: 3
+    0.5: {}
+    0.95:
+      num_leaves: 10
+      max_depth: 4
+      min_child_samples: 60
+      learning_rate: 0.02
+      reg_alpha: 2.0
+      reg_lambda: 5.0
+      min_gain_to_split: 0.05
+      feature_fraction: 0.60
+      bagging_fraction: 0.75
+      bagging_freq: 3
+    0.25:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.3
+      reg_lambda: 0.3
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
+    0.75:
+      num_leaves: 63
+      max_depth: 8
+      min_child_samples: 15
+      learning_rate: 0.03
+      reg_alpha: 0.3
+      reg_lambda: 0.3
+      min_gain_to_split: 0.005
+      feature_fraction: 0.85
+      bagging_fraction: 0.85
+      bagging_freq: 3
+  scaler:
+    type: DataFrameScaler
+    feature_range:
+    - 0
+    - 1
+quantiles:
+- 0.05
+- 0.25
+- 0.5
+- 0.75
+- 0.95
+non_crossing:
+  enabled: true
+  method: post_process
+quantile_recalibration:
+  # LEGADO (substituída por quantile_conformal abaixo). enabled=false: deltas
+  # legacy não são regenerados e não são aplicados em inference (fallback inerte).
+  enabled: false
+  method: holdout
+quantile_conformal:
+  # CQR (conformized quantile regression) DELTA-ONLY por horizonte x regime-base.
+  # Regime = intensidade OBSERVÁVEL da semana-base (casos), decidível em produção.
+  # Evidência dos experimentos out/2026 (expanding, por fold): cov90 h1 0.82->0.90,
+  # MAE estável (fold1 0.77->0.88, fold3 0.80->0.92); delta-only em h6-h8 cruza
+  # regimes contraditórios entre temporadas e degrada WIS. h4 ambíguo pós-retreino
+  # (f1 cov90 0.81->0.94 MAS f3 0.65->0.56 / cov50 0.37->0.15) => excluído; h5
+  # melhora todos os folds (f1 0.85->0.90, f2 0.94->1.00, f3 0.58->0.73) => incluído.
+  # Median shift (v6c EXP-A): por-REGIME (high/mid/low), validação expanding
+  # honesta no recompute (fold calibrado só com anteriores). O experimento
+  # antigo falho era o shift GLOBAL (amplitude 10x entre folds); a variante
+  # regime-condicionada nunca tinha sido medida. Scope: apply_horizons.
+  # Valid honesta: expanding (fold calibrado só com folds anteriores) no recompute.
+  enabled: true
+  half_life_years: 2.5
+  max_abs_delta: 1.0
+  apply_horizons: [1, 2, 3, 5]
+  # Median shift: REJEITADO de novo (v6c EXP-A out/2026): variante por-REGIME
+  # (high/mid/low) com validação expanding — cov90 melhora (h1 0.87, h2 0.92,
+  # h3 0.87, h5 0.86) MAS MAE/WIS pioram em h1/h3/h5 (fold1 ganha overshoot:
+  # pool do surto fold0 domina os resíduos). Mantém desligado; machinery
+  # incluída no recompute (config-driven) para futuros testes com peso/shrinkage.
+  apply_median_shift: false
+  max_abs_median_shift: 0.25
+  regime_thresholds:
+    high: 100.0   # casos na semana-base => cluster 'high' (surto instalado)
+    mid: 20.0     # 20-100 => 'mid'; <20 => 'low' (endemia baixa)
+postprocessing:
+  # Experimentos v7 (nov/2026) — pós-processamento no recompute (sem retreino).  # conformal_all_horizons: CQR delta-only em TODOS os horizontes (antes [1,2,3,5]).
+  # level_slope_correction: anti "regressão à média" — y_log ~ a + b·pred_log com
+  #   (a,b) fitados nos folds ANTERIORES (expanding); banda recentrada no nível.
+  # baseline_combination: mistura log-space mediana modelo+baseline com λ por
+  #   horizonte fitado expanding (ataca P3: transições de regime).
+  conformal_all_horizons: false
+  level_slope_correction: false
+  level_slope_min: 0.6
+  level_slope_max: 1.5
+  level_bin_correction: true
+  level_bin_shrink: 0.5
+  level_bin_nmin: 8
+  level_bin_correction_horizons: [4]
+  level_amplification: false
+  level_amplification_min: 1.0
+  level_amplification_max: 1.5
+  level_amplification_side: both
+  level_amplification_horizons: [1, 2, 3, 4, 5, 6, 7, 8]
+  baseline_combination: false
+  baseline_combination_horizons: [1, 2, 3]
+  validation_scheme: expanding
+  # 'expanding' (implantação incremental; fold0 sem ajuste) | 'loo' (fold calibrado
+  # com folds≠f — sem auto-resíduo, espelha artefato de produção)
+  phantom_parity: false
+  # Espelha o phantom gating do inference no caminho de validação (q95 cap por
+  # regime do mês-alvo): paridade live-vs-validação do fold 2022-23.
+  nc_protect_median: true
+  # EXP-NC (v7.2, Adendo 8): repair pós-conformal median-protetor — o clip em
+  # torno da mediana pós-camada A evita que deltas de BANDA reatribuam o slot
+  # q50 pelo sort (vazamento banda->mediana; MAE volta a medir só o nível).
+  quantile_reshape:
+    # EXP-Q0 (v8.1, Adendo 10): re-forma da banda 90% em torno da mediana
+    # (pós-camada A/CQR, pré-NC) — q95' = expm1(log1p(q50) + w_hi*), q05' =
+    # expm1(log1p(q50) - w_lo*), mediana intocada (MAE/gate inalterados).
+    # w* = roll trailing (smooth_roll4_weeks) das larguras em log1p, histórico
+    # por SE ordenada (só passado publicado). Caps K = min largura com miss
+    # do lado <= miss_raw + tol_pp: clamp calibrado expanding no pool de bandas
+    # PUBLICADAS dos folds anteriores (por regime-base; fallback global).
+    # fold0 (sem pool): suavização sem clamp — honesto expanding.
+    # Critérios do experimento: cov90 >= 0.85 global e pior queda por fold
+    # <= 0.03; cov50 ±0.02; dWIS <= 0; W90/W50 h6-h8 6.1 -> <= 4.0;
+    # corr(q05, med) >= 0.5.
+    enabled: false
+    apply_horizons: [4, 5, 6, 7, 8]
+    smooth_roll4_weeks: 4
+    target_cov90: 0.90
+    miss_tol_pp: 1.0
+    grid_step: 0.05
+    k_max: 3.0
+    pool_nmin_regime: 12
+  band_shape:
+    # EXP-Q2 (nov/2026): re-forma da banda quantílica EM PRODUÇÃO (live),
+    # ANTES do conformal — resolve o desenho dessincronizado do fan:
+    # q05 "cola no chão" (fatores q/med ~0.05) e q95 3-8× mediana em semanas
+    # aleatórias (shape_corr q05×q50 = 0.43 no walk-forward; 0.78 live).
+    # Âncora multiplicativa: q* = med × f*[h] (cases); mediana NUNCA alterada
+    # (MAE/gate de nível preservados). Modos:
+    #   profile (default): fatores FIXOS por horizonte calibrados no
+    #     walk-forward (mediana dos fatores raw por h, suavizados isotônico
+    #     PAV, f75/f95 ×1.10 p/ recalibrar cov50 0.43→0.51). Fan determinístico:
+    #     o desenho da banda É o desenho da mediana escalado; ruído de cauda
+    #     eliminado por construção. O conformal CQR (regime-base) modula as
+    #     caudas por cima do perfil.
+    #   raw: fatores por fan (pós-camadas de nível) + suavização roll-median no
+    #     eixo h + monotonia soft damped + caps (REPROVADO no teste live
+    #     2026-W44: pico nato do q95 h1 4.35× infecta o fan via accumulate —
+    #     banda colada no cap/lo_min).
+    # Walk-forward 2022-25, perfil-P2 (176 fans, scripts/analyze_band_shape.py):
+    # cov90 0.835→0.876 (+4.2pp, nominal 0.90 antes do conformal), cov50
+    # 0.428→0.509 (nominal 0.50), WIS −2.1% (MELHOR), MAE inalterado.
+    enabled: true
+    mode: profile
+    profile:
+      '0.05': [0.58, 0.547, 0.38, 0.288, 0.288, 0.288, 0.288, 0.27]
+      '0.25': [0.82, 0.785, 0.732, 0.693, 0.693, 0.693, 0.693, 0.693]
+      '0.75': [1.389, 1.444, 1.444, 1.444, 1.47, 1.47, 1.47, 1.47]
+      '0.95': [1.902, 2.189, 2.207, 2.275, 3.14, 3.14, 3.14, 3.14]
+    smooth_window: 3     # (raw mode)
+    monotone: soft       # 'soft' | 'hard' | false (raw mode)
+    monotone_damp: 0.85  # propagação amortecida da monotonia (raw mode)
+    lo_min: 0.27    # banda inferior nunca abaixo de 27% da mediana (anti "chão")
+    lo_max: 0.80    # q25 nunca acima de 0.80×med
+    hi_min: 1.18    # q75/q95 sempre acima da mediana
+    hi_max: 4.10    # cap anti-pico fantasma
+    median_eps_cases: 0.5
+    apply_horizons: [1, 2, 3, 4, 5, 6, 7, 8]
+  # Correção de viés de mediana (FBias alvo +0.05) — movida de
+  # get_latest_predictions para predict() e aplicada a TODOS os quantis
+  # (antes tocava só casos_previstos: q50 != mediana publicada no fan).
+  median_bias_factor: 1.08
+  median_bias_horizons: [2, 3, 4, 5, 6, 7, 8]
+quantile_width:
+  # EXP-Q1 (v9): caudas como modelos de LARGURA em torno da mediana por seed:
+  # u = log1p(y) − log1p(med_ref_s); bandas publicadas q0.95' = med_s + u95_s e
+  # q0.05' = med_s + u05_s (u05 ≤ 0); mediana/q25/q75 intocados ⇒ MAE/gate
+  # inalterado. Pool honesto expanding por fold: inner-holdout histórico
+  # (med_ref por modelo-seed próprio, treinado até inner.train_max_se —
+  # out-of-sample por construção) + semanas validadas dos folds anteriores
+  # (med_ref = mediana per-seed da validação do fold j) até o cutoff do fold
+  # (gap do walk preservado). Produção: FULL width model por seed no pool
+  # agregado; inference compõe med_full_s + u_full_s. Nos folds, pool <
+  # min_pool_rows usa caudas absolutas; falha no ajuste final impede a publicação.
+  mode: absolute            # 'absolute' (v8 canônico) | 'around_median' (EXP-Q1, REPROVADO nov/2026)
+  inner:
+    train_max_se: '202035'  # inner med treina só com o passado
+    holdout_min_se: '202036'
+    holdout_max_se: '202227'
+  min_pool_rows: 60
+  clip_u: 5.0               # |u| máximo (log1p) — guard contra alvos patológicos
+residual_stage2:
+  # EXP-R2 (nov/2026): booster de resíduos stage-2 por horizonte, fitado SÓ com os
+  # folds ANTERIORES (expanding — mesma honestidade do conformal). LGBM l2 r̂=f(X)
+  # somado a TODOS os quantis em log (mesmo shift, clip ±max_shift_log). Ataca o
+  # erro condicional de nível em h>=4 que recalibração global não resolve (Fase 1).
+  enabled: false
+  horizons: [4, 5, 6, 7, 8]
+  rounds: 60
+  lr: 0.05
+  num_leaves: 7
+  max_shift_log: 0.8
+  min_rows: 48
+deployment_gate:
+  # Gate de implantação por fold (P7): exige MAE de CADA fold completo (>=52 sem)
+  # <= max_baseline_ratio * baseline sazonal; se reprovar, update_pipeline.py
+  # faz rollback e NÃO promove o retreino (estado md5 não avança, sem restart).
+  enabled: true
+  max_baseline_ratio: 1.35
+phantom_gating:
+  enabled: true
+  calm_q95_max_factor: 1.5  # 1.8->1.5 corta 2000 vs 700 (calm cap 1.5× mediana) aceita h1 +2% para h8 ETP 10→4
+  outbreak_q95_max_factor: 2.0  # 2.5->2.0
+  disabled_horizons: []
+# horizon_weights disabled: pesos iguais por horizonte evita overfit
+horizon_weights:
+  enabled: false
+# asymmetric_loss: teste antigo (peso 1.25, h>=2, com caudas) piorou FBias (-0.19->-0.34 em h2).
+# v6 EXP-B (out/2026): variante v3 nunca medida — ONLY MEDIANA, h>=4, undershoot 2.0
+# (ataca o bias -24/-66 e o fold0 h4-h8). Resultado: ver Adendo 5 do relatório.
+asymmetric_loss:
+  enabled: false
+  horizon_threshold: 4
+# v6d EXP-B2: shift de label no TREINO da mediana (tau=0.5), h>=4.
+# Motivação: bias de subestimação estrutural em h>=4 (fold0: -120/-177). Treinar
+# a mediana com y_log+delta antecipa o viés (pinball translation-equivariant) sem
+# custom objective (que subtreina — EXP-B). Val de early-stopping em escala real.
+median_label_shift:
+  enabled: true
+  horizon_min: 4
+  delta_log: 0.15  # sweep: 0.20 melhora bias mas degrada MAE h7/h8 e folds calmos; 0.15 = melhor média MAE
+epidemiological_periods:
+  outbreak_months:
+  - 10
+  - 11
+  - 12
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  calm_months:
+  - 6
+  - 7
+  - 8
+  - 9
+inference:
+  horizon_specific_features: true
+  feature_alignment: strict
+  scaler_path: models/scaler.pkl
+  model_paths:
+    h1: models/lgbm_h1_seed{seed}_q{tau}.pkl
+    h2: models/lgbm_h2_seed{seed}_q{tau}.pkl
+    h3: models/lgbm_h3_seed{seed}_q{tau}.pkl
+    h4: models/lgbm_h4_seed{seed}_q{tau}.pkl
+    h5: models/lgbm_h5_seed{seed}_q{tau}.pkl
+    h6: models/lgbm_h6_seed{seed}_q{tau}.pkl
+    h7: models/lgbm_h7_seed{seed}_q{tau}.pkl
+    h8: models/lgbm_h8_seed{seed}_q{tau}.pkl
+  feature_list_path: models/feature_list.json
+  legacy_feature_aliases: true
+api:
+  host: 0.0.0.0
+  port: 8000
+  host_external: localhost
+  port_external: 8000
+  geocode: '5003207'
+  request_body:
+    required_fields:
+    - geocode
+    optional_fields: []
+  response:
+    format: json
+    fields:
+    - horizonte_semanas
+    - semana_epidemiologica
+    - casos_previstos
+    - alerta
+    alert_thresholds:
+      h1:
+      - 10
+      - 50
+      - 100
+      h2:
+      - 10
+      - 50
+      - 100
+      h3:
+      - 10
+      - 50
+      - 100
+      h4:
+      - 10
+      - 50
+      - 100
+      h5:
+      - 10
+      - 50
+      - 100
+      h6:
+      - 10
+      - 50
+      - 100
+      h7:
+      - 10
+      - 50
+      - 100
+      h8:
+      - 10
+      - 50
+      - 100
+    horizon_guidance: 'h1-h4: previsoes principais de magnitude (confianca media-alta).
+      h5-h8: sinal de alerta precoce - mais confiaveis em anos de baixa incidencia;
+      em anos de surto atipico (ex.: 2019, 45k casos) subestimam a magnitude. Nao
+      tratar h5-h8 como verdade absoluta.'
+    alert_labels:
+    - baixo
+    - medio
+    - alto
+    - critico
+metrics:
+  classification_thresholds:
+    outbreak_threshold: 50
+  targets:
+    h1:
+      mae: 45
+      wis: 39
+      spl_005: 0.8
+      spl_025: 0.75
+      spl_050: 0.7
+      spl_075: 0.75
+      spl_095: 0.85
+      etp: 2
+    h2:
+      mae: 55
+      wis: 45
+      spl_005: 0.85
+      spl_025: 0.75
+      spl_050: 0.75
+      spl_075: 0.75
+      spl_095: 0.9
+      etp: 3
+    h3:
+      mae: 65
+      wis: 52
+      spl_005: 0.9
+      spl_025: 0.75
+      spl_050: 0.8
+      spl_075: 0.75
+      spl_095: 0.95
+      etp: 4
+    h4:
+      mae: 68
+      wis: 58
+      spl_005: 0.95
+      spl_025: 0.75
+      spl_050: 0.85
+      spl_075: 0.75
+      spl_095: 1.0
+      etp: 5
+    h5:
+      mae: 75
+      wis: 65
+      spl_005: 1.0
+      spl_025: 0.85
+      spl_050: 0.9
+      spl_075: 0.85
+      spl_095: 1.05
+      etp: 6
+    h6:
+      mae: 80
+      wis: 71
+      spl_005: 1.05
+      spl_025: 0.85
+      spl_050: 0.95
+      spl_075: 0.85
+      spl_095: 1.1
+      etp: 7
+    h7:
+      mae: 90
+      wis: 78
+      spl_005: 1.1
+      spl_025: 0.85
+      spl_050: 1.0
+      spl_075: 0.85
+      spl_095: 1.15
+      etp: 8
+    h8:
+      mae: 95
+      wis: 84
+      spl_005: 1.15
+      spl_025: 0.85
+      spl_050: 1.05
+      spl_075: 0.85
+      spl_095: 1.2
+      etp: 9
+
+# Orçamentos de regressão retrospectiva de engenharia. Os critérios de utilidade
+# do futuro piloto precisam ser definidos com os usuários operacionais.
+promotion_policy:
+  min_paired_weeks: 104
+  min_peak_weeks: 3
+  coverage_90_floor: 0.70
+  max_coverage_error_increase: 0.02
+  max_ratio: {mae: 1.02, wis_total: 1.02, width_90: 1.10, peak_mae: 1.10}
+  max_mae_persistence_ratio: {1: 1.10, 2: 1.10, 3: 1.30, 4: 1.00, 5: 1.00, 6: 1.00, 7: 1.00, 8: 1.00}
+
+# Limiar de dengue do relatório municipal da SE 202646, por 100 mil habitantes.
+epidemic_threshold_per_100k: 77.4776143982573

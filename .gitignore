@@ -73,4 +73,15 @@ Thumbs.db
 .tox/
 
 # Jupyter
-.ipynb_checkpoints/models/quantile_recalibration.json.buggy.*
+.ipynb_checkpoints/
+/models/quantile_recalibration.json.buggy.*
+
+# Versões publicadas localmente pelo pipeline.
+/models/releases/
+/models/current
+/models/.current-*
+
+/cities/*/pilot/
+/cities/*/models/
+/cities/*/raw/
+/cities/*/processed/

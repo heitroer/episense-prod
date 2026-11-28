@@ -819,7 +819,7 @@ class EpisenseFeatureEngineer:
                            'verao', 'outono', 'inverno', 'primavera',
                            target_col, 'target',
                            # InfoDengue: colunas que vazam futuro ou sao IDs
-                           'casos_est', 'casos_est_min', 'casos_est_max',
+                           'casos_notificados', 'casos_observados', 'casos_est', 'casos_est_min', 'casos_est_max',
                            'p_rt1', 'p_inc100k', 'Localidade_id', 'nivel', 'id',
                            'tweet', 'Rt', 'pop', 'casprov', 'casprov_est', 'casprov_est_min',
                            'casprov_est_max', 'casconf', 'notif_accum_year',

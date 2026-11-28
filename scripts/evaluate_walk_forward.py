@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from config.config import load_config
 from data.epiweeks import add_epiweeks
-from data.origin_inputs import issued_inputs
+from data.origin_inputs import evaluation_inputs
 from models.calibration import compute_conformal, make_regime_hook, save_json
 from models.forecast_audit import QUANTILES, forecast_rows
 from models.inference import EpisenseInference
@@ -131,13 +131,7 @@ def evaluate(artifact, base, config, *, scored_rows=None, history=None):
     by_origin = defaultdict(list)
     for (fold, origin, h), row in forecasts.items():
         by_origin[origin].append((fold, row))
-    def revised_inputs():
-        from data.observations import observed_values
-        for origin in sorted(origins):
-            frame = base.loc[base["SE"] <= origin].sort_values("SE")
-            yield origin, origin, None, frame, observed_values(frame).dropna()
-
-    inputs = revised_inputs() if revised else issued_inputs(config, origins)
+    inputs = evaluation_inputs(config, origins, base)
     for origin, issued_week, digest, frame, observed_cases in inputs:
         regimes[origin] = float(frame["casos"].iloc[-1])
         persistence[origin] = float(observed_cases.iloc[-1])

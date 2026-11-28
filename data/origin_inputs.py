@@ -37,3 +37,15 @@ def issued_inputs(config, origins):
                 or frame.loc[observed.index[-1], "SE"] != audit["persistence_week"]):
             raise ValueError(f"Persistência incompatível com o snapshot de {origin}")
         yield origin, issued_week, digest, frame, observed
+
+
+def evaluation_inputs(config, origins, base):
+    """Seleciona a proveniência configurada e limita cada série à sua origem."""
+    if config["training"].get("historical_inputs") != "revised":
+        yield from issued_inputs(config, origins)
+        return
+    from data.observations import observed_values
+    base = base.sort_values("SE")
+    for origin in sorted(origins):
+        frame = base.loc[base["SE"] <= origin]
+        yield origin, origin, None, frame, observed_values(frame).dropna()

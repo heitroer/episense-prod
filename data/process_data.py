@@ -78,6 +78,9 @@ class EpisenseDataProcessor:
         dengue_df['SE'] = dengue_df['SE'].astype(str).str.zfill(6)
         weather_df['SE'] = weather_df['SE'].astype(str).str.zfill(6)
         
+        from data.live_utils import apply_nowcast
+        dengue_df = apply_nowcast(dengue_df)
+
         # Merge on SE
         merged = pd.merge(dengue_df, weather_df, on='SE', how='left', suffixes=('', '_weather'))
         
@@ -151,12 +154,12 @@ class EpisenseDataProcessor:
             n_imputed = int(merged['is_imputed'].sum())
             if n_imputed > 0:
                 logger.warning(f"Semanas imputadas (fabricadas): {n_imputed} semanas com casos ausente preenchidas com 0")
-            merged['casos'] = merged['casos'].fillna(0).astype(int)
+            merged['casos'] = merged['casos'].fillna(0)
         else:
             merged['is_imputed'] = False
         
         # Forward fill weather variables (strict ffill - no future data used for imputation)
-        weather_cols = [c for c in merged.columns if c not in ['SE', 'ano', 'semana', 'data_inicio_semana', 'casos']]
+        weather_cols = [c for c in merged.columns if c not in ['SE', 'ano', 'semana', 'data_inicio_semana', 'casos', 'casos_est', 'casos_notificados', 'casconf']]
         for col in weather_cols:
             if merged[col].dtype in ['float64', 'int64']:
                 merged[col] = merged[col].ffill()
@@ -182,9 +185,7 @@ class EpisenseDataProcessor:
         """Create base features from merged data."""
         df = df.copy()
         
-        # NOTA: treino usa casos PURO (confirmados) sem substituicao por nowcast.
-        # O nowcast (casos_est) so e usado na API/Dashboard nas ultimas 16 semanas (NOWCAST_WINDOW, ver api/main.py).
-        # Log cases (target variable) - casos puro
+        # Alvo semanal com ajuste por atraso de notificação.
         df['log_casos'] = np.log1p(df['casos'])
         
         # Seasonal features - usa weeks_in_year(ano) para anos com 53 semanas

@@ -3,6 +3,7 @@ Collect dengue data from InfoDengue API for Campo Grande, MS.
 API: https://info.dengue.mat.br/api/alertcity
 """
 
+from __future__ import annotations
 import requests
 import pandas as pd
 from pathlib import Path
@@ -27,30 +28,18 @@ DISEASE = config['project']['disease']  # dengue
 
 API_URL = f"https://info.dengue.mat.br/api/alertcity?geocode={GEOCODE}&disease={DISEASE}&format=csv&ew_format=SE"
 
-# Janela de revisao InfoDengue: o nowcast de uma SE continua sendo revisado por
-# ~16 semanas (config nowcast_window_weeks). Sem o intervalo ew/ey, a API
-# /alertcity retorna apenas ~3 semanas recentes com nowcast NAO consolidado —
-# as semanas antigas ficavam congeladas no historico local com valores parciais
-# (ex.: SE 202631 casos=8) enquanto o site InfoDengue exibia o consolidado
-# revisado (casos=28). Com ew_start/ey_start/ew_end/ey_end a API devolve a
-# serie CONSOLIDADA revisada (paridade com o site Italia-site).
-# 126 dias ~ 18 semanas > janela de nowcast de 16 semanas.
-REVISION_WINDOW_DAYS = 126
-
-
-def build_range_url(base_url: str, days: int = REVISION_WINDOW_DAYS) -> str:
-    """Adiciona ew_start/ey_start/ew_end/ey_end cobrindo os últimos `days` dias.
-
-    A API oficial (/services/api) monta assim:
-      /api/alertcity/?geocode=...&disease=...&format=...&ew_start=<w>&ey_start=<y>&ew_end=<w>&ey_end=<y>
-    Anos de 53 semanas e viradas sao tratados via calendario brasileiro
-    (data/epiweeks) — nunca int(SE)+n.
-    """
+def build_range_url(base_url: str, days: int | None = None) -> str:
+    """Consulta desde o início do histórico local para incorporar revisões antigas."""
     from datetime import date, timedelta
     from data.epiweeks import date_to_epiweek
-    today = date.today()
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo(config["data_sources"]["openmeteo"]["timezone"])).date()
     se_end = str(date_to_epiweek(today)).zfill(6)
-    se_start = str(date_to_epiweek(today - timedelta(days=days))).zfill(6)
+    if days is None:
+        history = DATA_RAW_DIR / "infodengue_cg_full.csv"
+        se_start = str(int(pd.read_csv(history, usecols=["SE"])["SE"].min())) if history.exists() else "201001"
+    else:
+        se_start = str(date_to_epiweek(today - timedelta(days=days))).zfill(6)
     return (
         f"{base_url}"
         f"&ew_start={int(se_start[4:])}&ey_start={int(se_start[:4])}"
@@ -68,8 +57,8 @@ def collect_infodengue_data() -> pd.DataFrame:
         response.raise_for_status()
         
         # Parse CSV
-        from io import StringIO
-        df = pd.read_csv(StringIO(response.text))
+        from io import BytesIO
+        df = pd.read_csv(BytesIO(response.content), encoding="utf-8-sig")
         
         logger.info(f"Downloaded {len(df)} rows from InfoDengue")
         logger.info(f"Columns: {df.columns.tolist()}")
@@ -84,8 +73,8 @@ def collect_infodengue_data() -> pd.DataFrame:
 def process_infodengue_data(df: pd.DataFrame) -> pd.DataFrame:
     """Process raw InfoDengue data into standard format.
     
-    Keeps ONLY 'casos' (confirmed) and 'casos_est' (nowcast).
-    All other case variants (casos_est_min, casos_est_max, casprov, casconf, etc.) are dropped.
+    Retain notifications, nowcasts and confirmed counts where available.
+    The Dourados pipeline also consumes municipal covariates.
     """
     if df.empty:
         return df
@@ -93,10 +82,11 @@ def process_infodengue_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
     # Keep ONLY the required columns from InfoDengue
-    keep_cols = ['SE', 'casos', 'casos_est']
-    if str(GEOCODE) == "5003702":
-        if "municipio_nome" not in df or not df["municipio_nome"].str.strip().eq("Dourados").all():
-            raise ValueError("Resposta InfoDengue incompatível com Dourados")
+    keep_cols = ['SE', 'casos', 'casos_est', 'casconf']
+    if str(GEOCODE) != "5002704":
+        city = config["project"]["location"].split(",")[0]
+        if "municipio_nome" not in df or not df["municipio_nome"].str.strip().eq(city).all():
+            raise ValueError(f"Resposta InfoDengue incompatível com {city}")
         keep_cols = list(df.columns)
     available_cols = [c for c in keep_cols if c in df.columns]
     df = df[available_cols].copy()
@@ -156,6 +146,10 @@ def update_full_history(df_new: pd.DataFrame, full_path: Path) -> pd.DataFrame:
     if full_path.exists():
         df_full = pd.read_csv(full_path)
         df_full['SE'] = df_full['SE'].apply(_norm_se2)
+        # Preserve campos históricos que esta coleta municipal não solicita.
+        previous = df_full.set_index('SE')
+        for col in df_full.columns.difference(df_new.columns):
+            df_new[col] = df_new['SE'].map(previous[col])
         df_full = df_full[~df_full['SE'].isin(df_new['SE'])]
         df_merged = pd.concat([df_full, df_new], ignore_index=True)
     else:

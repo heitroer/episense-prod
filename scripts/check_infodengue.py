@@ -4,7 +4,6 @@
 Cheap check (1 request) comparing the latest SE in the InfoDengue API against
 the last SE in the base. Runs the full update pipeline ONLY when the API has a
 newer week; stays silent otherwise (watchdog pattern)."""
-import io
 import os
 import subprocess
 import sys
@@ -18,16 +17,14 @@ os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-import requests
-
-API_URL = ("https://info.dengue.mat.br/api/alertcity"
-           "?geocode=5002704&disease=dengue&format=csv&ew_format=SE")
-
+from data.collect_infodengue import (archive_first_weekly_counts, collect_infodengue_data,
+                                     process_infodengue_data)
 
 def api_max_se() -> str:
-    r = requests.get(API_URL, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
+    df = process_infodengue_data(collect_infodengue_data())
+    if df.empty:
+        raise RuntimeError("Coleta InfoDengue vazia")
+    archive_first_weekly_counts(df)
     return str(df["SE"].max()).zfill(6)
 
 
@@ -72,4 +69,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Old host cron entries invoke this script without arguments.
+    # Scheduled collection now belongs to each municipal dashboard.
+    if sys.argv[1:] == ["--manual"]:
+        main()

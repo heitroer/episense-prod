@@ -1,4 +1,4 @@
-"""Treina o candidato retrospectivo nas duas cidades. Execute como módulo a partir da raiz."""
+"""Treina o candidato retrospectivo nos municípios configurados. Execute como módulo a partir da raiz."""
 
 import argparse
 import copy
@@ -33,6 +33,11 @@ CITIES = {
         "config/config.yaml",
         "models/current",
     ),
+    "corumba": (
+        "cities/5003207/processed/episense_base.csv",
+        "cities/5003207/config.yaml",
+        "cities/5003207/pilot",
+    ),
     "dourados": (
         "cities/5003702/processed/episense_base.csv",
         "cities/5003702/config.yaml",
@@ -56,6 +61,8 @@ def snapshot_references(inputs):
         dest = inputs / f"reference_{city}"
         dest.mkdir()
         source = (ROOT / model_dir).resolve()
+        if (source / "current").is_symlink():
+            source = (source / "current").resolve()
         for name in ("validation_history.json", "walk_forward_evaluation.json"):
             shutil.copyfile(source / name, dest / name)
 
@@ -77,6 +84,8 @@ def snapshot_inputs(output):
         )
     weeks = pd.read_csv(inputs / "campo_grande.csv").SE
     for code in REGION:
+        if code == "5003207":  # O painel já usa a base operacional de Corumbá.
+            continue
         params = {
             "geocode": code,
             "disease": "dengue",
@@ -141,9 +150,11 @@ def read_base(path):
 
 
 def regional_inputs(inputs):
-    cities = {c: read_base(inputs / f"{c}.csv") for c in CITIES}
+    cities = {c: read_base(inputs / f"{c}.csv") for c in CITIES if (inputs / f"{c}.csv").exists()}
     counts = {c: observed_values(f.set_index("SE")) for c, f in cities.items()}
     for code in REGION:
+        if code == "5003207" and "corumba" in cities:
+            continue
         peer = read_base(inputs / f"{code}.csv")
         counts[code] = peer.set_index("SE").casos
     panel = pd.DataFrame(counts).sort_index()
@@ -201,7 +212,7 @@ def evaluate_city(city, frame, panel, output):
             or meta["scope"] != "retrospective_revised_inputs"
         ):
             raise ValueError("Corte ou procedência incompatível")
-    peer = next(c for c in CITIES if c != city)
+    peer = "dourados" if city == "campo_grande" else "campo_grande"
     destination = output / "candidates" / city
     destination.mkdir(parents=True, exist_ok=True)
     candidate_history = copy.deepcopy(runs[1][0])
@@ -423,7 +434,7 @@ def main():
     parser.add_argument(
         "--evaluate-existing",
         action="store_true",
-        help="Reusar quatro treinos municipais e entradas congeladas",
+        help="Reusar os treinos municipais e as entradas congeladas",
     )
     args = parser.parse_args()
     output = args.output.resolve()
@@ -444,6 +455,8 @@ def write_manifest(output):
     inputs = output / "inputs"
     files = [p for p in inputs.rglob("*") if p.is_file()]
     for city in CITIES:
+        if not (inputs / f"{city}.csv").exists():
+            continue
         for directory in (
             output / city,
             output / (city + "_warmup"),
@@ -465,7 +478,7 @@ def write_manifest(output):
             output / "metrics.csv",
         ]
     )
-    files.extend(output / f"{city}_forecasts.csv" for city in CITIES)
+    files.extend(output / f"{city}_forecasts.csv" for city in CITIES if (inputs / f"{city}.csv").exists())
     (output / "manifest.json").write_text(
         json.dumps(
             {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},

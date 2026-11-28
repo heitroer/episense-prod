@@ -23,7 +23,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from models.metrics import pinball_mean, coverage_interval, mean_interval_width  # noqa: E402
+from models.metrics import weighted_interval_score, coverage_interval, mean_interval_width  # noqa: E402
 
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 
@@ -73,10 +73,7 @@ def metrics_from(y, q):
     out['cov50'] = coverage_interval(y, q[0.25], q[0.75])
     out['w90'] = mean_interval_width(y, q[0.05], q[0.95])
     out['w50'] = mean_interval_width(y, q[0.25], q[0.75])
-    tot = 0.0
-    for t in QUANTILES:
-        tot += pinball_mean(y, q[t], t)
-    out['wis_proxy'] = float(tot)
+    out['wis_proxy'] = weighted_interval_score(y, q)
     out['mae'] = float(np.mean(np.abs(y - q[0.50])))
     return out
 

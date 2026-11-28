@@ -1,0 +1,19 @@
+{
+  "first_origin": "202648",
+  "weeks": 52,
+  "maturity_weeks": 16,
+  "horizons": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "release": "model-aj6h73qj",
+  "model_sha256": "7e70260a598bb2e809f7948b968e7060af28a9f2ccf0d64e2734dd668bc57964",
+  "config_sha256": "58fbb8f98958d0cb34e09d22c101129520fd3d37dffc344d0f10008b9addd5e0",
+  "inference_sha256": "aedfa4027cb9056900aca53902118faa12ce68f06da7bcfe3de63897394b35ac"
+}

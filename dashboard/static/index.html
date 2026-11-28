@@ -6,8 +6,8 @@
 <title>Episense - Vigilância de dengue</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<link media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script async id="chart-library" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{
   color-scheme:dark;
@@ -75,51 +75,89 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .year-row .pill.active{background:var(--accent);border-color:var(--accent);color:#031412;box-shadow:0 2px 10px rgba(45,212,191,.22)}
 .year-row .pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
+.token-gate{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,7,13,.9);backdrop-filter:blur(8px)}
+.token-gate[hidden]{display:none}
+.token-card{width:min(460px,100%);border:1px solid var(--line);background:linear-gradient(180deg,rgba(21,28,43,.98),rgba(11,15,25,.98));border-radius:var(--radius);padding:24px;box-shadow:var(--shadow)}
+.token-card h2{font-size:20px;letter-spacing:-.03em;margin-bottom:6px}
+.token-card p{font-size:13px;color:var(--text-2);line-height:1.5}
+.token-card code{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--accent)}
+.token-field{display:flex;gap:8px;margin-top:16px}
+.token-field input{flex:1;min-width:0;height:42px;border:1px solid var(--line-2);border-radius:10px;background:var(--panel-2);color:var(--text);padding:0 12px;font:500 13px "IBM Plex Mono",monospace}
+.token-field input::placeholder{color:var(--muted-2)}
+.token-field button{height:42px;border:0;border-radius:10px;background:var(--accent);color:#031412;font-weight:700;padding:0 18px}
+.token-field button:hover{filter:brightness(1.06)}
+.token-error{min-height:18px;margin-top:10px;font-size:12px;color:var(--danger)}
+.token-note{margin-top:12px;font-size:11px;color:var(--muted)}
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.controls{grid-template-columns:1fr}.hero{grid-template-columns:1fr}.readout{grid-template-columns:repeat(4,1fr)}}
 .sw.skill-mae{background:var(--accent)}
 .sw.skill-wis{background:var(--accent-2)}
 @media(max-width:760px){.page{padding:12px}.top{height:auto;align-items:flex-start;flex-direction:column;padding-bottom:12px}.brand{align-items:flex-start;flex-direction:column;gap:4px}.hero-block{padding:18px}.readout{grid-template-columns:repeat(2,1fr)}.horizon{grid-template-columns:repeat(4,1fr)}.plot-wrap{height:360px}.chart-head{flex-direction:column}.chart-meta{justify-content:flex-start}.fc-grid{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>
+<link rel="stylesheet" href="/static/municipal.css?v=11">
 </head>
 <body>
+
+<div class="token-gate" id="token-gate" hidden>
+  <form class="token-card" id="token-form">
+    <h2>Acesso restrito</h2>
+    <p>Informe o token da API (<code>EPISENSE_API_KEY</code>) para carregar o painel.</p>
+    <div class="token-field">
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="Cole o token aqui" aria-label="Token da API">
+      <button type="submit">Entrar</button>
+    </div>
+    <div class="token-error" id="token-error" role="alert"></div>
+    <div class="token-note">O token fica apenas nesta aba do navegador (sessionStorage).</div>
+  </form>
+</div>
 <div class="page">
   <header class="top">
-    <div class="brand"><h1>Episense</h1><span>Campo Grande MS - Vigilância semanal de dengue</span></div>
-    <div class="statusbar"><span class="status" data-state="loading" id="model-status">Carregando</span></div>
+    <div class="brand"><strong>EpiSense</strong><a href="/"><span aria-hidden="true">←</span>  Trocar município</a></div>
+    <div class="statusbar"><span class="status" data-state="loading" id="model-status">Carregando</span><button class="ghost" id="token-logout" type="button" hidden>Trocar token</button></div>
   </header>
 
-  <section class="hero">
-    <div class="hero-block">
-      <div class="kicker">Painel operacional</div>
-      <h2>Antecipando surtos, protegendo vidas</h2>
-      <p>Previsões semanais probabilísticas que transformam dados em ação para a vigilância em Campo Grande.</p>
-    </div>
-    <div class="readout">
-      <div class="cell"><label>MAE H1</label><strong id="m-h1">--</strong></div>
-      <div class="cell"><label>MAE H4</label><strong id="m-h4">--</strong></div>
-      <div class="cell"><label>MAE H8</label><strong id="m-h8">--</strong></div>
-      <div class="cell"><label>Cobertura H1</label><strong id="m-cov">--</strong></div>
-    </div>
+<div class="workspace"><aside class="cities"><h2>Municípios</h2><nav aria-label="Selecionar município"><a href="?geocode=5002704" id="city-5002704"><strong>Campo Grande</strong><span>Carregando…</span><small></small></a><a href="?geocode=5003702" id="city-5003702"><strong>Dourados</strong><span>Carregando…</span><small></small></a><a href="?geocode=5003207" id="city-5003207"><strong>Corumbá</strong><span>Carregando…</span><small></small></a></nav></aside><div class="city-content">  <div class="municipal-title"><h1 id="city-name"></h1><span id="calendar-week"></span></div>
+  <div class="summary-grid"><section class="brief" id="situation"><h2>Previsão</h2>
+    <p class="insight" id="case-note">Carregando…</p><p class="forecast-change" id="forecast-change" hidden></p>
+    <div class="overview-plot"><canvas id="overview-chart" role="img" aria-label="Casos das últimas oito semanas e previsões das próximas oito"></canvas></div>
+    <div class="case-legend" id="overview-legend" aria-label="Legenda da previsão"></div>
   </section>
-
+  <section class="brief" id="climate"><h2>Clima</h2>
+    <p class="insight" id="climate-note">Carregando a série climática…</p>
+    <div id="climate-trends"></div>
+  </section>
+  </div><div class="analysis-grid">  <section class="metrics" id="metrics-section">
+    <div class="metrics-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div style="min-width:0"><h3>Métricas</h3>
+      <p id="training-id"></p></div>
+    </div>
+    <div class="metrics-tabs" id="metrics-tabs"></div>
+    <div class="metrics-table-wrap">
+      <table class="metrics-table" id="metrics-table">
+        <thead id="metrics-head-row">
+          <tr>
+            <th>Horizonte</th>
+            <th>MAE</th>
+            <th>Bias</th>
+            <th>Cov. 50%</th>
+            <th>Cov. 90%</th>
+          </tr>
+        </thead>
+        <tbody id="metrics-body">
+          <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:22px;font:500 13px &quot;IBM Plex Mono&quot;,monospace">Carregando métricas</td></tr>
+        </tbody>
+        <tfoot id="metrics-foot">
+          <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:12px;font:500 12px &quot;IBM Plex Mono&quot;,monospace">—</td></tr>
+        </tfoot>
+      </table>
+    </div>
+  </section><div class="history-column">
   <div class="grid" style="margin-top:16px">
     <main class="main">
-      <section class="chart-panel">
-        <div class="chart-head">
-          <div><h3>Gráfico de previsões históricas e futuras</h3><p id="chart-subtitle">Casos confirmados, previsto em validação e projeção futura a partir da origem.</p></div>
-
-        </div>
+      <section class="chart-panel" id="archive">
+        <div class="chart-head"><h2>Histórico de previsões</h2></div>
         <div class="plot-wrap"><div class="chart-shell"><canvas id="chart"></canvas></div></div>
-        <div class="legend">
-          <span><i class="sw real"></i>Real (observado)</span>
-          <span><i class="sw hist"></i>Histórico mediana H<span id="legend-h">1</span></span>
-          <span><i class="sw hist50"></i>IC 50% hist.</span>
-          <span><i class="sw hist90"></i>IC 90% hist.</span>
-          <span><i class="sw fc"></i>Previsão futura mediana</span>
-          <span><i class="sw fc50"></i>IC 50% futuro</span>
-          <span><i class="sw fc90"></i>IC 90% futuro</span>
-        </div>
+        <div class="case-legend" id="archive-chart-legend" aria-label="Legenda do histórico"></div>
       </section>
 
       <section class="controls">
@@ -148,59 +186,31 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
     </main>
   </div>
 
-  <section class="metrics" id="metrics-section">
-    <div class="metrics-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
-      <div style="min-width:0"><h3>Métricas de validação</h3>
-      <p>Validação Walk-Forward Expanding Window, 4 folds por ano epidemiológico (2022-2025)</p></div>
-      <button id="metrics-advanced-toggle" class="ghost" type="button" aria-pressed="false" style="height:28px;white-space:nowrap">Ver métricas avançadas</button>
-    </div>
-    <div class="metrics-tabs" id="metrics-tabs"></div>
-    <div class="metrics-table-wrap">
-      <table class="metrics-table" id="metrics-table">
-        <thead id="metrics-head-row">
-          <tr>
-            <th><span>Horizonte</span><small>Semanas à frente</small></th>
-            <th><span>MAE</span><small>casos</small></th>
-            <th><span>WIS total</span><small>5 quantis</small></th>
-            <th><span>Cobertura 90%</span><small>acerto IC 90%</small></th>
-          </tr>
-        </thead>
-        <tbody id="metrics-body">
-          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:22px;font:500 13px &quot;IBM Plex Mono&quot;,monospace">Carregando métricas</td></tr>
-        </tbody>
-        <tfoot id="metrics-foot">
-          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:12px;font:500 12px &quot;IBM Plex Mono&quot;,monospace">—</td></tr>
-        </tfoot>
-      </table>
-    </div>
-  </section>
-
-  <section class="metrics" id="skill-section">
-    <div class="metrics-head">
-      <h3>Ganho vs baseline sazonal</h3>
-      <p>Quanto (%) o modelo erra menos que o baseline de persistência sazonal (repetir a mediana histórica da mesma semana). Barra acima do zero = melhor que o baseline; abaixo = pior.</p>
-    </div>
-    <div class="metrics-table-wrap" style="padding:10px 14px 0">
-      <div style="position:relative;height:300px"><canvas id="skill-chart" aria-label="Ganho percentual vs baseline por horizonte" role="img"></canvas></div>
-    </div>
-    <div class="legend">
-      <span><i class="sw skill-mae"></i>Ganho MAE</span>
-      <span><i class="sw skill-wis"></i>Ganho WIS</span>
-    </div>
-  </section>
 </div>
+
+</div>
+</div></div></div><script src="/static/overview.js?v=16"></script>
 <script>
 const css = getComputedStyle(document.documentElement);
 const C = name => css.getPropertyValue(name).trim();
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const YEARS=[2022,2023,2024,2025,2026];
+const MAX_YEAR=Number(new Intl.DateTimeFormat('en',{year:'numeric',timeZone:'America/Campo_Grande'}).format(new Date()));
+const YEARS=Array.from({length:MAX_YEAR-2021},(_,i)=>2022+i);
+function weeksInYear(year){
+  function weekOne(y){
+    const jan4=new Date(Date.UTC(y,0,4));
+    return Date.UTC(y,0,4-jan4.getUTCDay());
+  }
+  return Math.round((weekOne(year+1)-weekOne(year))/604800000);
+}
+const RANGE_END=String(MAX_YEAR)+weeksInYear(MAX_YEAR);
 // slider agora seleciona por SE (snap em anos e folds), não só ano inteiro
-let selStart='202236',selEnd='202652';
-let yearStart=2022,yearEnd=2026; // alias legado sincronizado com selStart/selEnd
-const SNAP_SES=['202236','202301','202336','202401','202436','202501','202537','202601','202652'].sort();
+let selStart='202236',selEnd=RANGE_END;
+let yearStart=2022,yearEnd=MAX_YEAR; // alias legado sincronizado com selStart/selEnd
+const SNAP_SES=['202236','202336','202436','202537',...YEARS.slice(1).map(y=>y+'01'),RANGE_END].sort();
 function syncYearAlias(){ try{ yearStart=parseInt(selStart.slice(0,4),10); yearEnd=parseInt(selEnd.slice(0,4),10);}catch(e){} }
 function isFullRange(){ return selEnd===SNAP_SES[SNAP_SES.length-1]; }
-const state = {h:'1', win:104, originSE:null, originDate:null, history:[], forecast:null, chart:null, cache:new Map(), forecastCache:new Map(), loading:false};
+const state = {h:'1', win:104, originSE:null, originDate:null, history:[], forecast:null, chart:null, };
 const el = {
   horizon:document.getElementById('horizon-control'), chart:document.getElementById('chart'),
   range:document.getElementById('range-tag'), originTag:document.getElementById('origin-tag'), originLine:document.getElementById('origin-line'), subtitle:document.getElementById('chart-subtitle'),
@@ -208,86 +218,92 @@ const el = {
 };
 function seFmt(se){const s=String(se);return s.slice(0,4)+'S'+s.slice(4).padStart(2,'0')}
 function seLabel(se){const s=String(se);return s.slice(2,4)+'/'+s.slice(4).padStart(2,'0')}
-async function json(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(String(r.status));return r.json()}
+const TOKEN_KEY='episense_api_token';
+const cityLinks=[...document.querySelectorAll('.cities nav a')];
+const cityCodes=cityLinks.map(link=>link.id.slice(5));
+const requestedCode=new URLSearchParams(location.search).get('geocode');
+const cityCode=cityCodes.includes(requestedCode)?requestedCode:'5002704';
+const prefixForCity=code=>code==='5002704'?'':'/municipal/'+code;
+const cityPrefix=prefixForCity(cityCode);
+document.getElementById('city-name').textContent=document.querySelector('#city-'+cityCode+' strong').textContent;
+put('calendar-week','Semana '+Number(calendarWeek(new Date()).slice(1)));
+const tokenGate=document.getElementById('token-gate');
+const tokenForm=document.getElementById('token-form');
+const tokenInput=document.getElementById('token-input');
+const tokenError=document.getElementById('token-error');
+const tokenLogout=document.getElementById('token-logout');
+function getToken(){try{return sessionStorage.getItem(TOKEN_KEY)||''}catch(e){return ''}}
+function setToken(v){try{sessionStorage.setItem(TOKEN_KEY,v)}catch(e){}}
+function clearToken(){try{sessionStorage.removeItem(TOKEN_KEY)}catch(e){}}
+function showTokenGate(message){if(tokenGate)tokenGate.hidden=false;if(tokenError)tokenError.textContent=message||'';if(tokenInput)setTimeout(()=>tokenInput.focus(),50)}
+function hideTokenGate(){if(tokenGate)tokenGate.hidden=true}
+async function checkAuth(token=getToken()){
+  try{
+    const r=await fetch(cityPrefix+'/api/auth/check',{cache:'no-store',headers:token?{'X-API-Key':token}:{}});
+    if(r.status===429)return {ok:false,retry:Number(r.headers.get('Retry-After'))||30};
+    if(!r.ok)return {ok:false,required:r.status===401};
+    const data=await r.json().catch(()=>({}));
+    return {ok:true,required:!!data.required};
+  }catch(e){return {ok:false,required:true}}
+}
+async function json(url,prefix=cityPrefix){
+  const token=getToken();
+  const r=await fetch(prefix+url,{cache:'no-store',headers:token?{'X-API-Key':token}:{}});
+  if(r.status===401){el.modelStatus.textContent='Acesso indisponível'; el.modelStatus.dataset.state='error';throw new Error('401')}
+  if(!r.ok)throw new Error(String(r.status));
+  return r.json();
+}
+if(tokenForm)tokenForm.addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const value=(tokenInput.value||'').trim();
+  if(!value){showTokenGate('Informe o token.');return}
+  const auth=await checkAuth(value);
+  if(auth.ok){setToken(value);hideTokenGate();window.location.reload()}
+  else{showTokenGate(auth.retry?'Muitas tentativas. Tente novamente em '+auth.retry+' s.':'Não foi possível validar o token.')}
+});
+if(tokenLogout)tokenLogout.addEventListener('click',()=>{tokenInput.value='';showTokenGate()});
 function pct(v){return v==null||Number.isNaN(v)?'--':(v*100).toFixed(1)+'%'}
 function spct(v){return v==null||Number.isNaN(v)?'--':(v>=0?'+':'')+(v*100).toFixed(1)+'%'}
 function num(v){return v==null||Number.isNaN(v)?'--':Math.round(v).toLocaleString('pt-BR')}
 function level(v){if(v==null)return ['--',C('--muted')]; if(v<10)return ['Baixo',C('--ok')]; if(v<50)return ['Médio',C('--warn')]; if(v<100)return ['Alto',C('--forecast')]; return ['Crítico',C('--danger')]}
 function hButtons(){el.horizon.innerHTML=''; for(let h=1;h<=8;h++){const b=document.createElement('button');b.type='button';b.className='pill'+(String(h)===state.h?' active':'');b.textContent='H'+h;b.onclick=()=>setH(String(h));el.horizon.appendChild(b)}}
-let metricsData=null;let metricsFold='avg';let metricsAdvanced=false;let skillChart=null;
+let metricsData=null;let metricsFold='avg';
 function formatNum(v, digits=1){return v==null||Number.isNaN(v)?'--':Number(v).toFixed(digits)}
 function renderMetrics(){
   if(!metricsData) return;
-  // rebuild header based on advanced
-  const thead=document.getElementById('metrics-head-row');
-  if(thead){
-    if(metricsAdvanced){
-      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>RMSE</span><small>casos</small></th><th><span>Bias</span><small>− = subestima</small></th><th><span>Ganho MAE</span><small>% vs sazonal</small></th><th><span>Ganho WIS</span><small>% vs sazonal</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>WIS 50%</span><small>q25–q75</small></th><th><span>WIS 90%</span><small>q05–q95</small></th><th><span>Width 50%</span><small>largura IC</small></th><th><span>Width 90%</span><small>largura IC</small></th><th><span>Cobertura 50%</span><small>acerto IC 50%</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th><th><span>WAPE</span><small>% do volume real</small></th></tr>';
-    } else {
-      thead.innerHTML='<tr><th><span>Horizonte</span><small>Semanas à frente</small></th><th><span>MAE</span><small>casos</small></th><th><span>WIS total</span><small>5 quantis</small></th><th><span>Cobertura 90%</span><small>acerto IC 90%</small></th></tr>';
-    }
-  }
-  const body=document.getElementById('metrics-body'); if(!body) return;
-  body.innerHTML='';
-  for(let h=1;h<=8;h++){
-    const entry=metricsData[String(h)];
-    const d=entry ? (entry[metricsFold] || entry['avg']) : null;
-    const tr=document.createElement('tr');
-    if(metricsAdvanced){
-      let b=d?.bias; let bTxt=(b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1);
-      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td>'+formatNum(d?.rmse,1)+'</td><td>'+bTxt+'</td><td>'+spct(d?.skill_mae)+'</td><td>'+spct(d?.skill_wis)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td>'+formatNum(d?.wis_50,1)+'</td><td>'+formatNum(d?.wis_90,1)+'</td><td>'+formatNum(d?.width_50,0)+'</td><td>'+formatNum(d?.width_90,0)+'</td><td class="v-cov50">'+pct(d?.coverage_50)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td><td>'+pct(d?.wape)+'</td>';
-    } else {
-      tr.innerHTML='<td>H'+h+'</td><td class="v-mae">'+formatNum(d?.mae,1)+'</td><td class="v-wis">'+formatNum(d?.wis_total,1)+'</td><td class="v-cov">'+pct(d?.coverage_90)+'</td>';
-    }
-    body.appendChild(tr);
-  }
-  // SECTION: média entre horizontes (respeita fold selecionado e modo avançado)
-  const foot=document.getElementById('metrics-foot');
-  if(foot){
-    const rows=[1,2,3,4,5,6,7,8].map(h=>metricsData[String(h)]).filter(Boolean).map(e=>e[metricsFold]||e['avg']).filter(Boolean);
-    const mean=k=>{const vs=rows.map(r=>r?.[k]).filter(v=>v!=null&&!Number.isNaN(v));return vs.length?vs.reduce((a,b)=>a+b,0)/vs.length:null};
-    const nh=rows.length||8;
-    const bTxt=()=>{const b=mean('bias');return (b==null||Number.isNaN(b))?'--':(b>0?'+':'')+Number(b).toFixed(1)};
-    const label=`<td><span class="avg-label">Média h1–h${nh}</span><span class="avg-sub">média entre horizontes</span></td>`;
-    if(metricsAdvanced){
-      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td>'+formatNum(mean('rmse'),1)+'</td><td>'+bTxt()+'</td><td>'+spct(mean('skill_mae'))+'</td><td>'+spct(mean('skill_wis'))+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td>'+formatNum(mean('wis_50'),1)+'</td><td>'+formatNum(mean('wis_90'),1)+'</td><td>'+formatNum(mean('width_50'),0)+'</td><td>'+formatNum(mean('width_90'),0)+'</td><td class="v-cov50">'+pct(mean('coverage_50'))+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td><td>'+pct(mean('wape'))+'</td></tr>';
-    } else {
-      foot.innerHTML='<tr>'+label+'<td class="v-mae">'+formatNum(mean('mae'),1)+'</td><td class="v-wis">'+formatNum(mean('wis_total'),1)+'</td><td class="v-cov">'+pct(mean('coverage_90'))+'</td></tr>';
-    }
-  }
-  // update hero readout from selected fold
-  const h1d=metricsData['1']?.[metricsFold]||metricsData['1']?.['avg'];
-  const h4d=metricsData['4']?.[metricsFold]||metricsData['4']?.['avg'];
-  const h8d=metricsData['8']?.[metricsFold]||metricsData['8']?.['avg'];
-  const c1=document.getElementById('m-h1'); if(c1) c1.textContent=formatNum(h1d?.mae,1);
-  const c4=document.getElementById('m-h4'); if(c4) c4.textContent=formatNum(h4d?.mae,1);
-  const c8=document.getElementById('m-h8'); if(c8) c8.textContent=formatNum(h8d?.mae,1);
-  const cc=document.getElementById('m-cov'); if(cc) cc.textContent=pct(h1d?.coverage_90);
-  renderSkillChart();
+  const paired=['retrospective_consolidated','issued_inputs_consolidated_outcomes','retrospective_revised_inputs'].includes(metricsData.scope);
+  const bias = value => Number.isFinite(value) ? (value > 0 ? '+' : '') + formatNum(value) : '--';
+  const mae = ['MAE', 'mae', formatNum, 'v-mae'];
+  const biasColumn = ['Bias', 'bias', bias];
+  const coverage50 = ['Cov. 50%', 'coverage_50', pct, 'v-cov50'];
+  const coverage90 = ['Cov. 90%', 'coverage_90', pct, 'v-cov'];
+  const columns = [mae, biasColumn, coverage50, coverage90];
+
+  document.getElementById('metrics-head-row').innerHTML =
+    '<tr><th scope="col">Horizonte</th>' +
+    columns.map(([label]) => `<th scope="col">${label}</th>`).join('') + '</tr>';
+
+  const rows = Array.from({length: 8}, (_, index) => metricsData[String(index + 1)]?.[metricsFold]);
+  const cells = getValue => columns.map(([, key, format, className = '']) =>
+    `<td class="${className}">${format(getValue(key))}</td>`
+  ).join('');
+  document.getElementById('metrics-body').innerHTML = rows.map((row, index) =>
+    `<tr><td>H${index + 1}</td>${cells(key => row?.[key])}</tr>`
+  ).join('');
+
+  const mean = key => {
+    const values = rows.map(row => row?.[key]).filter(Number.isFinite);
+    return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+  };
+  document.getElementById('metrics-foot').innerHTML =
+    `<tr><td><span class="avg-label">Média H1–H8</span></td>${cells(mean)}</tr>`;
+  renderTrainingSubtitle();
 }
-// Ganho vs baseline sazonal (%) por horizonte — barras refletindo o fold selecionado
-const skillZeroPlugin={id:'skillZero',afterDraw(chart){const y=chart.scales.y;if(!y)return;const z=y.getPixelForValue(0);const a=chart.chartArea;if(!isFinite(z)||z<a.top||z>a.bottom)return;const ctx=chart.ctx;ctx.save();ctx.strokeStyle=C('--text-2');ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(a.left,z);ctx.lineTo(a.right,z);ctx.stroke();ctx.restore()}};
-function skillBar(y){return (y==null||Number.isNaN(y))?C('--panel-3'):(y>=0?C('--accent'):C('--danger'))}
-function skillBarW(y){return (y==null||Number.isNaN(y))?C('--panel-3'):(y>=0?C('--accent-2'):C('--danger'))}
-function renderSkillChart(){
-  const cv=document.getElementById('skill-chart'); if(!cv||!metricsData) return;
-  const rows=[1,2,3,4,5,6,7,8].map(h=>{const e=metricsData[String(h)];return e?(e[metricsFold]||e['avg']):null});
-  const col=k=>rows.map(r=>{const v=r?.[k];return (v==null||Number.isNaN(v))?null:Number(v)*100});
-  const data={labels:['H1','H2','H3','H4','H5','H6','H7','H8'],datasets:[
-    {label:'Ganho MAE',data:col('skill_mae'),backgroundColor:ctx=>skillBar(ctx.parsed?.y),borderRadius:4,maxBarThickness:24},
-    {label:'Ganho WIS',data:col('skill_wis'),backgroundColor:ctx=>skillBarW(ctx.parsed?.y),borderRadius:4,maxBarThickness:24}
-  ]};
-  const opts={responsive:true,maintainAspectRatio:false,animation:{duration:reducedMotion?0:500},
-    scales:{
-      y:{ticks:{color:C('--muted'),callback:v=>v+'%'},grid:{color:'rgba(36,48,68,.55)'},border:{color:C('--line')}},
-      x:{ticks:{color:C('--muted-2')},grid:{display:false}}
-    },
-    plugins:{
-      legend:{display:false},
-      tooltip:{callbacks:{label:ctx=>{const y=ctx.parsed.y;return ctx.dataset.label+': '+((y==null||Number.isNaN(y))?'--':(y>=0?'+':'')+Number(y).toFixed(1)+'%')}}}
-    }};
-  if(!skillChart){skillChart=new Chart(cv,{type:'bar',data,options:opts,plugins:[skillZeroPlugin]})}
-  else{skillChart.data=data;skillChart.update('none')}
+function renderTrainingSubtitle(){
+  if(!metricsData)return;
+  const trained=metricsData.completed_at;
+  const week=municipalReference?.SE;
+  put('training-id',trained ? 'Último treino: '+new Date(trained).toLocaleDateString('pt-BR',{timeZone:'America/Campo_Grande'})+(week?', '+shortWeek(week):'') : 'Último treino indisponível');
 }
 function buildMetricsTabs(){
   const tabs=document.getElementById('metrics-tabs'); if(!tabs||!metricsData) return;
@@ -295,20 +311,20 @@ function buildMetricsTabs(){
   // Impeccable Operate: segmented control with only year, period stays in tooltip; fold parcial sinalizado
   const labels={'avg':'Média','0':'2022','1':'2023','2':'2024','3':'2025*'};
   tabs.innerHTML='';
-  const order=['avg','0','1','2','3'];
+  const order=['avg',...Object.keys(folds).filter(k=>k!=='avg').sort((a,b)=>Number(a)-Number(b))];
   order.forEach(k=>{
     if(!(k in folds)) return;
     const info=folds[k];
     const b=document.createElement('button');
     b.type='button'; b.className='tab'+(metricsFold===k?' active':'');
-    b.textContent=labels[k]||info.label;
+    b.textContent=['retrospective_consolidated','issued_inputs_consolidated_outcomes','retrospective_revised_inputs'].includes(metricsData.scope)?(k==='avg'?'Média':info.label):(labels[k]||info.label);
     b.title=info.label+' — '+info.period+' ('+info.se+')'+(info.note?' — '+info.note:'');
     b.setAttribute('aria-pressed', metricsFold===k?'true':'false');
     b.onclick=()=>{metricsFold=k; buildMetricsTabs(); renderMetrics();};
     tabs.appendChild(b);
   });
 }
-async function loadMetrics(){try{const m=await json('/api/metrics');metricsData=m;metricsFold='avg';buildMetricsTabs();renderMetrics();const health=await json('/health');if(health.status==='ok'){el.modelStatus.textContent='Api funcionando';el.modelStatus.dataset.state='ok'}else{el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error'}}catch(e){el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error';const body=document.getElementById('metrics-body');if(body)body.innerHTML='<tr><td colspan=\"4\" style=\"text-align:center;color:var(--muted);padding:22px\">Erro ao carregar métricas</td></tr>'}}
+async function loadMetrics(){try{const m=await json('/api/metrics?latest=true');metricsData=m;metricsFold='avg';buildMetricsTabs();renderMetrics();const health=await json('/health');if(health.status==='ok'){el.modelStatus.textContent='Api funcionando';el.modelStatus.dataset.state='ok'}else{el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error'}}catch(e){el.modelStatus.textContent='Api indisponível';el.modelStatus.dataset.state='error';const body=document.getElementById('metrics-body');if(body)body.innerHTML='<tr><td colspan=\"6\" style=\"text-align:center;color:var(--muted);padding:22px\">Erro ao carregar métricas</td></tr>'}}
 function seYear(se){return parseInt(String(se).slice(0,4),10)}
 function filterByYears(points){ // agora filtra por SE exata (snap), compat com slider de folds
   const s=String(selStart).zfill?String(selStart).padStart(6,'0'):String(selStart);
@@ -322,8 +338,8 @@ function buildYearPills(){
   const hS=document.getElementById('handle-start'), hE=document.getElementById('handle-end');
   const sVal=document.getElementById('year-start-val'), eVal=document.getElementById('year-end-val');
   if(!slider||!hS||!hE) return;
-  const MIN=2022, MAX=2026;
-  const SLIDER_MIN_SE='202236', SLIDER_MAX_SE='202652';
+  const MIN=2022, MAX=MAX_YEAR;
+  const SLIDER_MIN_SE='202236', SLIDER_MAX_SE=RANGE_END;
   // folds walk-forward - apenas inícios (fim do último fold removido a pedido)
   const FOLD_BOUNDS=[
     {se:'202236',type:'start',label:'2022S36'},
@@ -331,22 +347,6 @@ function buildYearPills(){
     {se:'202436',type:'start',label:'2024S36'},
     {se:'202537',type:'start',label:'2025S37'},
   ];
-  function weeksInYear(y){
-    // Calendário brasileiro: semana 1 contém 4/jan, semana começa domingo.
-    // Replica data/epiweeks.py weeks_in_year dinamicamente — nunca hardcode [2014,2020,2025]
-    function w1Sunday(year){
-      const jan4 = new Date(year, 0, 4);
-      const dow = jan4.getDay(); // 0 Sun ..6 Sat = dias desde domingo
-      const w1 = new Date(jan4);
-      w1.setDate(jan4.getDate() - dow);
-      w1.setHours(0,0,0,0);
-      return w1;
-    }
-    const w1 = w1Sunday(y);
-    const w1Next = w1Sunday(y+1);
-    const diffDays = (w1Next - w1) / (1000*60*60*24);
-    return Math.round(diffDays/7);
-  }
   function seToAbsIdx(se){
     const s=String(se); const y=parseInt(s.slice(0,4),10), w=parseInt(s.slice(4),10);
     let idx=w-1; for(let yy=MIN; yy<y; yy++) idx+=weeksInYear(yy);
@@ -392,7 +392,7 @@ function buildYearPills(){
     const legend=document.getElementById('year-ticks-legend');
     if(legend){
       legend.innerHTML='';
-      const yearLabels=[{se:'202301',txt:'2023'},{se:'202401',txt:'2024'},{se:'202501',txt:'2025'},{se:'202601',txt:'2026'}];
+      const yearLabels=YEARS.slice(1).map(y=>({se:y+'01',txt:String(y)}));
       yearLabels.forEach(l=>{
         const r=seToRatio(l.se);
         const s=document.createElement('span');
@@ -418,7 +418,7 @@ function buildYearPills(){
   function yearToRatio(y){ return (y-MIN)/(MAX-MIN); }
   function ratioToYear(r){ return Math.round(r*(MAX-MIN)+MIN); }
   // lista ordenada de SEs selecionáveis (anos + folds)
-  const SNAP_LABELS={ '202236':'2022S36','202301':'2023','202336':'2023S36','202401':'2024','202436':'2024S36','202501':'2025','202537':'2025S37','202601':'2026','202652':'2026 fim' };
+  const SNAP_LABELS={ '202236':'2022S36','202301':'2023','202336':'2023S36','202401':'2024','202436':'2024S36','202501':'2025','202537':'2025S37','202601':'2026',[RANGE_END]:MAX_YEAR+' fim' };
   function seLabel(se){ return SNAP_LABELS[se]||se.slice(0,4)+'S'+se.slice(4); }
   function nearestSnapByRatio(r){
     let best=SNAP_SES[0], bestD=1e9, bestR=seToRatio(SNAP_SES[0]);
@@ -452,6 +452,7 @@ function buildYearPills(){
     const r=(x-pad)/usable;
     const snapped=nearestSnapByRatio(r);
     let se=snapped.se;
+    const previous=which==='start'?selStart:selEnd;
     if(which==='start'){
       // não cruza: start <= end
       if(se > selEnd) se=selEnd;
@@ -460,9 +461,10 @@ function buildYearPills(){
       if(se < selStart) se=selStart;
       selEnd=se;
     }
+    if(se===previous)return;
     syncYearAlias();
     updateUI();
-    loadHistory();
+    updateHistoryPeriod();
   }
   // initial
   renderTicks();
@@ -495,6 +497,7 @@ function buildYearPills(){
         const idx = SNAP_SES.indexOf(which==='start'? selStart : selEnd);
         let nIdx = idx + d;
         nIdx=Math.max(0, Math.min(SNAP_SES.length-1, nIdx));
+        if(nIdx===idx)return;
         const nSe=SNAP_SES[nIdx];
         if(which==='start'){
           if(nSe > selEnd) return;
@@ -503,7 +506,7 @@ function buildYearPills(){
           if(nSe < selStart) return;
           selEnd=nSe;
         }
-        syncYearAlias(); updateUI(); loadHistory();
+        syncYearAlias(); updateUI(); updateHistoryPeriod();
       }
     });
   }
@@ -526,74 +529,54 @@ function buildYearPills(){
   });
   window.addEventListener('resize', ()=>{renderTicks(); updateUI();});
 }
-async function loadHistory(){
-  if(state.loading)return; state.loading=true;
-  const key=state.h+':'+selStart+'-'+selEnd;
-  try{
-    // sem cache estático: histórico real e previsto desatualizavam (ficavam em state.cache)
-    // busca sempre fresco (mesma lógica API 8001 live) e invalida cache quando muda
-    let data = await json('/api/history?horizon='+state.h+'&window=200');
-    const cacheKey=state.h+':full';
-    state.cache.set(cacheKey,data);
-    let points=data.history||[];
-    points=filterByYears(points);
-    if(!points.length){ // fallback: if filter empty (e.g. 2026 beyond validation), show last available
-      points=data.history.slice(-20);
-    }
-    state.history=points;
-    if(!state.history.length){drawError('Sem dados');return}
-    const first=state.history[0], last=state.history[state.history.length-1];
-    if(!state.originSE){state.originSE=String(last.SE);state.originDate=last.date||last.SE}
-    if(el.range) el.range.textContent=seFmt(first.SE)+' a '+seFmt(last.SE)+' - '+state.history.length+' semanas';
-    el.legendH.textContent=state.h;
+let historyRequest=0;
+let loadedHistory=null;
+
+function updateHistoryPeriod(reuseForecast=true){
+  if(loadedHistory?.horizon!==state.h)return;
+  state.history=filterByYears(loadedHistory.points);
+  if(!state.history.length){
+    ++originRequest;
+    state.originSE=null;
+    state.originDate=null;
+    state.forecast=null;
     syncOriginUI();
-    renderChart(true);
-    if(!isFullRange()){
-      // período limitado: esconde futuro mas mantém cache para retorno instantâneo
-      if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura disponível apenas com período até 2026 fim</small></div>';
-      renderChart();
-    } else {
-      const currentOrigin = String(state.originSE);
-      const cached = state.forecastCache.get(currentOrigin);
-      if(cached && !cached.error){
-        state.forecast=cached;
-        if(el.forecast) renderForecast(true);
-        renderChart();
-        // revalida em segundo plano se cache antigo
-      } else if(state.forecast && String(state.forecast.origin_se)===currentOrigin){
-        if(el.forecast) renderForecast(true);
-        renderChart();
-      } else {
-        // sem cache: busca e salva para retorno instantâneo futuro
-        if(el.forecast) el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
-        loadForecast(currentOrigin).then(()=>{
-          if(String(state.originSE)!==currentOrigin)return;
-          if(!isFullRange()) return;
-          syncOriginUI();
-          if(el.forecast) renderForecast(true);
-          renderChart();
-        }).catch(()=>{ if(el.forecast && String(state.originSE)===currentOrigin)el.forecast.innerHTML='<div class="fc"><small>Erro ao buscar previsão</small></div>'; });
-      }
-    }
-  }catch(e){drawError('Erro ao carregar histórico: '+e.message)}
-  finally{state.loading=false}
-}
-async function loadForecast(se){
-  if(!se)return;
-  const key=String(se);
-  const cached=state.forecastCache.get(key);
-  if(cached && !cached.error){
-    state.forecast=cached;
-    state.originSE=String(cached.origin_se||se);
-    state.originDate=cached.origin_date||state.originDate;
+    drawError('Sem dados no período selecionado.');
+    if(el.range)el.range.textContent='Sem semanas no período';
+    if(el.forecast)el.forecast.textContent='Sem previsão para este período.';
     return;
   }
-  let data = await json('/api/forecast?origin_se='+encodeURIComponent(key));
-  state.forecastCache.set(key,data);
-  if(data.error){state.forecast={origin_se:key,forecast:[],error:true};return}
-  if(!data.error){state.forecast=data;state.originSE=String(data.origin_se||se);state.originDate=data.origin_date||state.originDate}
+  clearChartError();
+  const first=state.history[0], last=state.history[state.history.length-1];
+  const origin=state.history.find(point=>String(point.SE)===state.originSE)||last;
+  if(el.range)el.range.textContent=seFmt(first.SE)+' a '+seFmt(last.SE)+' - '+state.history.length+' semanas';
+  return setOrigin(origin.SE,origin.date,reuseForecast);
 }
-function syncOriginUI(){const label=state.originSE?seFmt(state.originSE):'--';if(el.originTag) el.originTag.textContent='Origem '+label;if(el.originLine) el.originLine.textContent=state.originSE?label+(state.originDate?' - '+state.originDate:''):'Selecione no gráfico';if(el.subtitle) el.subtitle.textContent='Histórico validado de 2022 a 2025. Clique numa semana para ver as 8 previsões feitas a partir dela.'}
+
+async function loadHistory(){
+  const requestId=++historyRequest;
+  const horizon=state.h;
+  const isCurrent=()=>requestId===historyRequest && horizon===state.h;
+  try{
+    const data=await json('/api/history?horizon='+horizon+'&window=200');
+    if(!isCurrent())return;
+    loadedHistory={horizon,points:data.history||[]};
+    await updateHistoryPeriod(false);
+  }catch(e){
+    if(isCurrent())drawError('Erro ao carregar histórico.');
+  }
+}
+const forecastRequests=new Map();
+function loadForecast(se){
+  const key=String(se);
+  if(!forecastRequests.has(key)){
+    const request=json('/api/forecast?origin_se='+encodeURIComponent(key))
+      .finally(()=>forecastRequests.delete(key));
+    forecastRequests.set(key,request);
+  }
+  return forecastRequests.get(key);
+}
+function syncOriginUI(){const label=state.originSE?seFmt(state.originSE):'--';if(el.originTag) el.originTag.textContent='Origem '+label;if(el.originLine) el.originLine.textContent=state.originSE?label+(state.originDate?' - '+state.originDate:''):'Selecione no gráfico';if(el.subtitle) el.subtitle.textContent='Selecione uma semana no gráfico.'}
 function renderForecast(animate){
   if(!el.forecast) return;
   const rows=(state.forecast?.forecast||[]).slice().sort((a,b)=>a.h-b.h);
@@ -607,13 +590,13 @@ function renderForecast(animate){
     let covHtml='';
     if(f.real!=null&&f.q05!=null&&f.q95!=null){
       const inside=f.real>=f.q05&&f.real<=f.q95;
-      covHtml='<small>Real: <b style="color:'+(inside?C('--ok'):C('--danger'))+'">'+num(f.real)+(inside?' ✔ no IC90':' ✘ fora do IC90')+'</b></small>';
+      covHtml='<small>Real: <b style="color:'+(inside?C('--ok'):C('--danger'))+'">'+num(f.real)+(inside?' ✔ no intervalo de 90%':' ✘ fora do intervalo de 90%')+'</b></small>';
     } else if(f.real==null){
       covHtml='<small>Real: -- (semana sem observação publicada)</small>';
     }
     const fi=parseInt(f.fold,10);
-    const foldTxt=isLive?'live':(Number.isFinite(fi)&&FOLD_START_YEARS[fi]?FOLD_START_YEARS[fi]:(f.fold!=null?'fold '+f.fold:''));
-    const calTxt=isLive?'calibrada (live)':(f.calibrated?'calibrada (CQR)':'sem calibração');
+    const foldTxt=isLive?'Prévia':state.forecast.source==='issued'?(state.forecast.issuance_id?'Emissão programada':'Emitida'):state.forecast.source==='legacy_profile'?'Legado com bandas reconstruídas':state.forecast.source==='legacy_archive'?'Arquivo legado':(Number.isFinite(fi)&&FOLD_START_YEARS[fi]?FOLD_START_YEARS[fi]:(f.fold!=null?'fold '+f.fold:''));
+    const calTxt=state.forecast.source==='validation'?(state.forecast.calibration_scheme==='walk_forward_processed'?'Backtest pós-processado':'Backtest bruto'):'';
     card.innerHTML='<label><span>H'+f.h+'</span><span>'+seFmt(f.target_se)+'</span></label><strong>'+num(f.q50)+'</strong>'
       +'<small>50%: '+num(f.q25)+'–'+num(f.q75)+'</small>'
       +'<small>90%: '+num(f.q05)+'–'+num(f.q95)+' casos</small>'
@@ -627,18 +610,31 @@ function series(){
   const hist=state.history, labels=hist.map(p=>seFmt(p.SE)), byLabel=new Map(labels.map((l,i)=>[l,i]));
   const full=[...labels]; const fc=(!isFullRange())?[]:(state.forecast?.forecast||[]); if(isFullRange()) fc.forEach(f=>{const l=seFmt(f.target_se); if(!byLabel.has(l)&&!full.includes(l))full.push(l)});
   const base=()=>Array(full.length).fill(null);
-  const real=base(), pred=base(), low=base(), high=base(), q25=base(), q75=base();
-  hist.forEach((p,i)=>{real[i]=p.real;pred[i]=p.pred;low[i]=p.q05??p.pred_low??null;high[i]=p.q95??p.pred_high??null;q25[i]=p.q25??null;q75[i]=p.q75??null});
+  const real=base(), reported=base(), pred=base(), low=base(), high=base(), q25=base(), q75=base();
+  hist.forEach((p,i)=>{real[i]=p.real;reported[i]=p.notificados;pred[i]=p.pred;low[i]=p.q05??p.pred_low??null;high[i]=p.q95??p.pred_high??null;q25[i]=p.q25??null;q75[i]=p.q75??null});
   const fLow=base(), fHigh=base(), fMed=base(), fQ25=base(), fQ75=base();
   if(isFullRange()) fc.forEach(f=>{const i=full.indexOf(seFmt(f.target_se)); if(i>=0){fLow[i]=f.q05;fHigh[i]=f.q95;fMed[i]=f.q50;fQ25[i]=f.q25;fQ75[i]=f.q75}});
-  return {full,real,pred,low,high,q25,q75,fLow,fHigh,fMed,fQ25,fQ75,originIndex:full.indexOf(seFmt(state.originSE||''))};
+  const originIndex=full.indexOf(seFmt(state.originSE||''));
+  if(Number.isFinite(real[originIndex])){
+    for(const bounds of [[fLow,fHigh],[fQ25,fQ75],[fMed]]){
+      if(bounds.every(values=>Number.isFinite(values[originIndex+1]))){
+        for(const values of bounds)values[originIndex]=real[originIndex];
+      }
+    }
+  }
+  return {full,real,reported,pred,low,high,q25,q75,fLow,fHigh,fMed,fQ25,fQ75,originIndex};
 }
 const FOLD_START_LABELS=['2022S36','2023S36','2024S36','2025S37'];
 const FOLD_START_YEARS=['Fold 2022','Fold 2023','Fold 2024','Fold 2025'];
 const hoverLinePlugin={id:'hoverLine',afterDraw(chart){if(chart.tooltip&&chart.tooltip.getActiveElements().length){const x=chart.tooltip.caretX,top=chart.chartArea.top,bottom=chart.chartArea.bottom,ctx=chart.ctx;ctx.save();ctx.strokeStyle='rgba(125,211,252,0.95)';ctx.lineWidth=1;ctx.setLineDash([]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.restore();}}};
 const foldMarkersPlugin={id:'foldMarkers',afterDatasetsDraw(chart){const labels=chart.data.labels||[];const ctx=chart.ctx;const area=chart.chartArea;const scale=chart.scales.x;if(!scale||!area) return;FOLD_START_LABELS.forEach((lab,i)=>{const idx=labels.indexOf(lab);if(idx<0) return;const x=scale.getPixelForValue(idx);if(x<area.left-1||x>area.right+1) return;ctx.save();ctx.strokeStyle='rgba(148,163,184,0.45)';ctx.lineWidth=1;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(x,area.top);ctx.lineTo(x,area.bottom);ctx.stroke();ctx.setLineDash([]);const text=FOLD_START_YEARS[i];ctx.font='600 9px IBM Plex Mono';const w=ctx.measureText(text).width+10;const h=14;const rx=x-w/2;const ry=area.bottom+8;ctx.fillStyle='rgba(11,15,25,0.92)';ctx.strokeStyle='rgba(148,163,184,0.55)';ctx.lineWidth=1;ctx.beginPath();const r=6;ctx.moveTo(rx+r,ry);ctx.lineTo(rx+w-r,ry);ctx.quadraticCurveTo(rx+w,ry,rx+w,ry+r);ctx.lineTo(rx+w,ry+h-r);ctx.quadraticCurveTo(rx+w,ry+h,rx+w-r,ry+h);ctx.lineTo(rx+r,ry+h);ctx.quadraticCurveTo(rx,ry+h,rx,ry+h-r);ctx.lineTo(rx,ry+r);ctx.quadraticCurveTo(rx,ry,rx+r,ry);ctx.closePath();ctx.fill();ctx.stroke();ctx.fillStyle='rgba(226,232,240,0.95)';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(text,x,ry+h/2+0.5);ctx.restore();});}};
 const originPlugin={id:'originLine',afterDatasetsDraw(chart,args,opts){const idx=opts.index;if(idx<0)return;const x=chart.scales.x.getPixelForValue(idx), top=chart.chartArea.top, bottom=chart.chartArea.bottom, ctx=chart.ctx;ctx.save();ctx.strokeStyle='rgba(251,113,133,0.95)';ctx.lineWidth=1;ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='rgba(251,113,133,0.95)';ctx.font='600 11px IBM Plex Mono';ctx.textAlign='center';ctx.fillText(opts.label||'Hoje',x,top+14);ctx.restore()}};
-Chart.register(hoverLinePlugin,foldMarkersPlugin,originPlugin);
+function enableCharts(){
+  Chart.register(hoverLinePlugin,foldMarkersPlugin,originPlugin);
+  if(state.history.length)renderChart(false);
+}
+if(window.Chart)enableCharts();
+else document.getElementById('chart-library').addEventListener('load',enableCharts,{once:true});
 function triggerChartSlide(){
   if(reducedMotion)return;
   const shell=document.querySelector('.chart-shell');
@@ -646,74 +642,110 @@ function triggerChartSlide(){
   // animacao removida
 }
 function renderChart(animate){
-  const s=series(); const step=Math.max(1,Math.ceil(s.full.length/16));
+  if(!window.Chart)return;
+  const s=series();
+  const futureColor=forecastColor(municipalReference,state.forecast?.forecast?.find(row=>Number(row.h)===8 && row.disponivel!==false)?.q50);
+
   const data={labels:s.full,datasets:[
-    {label:'Real',data:s.real,borderColor:'#e8eef7',backgroundColor:'#e8eef7',borderWidth:2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:true},
+
+    {label:'Casos',data:s.real,borderColor:'#e8eef7',backgroundColor:'#e8eef7',borderWidth:2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:true},
     {label:'Histórico 90% inferior',data:s.low,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',pointRadius:0,tension:.28,spanGaps:false},
     {label:'Histórico 90% superior',data:s.high,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.10)',fill:'-1',pointRadius:0,tension:.28,spanGaps:false},
     {label:'Histórico 50% inferior',data:s.q25,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.22)',pointRadius:0,tension:.28,spanGaps:false},
     {label:'Histórico 50% superior',data:s.q75,borderColor:'transparent',backgroundColor:'rgba(56,189,248,.22)',fill:'-1',pointRadius:0,tension:.28,spanGaps:false},
-    {label:'Histórico mediana H'+state.h,data:s.pred,borderColor:C('--accent-2'),backgroundColor:C('--accent-2'),borderDash:[6,4],borderWidth:1.8,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:false},
-    {label:'Futuro 90% inferior',data:s.fLow,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',pointRadius:0,tension:.25,spanGaps:false},
-    {label:'Futuro 90% superior',data:s.fHigh,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.16)',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
-    {label:'Futuro 50% inferior',data:s.fQ25,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.28)',pointRadius:0,tension:.25,spanGaps:false},
-    {label:'Futuro 50% superior',data:s.fQ75,borderColor:'transparent',backgroundColor:'rgba(245,158,11,.28)',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
-    {label:'Previsão futura',data:s.fMed,borderColor:C('--forecast'),backgroundColor:C('--forecast'),borderWidth:2.2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.25,spanGaps:false}
+    {label:'Previsão H'+state.h,data:s.pred,borderColor:C('--accent-2'),backgroundColor:C('--accent-2'),borderDash:[6,4],borderWidth:1.8,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.28,spanGaps:false},
+    {label:'Futuro 90% inferior',data:s.fLow,borderColor:'transparent',backgroundColor:futureColor+'26',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'Futuro 90% superior',data:s.fHigh,borderColor:'transparent',backgroundColor:futureColor+'26',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'Futuro 50% inferior',data:s.fQ25,borderColor:'transparent',backgroundColor:futureColor+'47',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'Futuro 50% superior',data:s.fQ75,borderColor:'transparent',backgroundColor:futureColor+'47',fill:'-1',pointRadius:0,tension:.25,spanGaps:false},
+    {label:'Previsão futura',data:s.fMed,borderColor:futureColor,backgroundColor:futureColor,borderWidth:2.2,pointRadius:0,pointHoverRadius:0,pointHitRadius:14,tension:.25,spanGaps:false}
+,
+    {label:'Notificados',data:s.reported,borderColor:'#86efac',borderDash:[3,4],borderWidth:1,pointRadius:0,spanGaps:false}
   ]};
-  const opts={responsive:true,maintainAspectRatio:false,animation:false,transitions:{active:{animation:{duration:0}},show:{animation:{duration:0}},hide:{animation:{duration:0}},resize:{animation:{duration:0}}},interaction:{mode:'index',intersect:false},onClick(e,els,ch){const pts=ch.getElementsAtEventForMode(e,'index',{intersect:false},true);if(!pts.length)return;const i=pts[0].index;const l=ch.data.labels[i];if(!l)return;setOrigin(l.replace('S',''),state.history[i]?state.history[i].date:undefined)},onHover(e,els,ch){try{const pts=ch.getElementsAtEventForMode(e,'index',{intersect:false},true);if(e.native)e.native.target.style.cursor=pts.length?'pointer':'default'}catch(_){}},plugins:{legend:{display:false},originLine:{index:s.originIndex,label:(function(){const oi=s.originIndex;const lastHist=state.history.length-1;return (oi>=0&&oi<lastHist)?('Origem '+(state.originSE?seLabel(state.originSE):'')):'Hoje'})()},tooltip:{backgroundColor:'#0b0f19',titleColor:C('--text'),bodyColor:C('--text-2'),borderColor:C('--line-2'),borderWidth:1,padding:10,callbacks:{title(items){return items[0]?.label||''},label(ctx){if(ctx.parsed.y==null)return null;const idx=ctx.dataIndex;const ds=ctx.dataset.label;if(ds==='Real')return 'Real: '+num(ctx.parsed.y);if(ds.includes('mediana')||ds.includes('Previsão futura'))return 'Mediana: '+num(ctx.parsed.y);return null;},afterBody(items){if(!items||!items.length)return;const idx=items[0].dataIndex;const chart=items[0].chart;if(!chart)return;const get=(i)=>chart.data.datasets[i]?.data[idx];const hist90Low=get(1), hist90High=get(2), hist50Low=get(3), hist50High=get(4), fut90Low=get(6), fut90High=get(7), fut50Low=get(8), fut50High=get(9);let lines=[];if(hist50Low!=null&&hist50High!=null) lines.push('IC 50%: '+num(hist50Low)+' – '+num(hist50High)); if(hist90Low!=null&&hist90High!=null) lines.push('IC 90%: '+num(hist90Low)+' – '+num(hist90High)); if(!lines.length && fut50Low!=null&&fut50High!=null) lines.push('IC 50%: '+num(fut50Low)+' – '+num(fut50High)); if(!lines.length && fut90Low!=null&&fut90High!=null) lines.push('IC 90%: '+num(fut90Low)+' – '+num(fut90High)); else if(fut50Low!=null&&fut50High!=null && lines.length<2) lines.push('IC 50% futuro: '+num(fut50Low)+' – '+num(fut50High)); else if(fut90Low!=null&&fut90High!=null && lines.length<2) lines.push('IC 90% futuro: '+num(fut90Low)+' – '+num(fut90High));return lines.length?lines:undefined;}},filter(item){const allowed=['Real','Histórico mediana H'+state.h,'Previsão futura'];return allowed.includes(item.dataset.label);}}},scales:{x:{grid:{color:'rgba(51,65,85,.45)'},border:{color:C('--line-2')},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},maxRotation:0,minRotation:0,autoSkip:false,callback(value,index){const lab=this.getLabelForValue(value);if(index===0||index===s.full.length-1)return lab;if(index%step===0)return lab.slice(2);return ''}}},y:{beginAtZero:true,grid:{color:'rgba(51,65,85,.5)'},border:{display:false},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},callback:v=>Number(v).toLocaleString('pt-BR')}}}};
+  renderCaseLegend('archive-chart-legend',data.datasets,[
+    [[0,'Casos'],[11,'Notificados']],
+    [[5,'Histórico H'+state.h],[4,'Faixa 50%'],[2,'Faixa 90%']],
+    [[10,'Previsão'],[9,'Faixa 50%'],[7,'Faixa 90%']]
+  ]);
+  const opts={responsive:true,maintainAspectRatio:false,animation:false,transitions:{active:{animation:{duration:0}},show:{animation:{duration:0}},hide:{animation:{duration:0}},resize:{animation:{duration:0}}},interaction:{mode:'index',intersect:false},onClick(e,els,ch){const pts=ch.getElementsAtEventForMode(e,'index',{intersect:false},true);if(!pts.length)return;const i=pts[0].index;const l=ch.data.labels[i];if(!l)return;setOrigin(l.replace('S',''),state.history[i]?state.history[i].date:undefined)},onHover(e,els,ch){try{const pts=ch.getElementsAtEventForMode(e,'index',{intersect:false},true);if(e.native)e.native.target.style.cursor=pts.length?'pointer':'default'}catch(_){}},plugins:{legend:{display:false},originLine:{index:s.originIndex,label:(function(){const oi=s.originIndex;const lastHist=state.history.length-1;return (oi>=0&&oi<lastHist)?('Origem '+(state.originSE?seLabel(state.originSE):'')):'Hoje'})()},tooltip:{
+    displayColors:false,
+    filter:item=>item.datasetIndex===0 || item.datasetIndex===5 || item.datasetIndex===10,
+    callbacks:{
+      title:items=>items[0]?.label.replace(/^\d{4}/,'')||'',
+      label:()=>null,
+      afterBody(items){
+        if(!items.length)return [];
+        const {dataIndex:i,chart}=items[0];
+        const datasets=chart.data.datasets;
+        const at=index=>datasets[index].data[i];
+        const future=i!==s.originIndex && Number.isFinite(at(10));
+        const rows=[];
+        if(Number.isFinite(at(0)))rows.push('Casos: '+displayValue(at(0)));
+        const quantiles=['q05','q25','Méd','q75','q95'];
+        const indices=future?[6,8,10,9,7]:[1,3,5,4,2];
+        indices.forEach((index,position)=>{
+          const value=at(index);
+          if(Number.isFinite(value))rows.push(quantiles[position]+': '+displayValue(value));
+        });
+        return rows;
+      }
+    }
+  }},scales:{x:{grid:{color:'rgba(51,65,85,.45)'},border:{color:C('--line-2')},ticks:{color:'#a2aec0',maxTicksLimit:8,maxRotation:0,callback(value){return this.getLabelForValue(value).replace(/^\d{4}/,'')}}},y:{beginAtZero:true,grid:{color:'rgba(51,65,85,.5)'},border:{display:false},ticks:{color:C('--muted'),font:{family:'IBM Plex Mono',size:11},callback:v=>Number(v).toLocaleString('pt-BR')}}}};
   if(!state.chart){state.chart=new Chart(el.chart,{type:'line',data,options:opts})}else{state.chart.options=opts;state.chart.data=data;state.chart.update('none')}
   if(animate)triggerChartSlide();
 }
-function drawError(msg){const box=document.querySelector('.chart-shell');box.innerHTML='<div class="error">'+msg+'</div>'}
-let originRequest = 0;
-async function setOrigin(se,date){
-  const requestId = ++originRequest;
-  state.originSE=String(se);
-  state.originDate=date||state.originDate;
+function clearChartError(){
+  document.querySelector('.chart-shell .error')?.remove();
+  el.chart.hidden=false;
+}
+function drawError(message){
+  clearChartError();
+  el.chart.hidden=true;
+  const status=document.createElement('div');
+  status.className='error';
+  status.textContent=message;
+  document.querySelector('.chart-shell').appendChild(status);
+}
+let originRequest=0;
+async function setOrigin(se,date,reuseForecast=false){
+  const requestId=++originRequest;
+  const historyId=historyRequest;
+  const origin=String(se);
+  const view=[state.h,selStart,selEnd].join('|');
+  const isCurrent=()=>requestId===originRequest && historyId===historyRequest
+    && view===[state.h,selStart,selEnd].join('|') && state.originSE===origin;
+  const retained=reuseForecast && origin===state.originSE ? state.forecast : null;
+  state.originSE=origin;
+  state.originDate=retained?.origin_date||date||null;
+  state.forecast=retained;
   syncOriginUI();
   renderChart(true);
   if(!isFullRange()){
-    if(el.forecast) el.forecast.innerHTML='<div class="fc"><small>Previsão futura indisponível para período limitado</small></div>';
+    if(el.forecast)el.forecast.textContent='Amplie o período até o final para exibir as previsões.';
     return;
   }
-  const cached=state.forecastCache.get(String(state.originSE));
-  if(cached && !cached.error){
-    state.forecast=cached;
-    syncOriginUI();
-    if(el.forecast) renderForecast(true);
-    renderChart(true);
-    return;
-  }
-  if(el.forecast) el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
+  if(retained){renderForecast(false);return}
+  if(el.forecast)el.forecast.innerHTML='<div class="fc skeleton"></div><div class="fc skeleton"></div>';
   try{
-    await loadForecast(state.originSE);
-    if(requestId!==originRequest)return;
-    if(!isFullRange()) return;
+    const forecast=await loadForecast(origin);
+    if(!isCurrent())return;
+    if(forecast.error || String(forecast.origin_se)!==origin)throw new Error('Origem indisponível');
+    state.forecast=forecast;
+    state.originDate=forecast.origin_date||state.originDate;
     syncOriginUI();
-    if(el.forecast) renderForecast(true);
+    renderForecast(true);
     renderChart(true);
   }catch(e){
-    if(el.forecast && requestId===originRequest)el.forecast.innerHTML='<div class="fc"><small>Erro ao buscar previsão</small></div>';
+    if(isCurrent()&&el.forecast)el.forecast.textContent='Erro ao buscar previsão.';
   }
 }
 async function setH(h){if(state.h===h)return;state.h=h;hButtons();if(el.forecast) renderForecast(true);triggerChartSlide();await loadHistory()}
 if(el.latest) el.latest.addEventListener('click',async()=>{const last=state.history[state.history.length-1];if(last)await setOrigin(String(last.SE),last.date)});
-(function bindAdvancedToggle(){
-  const btn=document.getElementById('metrics-advanced-toggle');
-  if(btn){
-    btn.addEventListener('click',()=>{
-      metricsAdvanced=!metricsAdvanced;
-      btn.textContent=metricsAdvanced?'Ver métricas simples':'Ver métricas avançadas';
-      btn.setAttribute('aria-pressed', metricsAdvanced?'true':'false');
-      renderMetrics();
-    });
-  }
-})();
 // ------------------------------------------------------------------
-// AUTO-ATUALIZAÇÃO automatico: detecta nova semana epidemiologica InfoDengue
+// AUTO-ATUALIZAÇÃO automatico: detecta nova semana epidemiologica
 // /api/status expoem base_max (ultima SE processada) e forecast_archive
 // (n de origens arquivadas). Quando qualquer um muda (nova semana publicada,
-// revisao InfoDengue ou forecast novo arquivado), limpa os caches do browser
+// revisao ou forecast novo arquivado), limpa os caches do browser
 // e recarrega historico + previsao sem interacao do usuario.
 // Poll leve a cada 2 min + refresh imediato ao voltar para a aba.
 // ------------------------------------------------------------------
@@ -723,21 +755,35 @@ async function refreshTick(initial){
   if(document.hidden && !initial) return;
   let s;
   try{ s = await json('/api/status'); }catch(e){ return; } // rede instavel: tenta no proximo tick
-  const k = String(s.base_max||'')+'|'+String(s.forecast_archive ?? '');
+  const k=[s.base_max,s.archive_revision,s.base_revision,s.model_release].join('|');
   if(lastKnownStatus === null){ lastKnownStatus = k; return; }
   if(k === lastKnownStatus) return;
   lastKnownStatus = k;
   const prevLast = (state.history && state.history.length) ? String(state.history[state.history.length-1].SE) : null;
   const wasLatest = prevLast && String(state.originSE) === prevLast;
   // Nova semana detectada: invalida caches e recarrega
-  state.cache.clear();
-  state.forecastCache.clear();
   if(wasLatest){ state.originSE = null; } // usuario estava no 'Hoje': reancora na nova ultima semana
-  try{ await loadHistory(); }catch(e){}
+  try{ await Promise.all([loadOverview(),loadHistory(),loadMetrics()]); }catch(e){}
 }
 setInterval(()=>{ refreshTick(false); }, REFRESH_INTERVAL_MS);
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) refreshTick(false); });
-(async function init(){hButtons();buildYearPills();await loadMetrics();await loadHistory();await refreshTick(true)})();
+(async function init(){
+  const auth=await checkAuth();
+  if(!auth.ok){
+    if(auth.required && !getToken()){location.replace('/');return}
+    tokenLogout.hidden=false;
+    el.modelStatus.textContent='Acesso indisponível';
+    el.modelStatus.dataset.state='error';
+    return;
+  }
+  hideTokenGate();
+  if(auth.required && tokenLogout)tokenLogout.hidden=false;
+  hButtons();buildYearPills();
+  document.querySelector("#city-"+cityCode).setAttribute("aria-current","page");
+  restoreCitySummaries();
+  await Promise.allSettled([...cityCodes.filter(code=>code!==cityCode).map(loadOtherCity),loadOverview(), loadHistory(), loadMetrics()]);
+  await refreshTick(true);
+})();
 </script>
 </body>
 </html>
